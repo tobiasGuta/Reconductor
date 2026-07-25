@@ -35,6 +35,19 @@ type Input struct {
 	Method     string   `json:"method,omitempty"`
 	PlanDigest string   `json:"target_plan_digest,omitempty"`
 }
+
+type ProviderOutput struct {
+	Lines             []string                   `json:"lines"`
+	Authorized        []string                   `json:"authorized"`
+	AuthorizedURLs    []string                   `json:"authorized_urls"`
+	AuthorizedRecords []provideroutput.Record    `json:"authorized_records"`
+	Filtered          []targeting.FilterDecision `json:"filtered"`
+	Records           []provideroutput.Record    `json:"records"`
+	Warnings          []provideroutput.Warning   `json:"warnings"`
+	AcceptedCount     int                        `json:"accepted_count"`
+	FilteredCount     int                        `json:"filtered_count"`
+}
+
 type Invocation struct {
 	Args  []string
 	Stdin []byte
@@ -102,7 +115,7 @@ func New(def Definition, runner Runner, r *redaction.Redactor) *Provider {
 	return &Provider{def: def, runner: runner, redactor: r}
 }
 func (p *Provider) Manifest() capability.Manifest {
-	return capability.Manifest{Name: p.def.Name, Description: p.def.Description, Version: p.def.Version, Risk: p.def.Risk, InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"domain":{"type":"string"},"domains":{"type":"array","items":{"type":"string"}},"targets":{"type":"array","items":{"type":"string"}},"headless":{"type":"boolean"},"ports":{"type":"string"},"method":{"type":"string"},"target_plan_digest":{"type":"string"}}}`), OutputSchema: json.RawMessage(`{"type":"object","properties":{"lines":{"type":"array","items":{"type":"string"}},"authorized":{"type":"array"},"filtered":{"type":"array"},"warnings":{"type":"array"}}}`), RequiredScopeType: p.def.ScopeType, ApprovalRequired: p.def.Risk == policy.Moderate || p.def.Risk == policy.High, RetrySafe: p.def.RetrySafe, Idempotent: p.def.Idempotent, SupportedProviders: []string{p.def.Provider}, ProducedArtifactTypes: []string{"raw-provider-output", "normalized-json"}, RequiredSecrets: p.def.RequiredSecrets, PolicyRequirements: p.def.PolicyRequirements, DefaultTimeout: p.def.Timeout}
+	return capability.Manifest{Name: p.def.Name, Description: p.def.Description, Version: p.def.Version, Risk: p.def.Risk, InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"domain":{"type":"string"},"domains":{"type":"array","items":{"type":"string"}},"targets":{"type":"array","items":{"type":"string"}},"headless":{"type":"boolean"},"ports":{"type":"string"},"method":{"type":"string"},"target_plan_digest":{"type":"string"}}}`), OutputSchema: json.RawMessage(providerOutputSchema), RequiredScopeType: p.def.ScopeType, ApprovalRequired: p.def.Risk == policy.Moderate || p.def.Risk == policy.High, RetrySafe: p.def.RetrySafe, Idempotent: p.def.Idempotent, SupportedProviders: []string{p.def.Provider}, ProducedArtifactTypes: []string{"raw-provider-output", "normalized-json"}, RequiredSecrets: p.def.RequiredSecrets, PolicyRequirements: p.def.PolicyRequirements, DefaultTimeout: p.def.Timeout}
 }
 func (p *Provider) ValidateDefinition(raw json.RawMessage) error {
 	var in Input
@@ -192,7 +205,7 @@ func (p *Provider) Execute(ctx context.Context, req capability.Request) (capabil
 	safeStdout := p.redactor.Text(string(stdout))
 	safeStderr := p.redactor.Text(string(stderr))
 	lines := splitLines(safeStdout)
-	normalized := map[string]any{"lines": lines, "authorized": lines, "filtered": []any{}, "warnings": []any{}, "accepted_count": len(lines), "filtered_count": 0}
+	normalized := ProviderOutput{Lines: lines, Authorized: lines, AuthorizedURLs: []string{}, AuthorizedRecords: []provideroutput.Record{}, Filtered: []targeting.FilterDecision{}, Records: []provideroutput.Record{}, Warnings: []provideroutput.Warning{}, AcceptedCount: len(lines), FilteredCount: 0}
 	if p.def.OutputAdapter != "" {
 		detailed, ok := req.Scope.(targeting.DetailedScope)
 		if !ok {
@@ -200,8 +213,11 @@ func (p *Provider) Execute(ctx context.Context, req capability.Request) (capabil
 		}
 		batch := provideroutput.Parse(p.def.OutputAdapter, lines)
 		accepted, authorizedURLs, authorizedRecords, filtered := filterRecords(detailed, batch.Records)
-		normalized = map[string]any{"lines": accepted, "authorized": accepted, "authorized_urls": authorizedURLs, "authorized_records": authorizedRecords, "filtered": filtered, "records": batch.Records, "warnings": batch.Warnings, "accepted_count": len(accepted), "filtered_count": len(filtered)}
+		normalized = ProviderOutput{Lines: accepted, Authorized: accepted, AuthorizedURLs: authorizedURLs, AuthorizedRecords: authorizedRecords, Filtered: filtered, Records: batch.Records, Warnings: batch.Warnings, AcceptedCount: len(accepted), FilteredCount: len(filtered)}
 		lines = accepted
+	}
+	if err := validateProviderOutput(normalized); err != nil {
+		return capability.Result{}, err
 	}
 	output, _ := json.Marshal(normalized)
 	tool := &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: p.def.Name, Provider: p.def.Provider, ToolVersion: p.redactor.Text(version), SanitizedArguments: safeArgs, ExecutionEnvironment: json.RawMessage(`{"kind":"local-process","shell":false}`), StartedAt: started, CompletedAt: &completed, ExitCode: &exit, TimedOut: errors.Is(runCtx.Err(), context.DeadlineExceeded)}
@@ -388,6 +404,50 @@ func filterRecords(sc targeting.DetailedScope, records []provideroutput.Record) 
 	return accepted, authorizedURLs, authorizedRecords, filtered
 }
 func scopeReason(value string) platformscope.Reason { return platformscope.Reason(value) }
+
+func validateProviderOutput(output ProviderOutput) error {
+	if output.Lines == nil || output.Authorized == nil || output.AuthorizedURLs == nil || output.AuthorizedRecords == nil || output.Filtered == nil || output.Records == nil || output.Warnings == nil {
+		return fmt.Errorf("provider output collections must be non-null")
+	}
+	if output.AcceptedCount != len(output.Authorized) {
+		return fmt.Errorf("provider output accepted_count=%d does not match authorized=%d", output.AcceptedCount, len(output.Authorized))
+	}
+	if output.FilteredCount != len(output.Filtered) {
+		return fmt.Errorf("provider output filtered_count=%d does not match filtered=%d", output.FilteredCount, len(output.Filtered))
+	}
+	if len(output.Lines) != len(output.Authorized) {
+		return fmt.Errorf("provider output lines=%d does not match authorized=%d", len(output.Lines), len(output.Authorized))
+	}
+	for index, record := range append(append([]provideroutput.Record{}, output.Records...), output.AuthorizedRecords...) {
+		if record.Provider == "" || record.Kind == "" || record.Target == "" {
+			return fmt.Errorf("provider output record %d requires provider, kind, and target", index)
+		}
+		switch record.Kind {
+		case provideroutput.HostRecord:
+			if record.Host == "" {
+				return fmt.Errorf("provider output host record %d requires host", index)
+			}
+		case provideroutput.PortRecord:
+			if record.Host == "" || record.Port < 1 || record.Port > 65535 {
+				return fmt.Errorf("provider output port record %d requires host and valid port", index)
+			}
+		case provideroutput.URLRecord:
+			u, err := url.Parse(record.Target)
+			if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
+				return fmt.Errorf("provider output url record %d has invalid HTTP target", index)
+			}
+		default:
+			return fmt.Errorf("provider output record %d has unsupported kind %q", index, record.Kind)
+		}
+	}
+	for index, warning := range output.Warnings {
+		if warning.Line < 1 || strings.TrimSpace(warning.Reason) == "" {
+			return fmt.Errorf("provider output warning %d requires line and reason", index)
+		}
+	}
+	return nil
+}
+
 func dedupe(items []string) []string {
 	if len(items) < 2 {
 		return items
@@ -400,3 +460,5 @@ func dedupe(items []string) []string {
 	}
 	return out
 }
+
+const providerOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["lines","authorized","authorized_urls","authorized_records","filtered","records","warnings","accepted_count","filtered_count"],"properties":{"lines":{"type":"array","items":{"type":"string"}},"authorized":{"type":"array","items":{"type":"string"}},"authorized_urls":{"type":"array","items":{"type":"string","format":"uri"}},"authorized_records":{"type":"array","items":{"$ref":"#/$defs/record"}},"filtered":{"type":"array","items":{"$ref":"#/$defs/filter_decision"}},"records":{"type":"array","items":{"$ref":"#/$defs/record"}},"warnings":{"type":"array","items":{"$ref":"#/$defs/warning"}},"accepted_count":{"type":"integer","minimum":0},"filtered_count":{"type":"integer","minimum":0}},"$defs":{"record":{"type":"object","additionalProperties":false,"required":["provider","kind","target"],"properties":{"provider":{"type":"string","minLength":1},"kind":{"enum":["host","port","url"]},"target":{"type":"string","minLength":1},"host":{"type":"string"},"port":{"type":"integer","minimum":0,"maximum":65535},"status_code":{"type":"integer","minimum":0,"maximum":599},"technologies":{"type":"array","items":{"type":"string"}},"fields":{"type":"object"}}},"filter_decision":{"type":"object","additionalProperties":false,"required":["target","accepted","reason"],"properties":{"target":{"type":"string"},"accepted":{"type":"boolean"},"reason":{"type":"string"},"authorized_urls":{"type":"array","items":{"type":"string","format":"uri"}},"source_rule_ids":{"type":"array","items":{"type":"string"}}}},"warning":{"type":"object","additionalProperties":false,"required":["line","reason"],"properties":{"line":{"type":"integer","minimum":1},"reason":{"type":"string","minLength":1}}}}}`

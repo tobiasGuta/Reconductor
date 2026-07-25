@@ -156,12 +156,21 @@ func Validate(d Definition, r *capability.Registry) error {
 			if _, ok := byID[parts[0]]; !ok {
 				return fmt.Errorf("step %s binding references unknown step %s", s.ID, parts[0])
 			}
+			if err := validateOutputPath(r, byID[parts[0]], parts[2]); err != nil {
+				return fmt.Errorf("step %s binding %q: %w", s.ID, binding, err)
+			}
 		}
 		if s.Condition != "" {
 			_, reference, _ := strings.Cut(s.Condition, ":")
-			source := strings.Split(reference, ".")[0]
+			parts := strings.Split(reference, ".")
+			source := parts[0]
 			if _, ok := byID[source]; !ok {
 				return fmt.Errorf("step %s condition references unknown step %s", s.ID, source)
+			}
+			if len(parts) >= 3 && parts[1] == "output" {
+				if err := validateOutputPath(r, byID[source], parts[2]); err != nil {
+					return fmt.Errorf("step %s condition %q: %w", s.ID, s.Condition, err)
+				}
 			}
 		}
 	}
@@ -203,6 +212,27 @@ func Validate(d Definition, r *capability.Registry) error {
 				return fmt.Errorf("step %s condition source %s must be a dependency", step.ID, source)
 			}
 		}
+	}
+	return nil
+}
+
+func validateOutputPath(r *capability.Registry, source Step, field string) error {
+	implementation, ok := r.Get(source.Capability)
+	if !ok {
+		return fmt.Errorf("source capability %q is not registered", source.Capability)
+	}
+	raw := implementation.Manifest().OutputSchema
+	if len(raw) == 0 {
+		return nil
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil || len(schema.Properties) == 0 {
+		return nil
+	}
+	if _, ok := schema.Properties[field]; !ok {
+		return fmt.Errorf("source capability %q does not declare output field %q", source.Capability, field)
 	}
 	return nil
 }

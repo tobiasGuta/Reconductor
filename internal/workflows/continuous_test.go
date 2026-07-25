@@ -86,12 +86,47 @@ func TestContinuousWebReconEndToEndStateMachine(t *testing.T) {
 	if state.Run.Status != domain.RunCompleted {
 		t.Fatalf("status=%s", state.Run.Status)
 	}
-	if len(state.Steps) != 11 {
+	if len(state.Steps) != 12 {
 		t.Fatalf("steps=%d", len(state.Steps))
 	}
 	for id, step := range state.Steps {
 		if step.Run.Status != domain.StepSucceeded {
 			t.Fatalf("step %s status=%s", id, step.Run.Status)
 		}
+	}
+}
+
+func TestContinuousWebReconProducesBriefBeforeNucleiApproval(t *testing.T) {
+	registry := capability.NewRegistry()
+	for _, name := range []string{"discover.subdomains", "targeting.prepare", "resolve.dns", "scan.ports", "probe.http", "compare.assets", "crawl.web", "discover.archive_urls", "classify.endpoint", "scan.nuclei", "report.changes"} {
+		if err := registry.Register(e2eCap{name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sc, err := platformscope.Compile([]platformscope.Rule{{Protocol: `^https$`, Host: `^api\.example\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}, {Protocol: `^https$`, Host: `^.*\.example\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := targeting.Plan(sc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := ContinuousWebRecon(plan, false)
+	engine := workflow.Engine{Registry: registry, Executor: registry, Policy: policy.Policy{AllowedCapabilities: registry.Names()}, Scope: sc}
+	state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), WorkflowDefinitionID: definition.ID, RequestedBy: "test"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Run.Status != domain.RunPaused {
+		t.Fatalf("status=%s", state.Run.Status)
+	}
+	if state.Steps["generate-recon-brief"].Run.Status != domain.StepSucceeded {
+		t.Fatalf("preliminary brief did not run before approval: %#v", state.Steps["generate-recon-brief"])
+	}
+	if state.Steps["run-safe-nuclei-profile"].Run.Status != domain.StepAwaitingApproval {
+		t.Fatalf("nuclei step should be awaiting approval: %#v", state.Steps["run-safe-nuclei-profile"])
+	}
+	if state.Steps["enrich-recon-brief"] != nil {
+		t.Fatalf("enriched brief should wait for scanner evidence: %#v", state.Steps["enrich-recon-brief"])
 	}
 }

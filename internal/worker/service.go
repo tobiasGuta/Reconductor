@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,13 +12,14 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/budget"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/execution"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
 )
 
 type ResultStore interface {
+	execution.ResultStore
 	AlreadySucceeded(context.Context, string) (bool, error)
-	PersistResult(context.Context, domain.ID, domain.StepRun, *domain.ToolRun, []domain.Artifact, domain.ActionResult) error
 }
 type Service struct {
 	Queue                   *queue.Streams
@@ -182,37 +182,16 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 			auditor = recorder
 		}
 	}
-	result, runErr := s.Registry.Execute(ctx, capability.Request{Action: d.Job.Action, ProgramID: d.Job.ProgramID, Provider: d.Job.Provider, Approved: d.Job.Approved, Policy: d.Job.Policy, Scope: sc, PolicyPhase: "execution", DecisionRecorder: auditor})
+	result, runErr := s.executeJob(ctx, d, provider, sc, auditor)
 	if runErr != nil {
 		retryable := result.Action.Error != nil && result.Action.Error.Retryable
 		return s.Queue.Fail(ctx, d.MessageID, d.Job, runErr.Error(), retryable)
 	}
-	tool := result.ToolRun
-	if tool == nil {
-		now := time.Now().UTC()
-		version := "1"
-		if implementation, ok := s.Registry.Get(d.Job.Action.Capability); ok {
-			version = implementation.Manifest().Version
-		}
-		tool = &domain.ToolRun{ID: domain.NewID(), StepRunID: d.Job.Action.StepRunID, Capability: d.Job.Action.Capability, Provider: "platform", ToolVersion: version, SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"in-process"}`), StartedAt: now, CompletedAt: &now}
-	}
-	var artifacts []domain.Artifact
-	if len(result.Action.Output) > 0 {
-		a, err := s.Artifacts.Put(ctx, artifact.PutRequest{ProgramID: d.Job.ProgramID, TaskID: d.Job.Action.TaskID, WorkflowRunID: d.Job.Action.WorkflowRunID, StepRunID: d.Job.Action.StepRunID, ToolRunID: tool.ID, Type: "normalized-result", ContentType: "application/json", Name: "result.json", Retention: d.Job.Policy.ArtifactRetention, Data: result.Action.Output})
-		if err != nil {
-			return s.Queue.Fail(ctx, d.MessageID, d.Job, "artifact: "+err.Error(), true)
-		}
-		artifacts = append(artifacts, a)
-		tool.ArtifactIDs = append(tool.ArtifactIDs, a.ID)
-		tool.StdoutArtifactID = &a.ID
-		result.Action.ArtifactIDs = append(result.Action.ArtifactIDs, a.ID)
-	}
-	now := time.Now().UTC()
-	step := domain.StepRun{ID: d.Job.Action.StepRunID, WorkflowRunID: d.Job.Action.WorkflowRunID, Capability: d.Job.Action.Capability, Status: domain.StepSucceeded, Output: result.Action.Output, CompletedAt: &now, IdempotencyKey: d.Job.Action.IdempotencyKey}
-	if err := s.Results.PersistResult(ctx, d.Job.ProgramID, step, tool, artifacts, result.Action); err != nil {
-		return err
-	}
 	return s.Queue.Ack(ctx, d.MessageID, result.Action)
+}
+
+func (s *Service) executeJob(ctx context.Context, d queue.Delivery, provider string, sc capability.Scope, auditor capability.PolicyDecisionRecorder) (capability.Result, error) {
+	return (execution.Service{Registry: s.Registry, Store: s.Results, Artifacts: s.Artifacts, ProgramID: d.Job.ProgramID, PolicyAuditor: auditor}).Execute(ctx, capability.Request{Action: d.Job.Action, Provider: provider, Approved: d.Job.Approved, Policy: d.Job.Policy, Scope: sc})
 }
 
 func (s *Service) purgeExpired(ctx context.Context) error {

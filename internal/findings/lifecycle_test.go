@@ -21,11 +21,15 @@ func TestCandidateLifecycle(t *testing.T) {
 }
 func TestSafeVerificationPlaybooks(t *testing.T) {
 	v := Verify("openapi", VerificationInput{StatusCode: 200, Body: json.RawMessage(`{"openapi":"3.0.0","paths":{}}`)})
-	if v.Verdict != VerdictConfirmed {
+	if v.Verdict != VerdictManual || v.EvidenceVerdict != EvidenceObserved || v.ImpactVerdict != ImpactUnreviewed {
 		t.Fatalf("got %s", v.Verdict)
 	}
 	v = Verify("missing-authentication", VerificationInput{UnauthenticatedStatusCode: 200})
-	if v.Verdict != VerdictManual {
+	if v.Verdict != VerdictManual || v.EvidenceVerdict != EvidenceObserved || v.ImpactVerdict != ImpactUnreviewed {
 		t.Fatal("missing auth must require human impact review")
+	}
+	v = Verify("openapi", VerificationInput{StatusCode: 404})
+	if v.Verdict != VerdictRejected || v.EvidenceVerdict != EvidenceNotObserved || v.ImpactVerdict != ImpactRejected {
+		t.Fatalf("missing behavior should be rejected evidence: %#v", v)
 	}
 }

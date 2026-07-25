@@ -15,6 +15,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/provideroutput"
 	"github.com/tobiasGuta/Reconductor/internal/redaction"
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
+	"github.com/tobiasGuta/Reconductor/internal/targeting"
 )
 
 type fakeRunner struct {
@@ -102,6 +103,34 @@ func TestPassiveDiscoveryOutputIsFilteredPerRecordBeforeActiveUse(t *testing.T) 
 	}
 	if len(output.Filtered) != 2 || len(output.Warnings) != 1 {
 		t.Fatalf("filtered=%v warnings=%v", output.Filtered, output.Warnings)
+	}
+}
+
+func TestProviderManifestPublishesCompleteClosedOutputSchema(t *testing.T) {
+	p := New(Definition{Name: "probe.http", Provider: "httpx", Executable: "httpx", Version: "3", Risk: policy.Low, BuildArgs: func(i Input, _ policy.Policy) ([]string, error) { return []string{"-u", i.Targets[0]}, nil }}, &fakeRunner{}, nil)
+	manifest := p.Manifest()
+	var schema struct {
+		AdditionalProperties *bool                      `json:"additionalProperties"`
+		Required             []string                   `json:"required"`
+		Properties           map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(manifest.OutputSchema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	required := map[string]bool{}
+	for _, field := range schema.Required {
+		required[field] = true
+	}
+	for _, field := range []string{"lines", "authorized", "authorized_urls", "authorized_records", "filtered", "records", "warnings", "accepted_count", "filtered_count"} {
+		if _, ok := schema.Properties[field]; !ok || !required[field] {
+			t.Fatalf("output schema does not declare required field %q: %s", field, manifest.OutputSchema)
+		}
+	}
+	if schema.AdditionalProperties == nil || *schema.AdditionalProperties {
+		t.Fatalf("provider output schema is not closed: %s", manifest.OutputSchema)
+	}
+	if err := validateProviderOutput(ProviderOutput{Lines: []string{}, Authorized: []string{}, AuthorizedURLs: []string{}, AuthorizedRecords: []provideroutput.Record{}, Filtered: []targeting.FilterDecision{}, Records: []provideroutput.Record{}, Warnings: []provideroutput.Warning{}, AcceptedCount: 1}); err == nil {
+		t.Fatal("inconsistent provider output counts were accepted")
 	}
 }
 func (f *fakeRunner) Version(context.Context, string, []string) (string, error) {

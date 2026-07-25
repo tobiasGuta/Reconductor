@@ -22,8 +22,8 @@ func TestLocalOpenRedirectVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	v := findings.Verify("open-redirect", findings.VerificationInput{URL: target, StatusCode: resp.StatusCode, Headers: resp.Header})
-	if v.Verdict != findings.VerdictConfirmed {
-		t.Fatalf("verdict=%s summary=%s", v.Verdict, v.Summary)
+	v := findings.Verify("open-redirect", findings.VerificationInput{URL: target, StatusCode: resp.StatusCode, Headers: resp.Header, VerificationOrigin: "https://verification.invalid"})
+	if v.Verdict != findings.VerdictManual || v.EvidenceVerdict != findings.EvidenceObserved || v.ImpactVerdict != findings.ImpactUnreviewed {
+		t.Fatalf("verification=%#v", v)
 	}
 }

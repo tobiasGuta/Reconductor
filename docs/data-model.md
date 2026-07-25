@@ -16,4 +16,4 @@ Assets are stable logical identities. Asset observations describe what a capabil
 
 Route signatures generalize integer, UUID, long hex/ObjectID, date/timestamp, and strong high-entropy identifier segments. They do not generalize a path merely because it has several siblings.
 
-Scanner output becomes `candidate_findings`. Verification results independently record confirmed, rejected, inconclusive, or manual-review verdicts. Only a confirmed candidate may become a `verified_finding`; the scanner does not assert business impact.
+Scanner output becomes `candidate_findings`. Verification results independently record a compatibility `verdict` plus separate `evidence_verdict` and `impact_verdict` values. Playbooks can mark behavior as `observed` while leaving impact `unreviewed`; only reviewed, confirmed-impact candidates should become `verified_finding` records. The scanner does not assert business impact.

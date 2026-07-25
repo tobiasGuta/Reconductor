@@ -1,6 +1,6 @@
 # Workflows
 
-Workflow definitions contain stable capability names, typed JSON inputs, dependency IDs, bounded retries, timeouts, supported conditions, and explicit output bindings. Validation rejects cycles, unknown capabilities, invalid JSON, missing dependencies, unsupported conditions, and undeclared binding sources. There is no command or script field.
+Workflow definitions contain stable capability names, typed JSON inputs, dependency IDs, bounded retries, timeouts, supported conditions, and explicit output bindings. Validation rejects cycles, unknown capabilities, invalid JSON, missing dependencies, unsupported conditions, undeclared binding sources, and bindings or output conditions that reference fields absent from the source capability's output schema. There is no command or script field.
 
 The engine persists before and after each meaningful state transition. A resumed run retains a succeeded step when its normalized input hash is unchanged. It reruns only when the definition opts into input-change reruns or the operator starts an explicit retry. Pause, cancellation, skipped steps, retryable failures, approvals, and terminal states are distinct.
 
@@ -16,19 +16,19 @@ Every definition receives a deterministic target-plan digest. Exact host rules y
 
 ## `continuous-web-recon`
 
-Version `2.1.0` runs passive discovery only for planned roots, filters each result, merges authorized discovered URLs with exact seeds, then runs DNSx, an optional authorized port intersection in Naabu, HTTPX, asset comparison, crawling, GAU, endpoint classification, an approved safe Nuclei profile, and a changes report. It supports multiple unrelated domains without `--domain`.
+Version `2.2.0` runs passive discovery only for planned roots, filters each result, merges authorized discovered URLs with exact seeds, then runs DNSx, an optional authorized port intersection in Naabu, HTTPX, asset comparison, crawling, GAU, endpoint classification, a preliminary recon brief, an optional approved safe Nuclei profile, and a scanner-enriched brief. It supports multiple unrelated domains without `--domain`.
 
 ## `authorized-web-baseline`
 
-Version `1.1.0` starts only from scope-derived exact seeds, then resolves, optionally scans a common authorized port intersection, probes, compares, crawls changed assets, classifies endpoints, pauses for Nuclei approval, and reports changes. It needs no discovery root.
+Version `1.2.0` starts only from scope-derived exact seeds, then resolves, optionally scans a common authorized port intersection, probes, compares, crawls changed assets, classifies endpoints, emits a preliminary recon brief, pauses for optional Nuclei approval, and emits a scanner-enriched brief after approved scanner evidence exists. It needs no discovery root.
 
 HTTP observations are routed deterministically: 2xx assets may be crawled, 2xx/redirect/authentication responses may enter the approved safe scan profile, and other statuses are retained as observations but not scanned.
 
-The classifier receives only each provider's post-scope-filter `authorized_records`. HTTPX supplies response status, content type, redirect, and technology evidence; Katana supplies request and JavaScript relationship evidence; GAU supplies lower-confidence passive observations. Structured HTTP observations from the latest prior completed run are loaded for route-normalized historical comparisons. The complete evidence classification is persisted in the step result and forwarded into the report.
+The classifier receives only each provider's post-scope-filter `authorized_records`. HTTPX supplies response status, content type, redirect, and technology evidence; Katana supplies request and JavaScript relationship evidence; GAU supplies lower-confidence passive observations. Structured HTTP observations from the latest prior completed run are loaded by the shared execution service for route-normalized historical comparisons in both local and Redis worker modes. The complete evidence classification is persisted in the step result and forwarded into the preliminary and enriched reports.
 
 Every scheduled invocation should create a new Task execution and WorkflowRun. The first run treats observed HTTP assets as new. Negative transitions require a complete successful source step; a failed or incomplete scan never marks an asset removed or a finding resolved.
 
-Moderate Nuclei execution pauses without approval. Independent safe branches that are already ready may finish before the workflow enters its paused state. Intrusive, destructive, denial-of-service, brute-force, credential-stuffing, and state-changing behavior is not part of this workflow.
+Moderate Nuclei execution pauses without approval. The preliminary recon brief is an independent safe branch after endpoint classification, so the researcher can review endpoint and change intelligence before approving scanner enrichment. Intrusive, destructive, denial-of-service, brute-force, credential-stuffing, and state-changing behavior is not part of this workflow.
 
 ```powershell
 go run ./cmd/platform scope plan --scope .\scope\mixed-example.json

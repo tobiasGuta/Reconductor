@@ -2,7 +2,7 @@
 
 Reconductor is a deterministic, human-directed enterprise security reconnaissance platform for authorized bug bounty and penetration-testing work. It automates repeatable discovery and safe scanning while keeping scope, policy, approval, and vulnerability decisions under human control.
 
-The platform does **not** contain an LLM, planner, agent loop, prompt engine, embeddings, or unrestricted shell interface. A future local planner can only submit the same validated `ActionRequest` objects used by the CLI, scheduler, workflow runner, and worker.
+The platform does **not** contain an LLM, planner, agent loop, prompt engine, embeddings, or unrestricted shell interface. A future local planner may propose a `PlanProposal`; Reconductor must validate it, require human review, and create trusted task, workflow, step, approval, idempotency, attribution, and `ActionRequest` records itself.
 
 ## Safety model
 
@@ -21,9 +21,9 @@ The built-in Nuclei profile excludes denial-of-service, brute-force, fuzzing, an
 ## Architecture
 
 ```text
-Human / CLI / local console API / scheduler / future local AI
+Human / CLI / local console API / scheduler / future local AI proposal
                            |
-                    ActionRequest
+                 validated platform intent
                            |
             schema + scope + policy checks
                            |
@@ -54,7 +54,7 @@ The persisted hierarchy is `Program -> Task -> WorkflowRun -> StepRun -> ToolRun
 | `compare.assets` | in-process | passive |
 | `report.changes` | in-process | passive |
 
-There are two generic scope-driven definitions: `continuous-web-recon` adds passive discovery for derived/operator-approved roots, while `authorized-web-baseline` operates only from exact active seeds. Both support multiple unrelated domains.
+There are two generic scope-driven definitions: `continuous-web-recon` adds passive discovery for derived/operator-approved roots, while `authorized-web-baseline` operates only from exact active seeds. Both support multiple unrelated domains and produce a preliminary recon brief before optional Nuclei approval.
 
 ## Local setup
 

@@ -81,6 +81,48 @@ func TestDependencyValidation(t *testing.T) {
 		t.Fatal("binding from an unordered branch was accepted")
 	}
 }
+
+type schemaCap struct {
+	name   string
+	output json.RawMessage
+}
+
+func (c schemaCap) Manifest() capability.Manifest {
+	return capability.Manifest{Name: c.name, Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true, OutputSchema: c.output}
+}
+func (c schemaCap) Validate(context.Context, capability.Request) error { return nil }
+func (c schemaCap) Execute(context.Context, capability.Request) (capability.Result, error) {
+	return capability.Result{}, nil
+}
+
+func TestValidationRejectsUndeclaredOutputBindingsAndConditions(t *testing.T) {
+	registry := capability.NewRegistry()
+	if err := registry.Register(schemaCap{name: "source", output: json.RawMessage(`{"type":"object","additionalProperties":false,"required":["lines"],"properties":{"lines":{"type":"array","items":{"type":"string"}}}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(schemaCap{name: "sink", output: json.RawMessage(`{"type":"object","additionalProperties":false,"required":["ok"],"properties":{"ok":{"type":"boolean"}}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	valid := Definition{Name: "schema-bindings", Version: "1", Steps: []Step{
+		{ID: "source-step", Capability: "source", Input: json.RawMessage(`{}`)},
+		{ID: "sink-step", Capability: "sink", DependsOn: []string{"source-step"}, Input: json.RawMessage(`{"value":[]}`), Bindings: map[string]string{"value": "source-step.output.lines"}, Condition: "nonempty:source-step.output.lines"},
+	}}
+	if err := Validate(valid, registry); err != nil {
+		t.Fatalf("valid declared output binding rejected: %v", err)
+	}
+	invalidBinding := valid
+	invalidBinding.Steps = append([]Step(nil), valid.Steps...)
+	invalidBinding.Steps[1].Bindings = map[string]string{"value": "source-step.output.authorized_records"}
+	if err := Validate(invalidBinding, registry); err == nil {
+		t.Fatal("undeclared output binding was accepted")
+	}
+	invalidCondition := valid
+	invalidCondition.Steps = append([]Step(nil), valid.Steps...)
+	invalidCondition.Steps[1].Condition = "nonempty:source-step.output.typo"
+	if err := Validate(invalidCondition, registry); err == nil {
+		t.Fatal("undeclared output condition was accepted")
+	}
+}
 func TestRetryIdempotencyAndResume(t *testing.T) {
 	calls := 0
 	r := registryFor(t, testCap{"x", &calls, true})

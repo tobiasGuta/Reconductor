@@ -46,17 +46,36 @@ const (
 	VerdictManual       Verdict = "manual_review"
 )
 
+type EvidenceVerdict string
+
+const (
+	EvidenceObserved     EvidenceVerdict = "observed"
+	EvidenceNotObserved  EvidenceVerdict = "not_observed"
+	EvidenceInconclusive EvidenceVerdict = "inconclusive"
+)
+
+type ImpactVerdict string
+
+const (
+	ImpactUnreviewed ImpactVerdict = "unreviewed"
+	ImpactConfirmed  ImpactVerdict = "confirmed"
+	ImpactRejected   ImpactVerdict = "rejected"
+)
+
 type VerificationInput struct {
 	URL                       string              `json:"url"`
 	StatusCode                int                 `json:"status_code"`
 	Headers                   map[string][]string `json:"headers"`
 	Body                      json.RawMessage     `json:"body"`
 	UnauthenticatedStatusCode int                 `json:"unauthenticated_status_code"`
+	VerificationOrigin        string              `json:"verification_origin"`
 }
 type Verification struct {
-	Playbook string  `json:"playbook"`
-	Verdict  Verdict `json:"verdict"`
-	Summary  string  `json:"summary"`
+	Playbook        string          `json:"playbook"`
+	Verdict         Verdict         `json:"verdict"`
+	EvidenceVerdict EvidenceVerdict `json:"evidence_verdict"`
+	ImpactVerdict   ImpactVerdict   `json:"impact_verdict"`
+	Summary         string          `json:"summary"`
 }
 
 func Transition(from, to CandidateStatus) error {
@@ -71,15 +90,15 @@ func Verify(playbook string, in VerificationInput) Verification {
 	switch playbook {
 	case "exposed-file":
 		if in.StatusCode == 200 && (strings.Contains(body, "private key") || strings.Contains(body, "database_password") || strings.Contains(body, "aws_access_key_id")) {
-			return Verification{playbook, VerdictConfirmed, "independent response evidence contains an exposed-file marker"}
+			return observed(playbook, VerdictConfirmed, ImpactConfirmed, "independent response evidence contains an exposed-file marker")
 		}
 	case "openapi":
 		if in.StatusCode == 200 && (strings.Contains(body, `"openapi"`) || strings.Contains(body, `"swagger"`)) && strings.Contains(body, `"paths"`) {
-			return Verification{playbook, VerdictConfirmed, "response parses as a public API description candidate"}
+			return observed(playbook, VerdictManual, ImpactUnreviewed, "public API description behavior observed; security impact requires human review")
 		}
 	case "graphql-introspection":
 		if in.StatusCode == 200 && strings.Contains(body, `"__schema"`) {
-			return Verification{playbook, VerdictConfirmed, "GraphQL schema evidence was returned"}
+			return observed(playbook, VerdictManual, ImpactUnreviewed, "GraphQL introspection behavior observed; exposed data impact requires human review")
 		}
 	case "open-redirect":
 		u, err := url.Parse(in.URL)
@@ -87,7 +106,10 @@ func Verify(playbook string, in VerificationInput) Verification {
 			for _, v := range in.Headers["Location"] {
 				loc, e := url.Parse(v)
 				if e == nil && loc.IsAbs() && !strings.EqualFold(loc.Hostname(), u.Hostname()) {
-					return Verification{playbook, VerdictConfirmed, "redirect location points to the configured external verification origin"}
+					if matchesVerificationOrigin(in.VerificationOrigin, loc) {
+						return observed(playbook, VerdictManual, ImpactUnreviewed, "redirect to configured external verification origin observed; impact requires human review")
+					}
+					return observed(playbook, VerdictManual, ImpactUnreviewed, "external redirect behavior observed without configured-origin proof; impact requires human review")
 				}
 			}
 		}
@@ -95,20 +117,35 @@ func Verify(playbook string, in VerificationInput) Verification {
 		origin := first(in.Headers["X-Verification-Origin"])
 		allow := first(in.Headers["Access-Control-Allow-Origin"])
 		if origin != "" && origin == allow {
-			return Verification{playbook, VerdictConfirmed, "arbitrary verification origin was reflected"}
+			return observed(playbook, VerdictManual, ImpactUnreviewed, "CORS origin reflection observed; sensitive credentialed data exposure requires human review")
 		}
 	case "missing-authentication":
 		if in.UnauthenticatedStatusCode >= 200 && in.UnauthenticatedStatusCode < 300 {
-			return Verification{playbook, VerdictManual, "endpoint responded without credentials; authorization and impact require human review"}
+			return observed(playbook, VerdictManual, ImpactUnreviewed, "endpoint responded without credentials; authorization and impact require human review")
 		}
 	default:
-		return Verification{playbook, VerdictInconclusive, "unknown verification playbook"}
+		return Verification{Playbook: playbook, Verdict: VerdictInconclusive, EvidenceVerdict: EvidenceInconclusive, ImpactVerdict: ImpactUnreviewed, Summary: "unknown verification playbook"}
 	}
-	return Verification{playbook, VerdictRejected, "independent confirmation criteria were not met"}
+	return Verification{Playbook: playbook, Verdict: VerdictRejected, EvidenceVerdict: EvidenceNotObserved, ImpactVerdict: ImpactRejected, Summary: "independent observation criteria were not met"}
 }
 func first(v []string) string {
 	if len(v) == 0 {
 		return ""
 	}
 	return v[0]
+}
+
+func observed(playbook string, verdict Verdict, impact ImpactVerdict, summary string) Verification {
+	return Verification{Playbook: playbook, Verdict: verdict, EvidenceVerdict: EvidenceObserved, ImpactVerdict: impact, Summary: summary}
+}
+
+func matchesVerificationOrigin(raw string, loc *url.URL) bool {
+	if raw == "" || loc == nil {
+		return false
+	}
+	origin, err := url.Parse(raw)
+	if err != nil || origin.Hostname() == "" {
+		return false
+	}
+	return strings.EqualFold(origin.Scheme, loc.Scheme) && strings.EqualFold(origin.Hostname(), loc.Hostname()) && origin.Port() == loc.Port()
 }
