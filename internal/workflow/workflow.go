@@ -156,7 +156,7 @@ func Validate(d Definition, r *capability.Registry) error {
 			if _, ok := byID[parts[0]]; !ok {
 				return fmt.Errorf("step %s binding references unknown step %s", s.ID, parts[0])
 			}
-			if err := validateOutputPath(r, byID[parts[0]], parts[2]); err != nil {
+			if err := validateOutputPath(r, byID[parts[0]], parts[2:]); err != nil {
 				return fmt.Errorf("step %s binding %q: %w", s.ID, binding, err)
 			}
 		}
@@ -168,7 +168,7 @@ func Validate(d Definition, r *capability.Registry) error {
 				return fmt.Errorf("step %s condition references unknown step %s", s.ID, source)
 			}
 			if len(parts) >= 3 && parts[1] == "output" {
-				if err := validateOutputPath(r, byID[source], parts[2]); err != nil {
+				if err := validateOutputPath(r, byID[source], parts[2:]); err != nil {
 					return fmt.Errorf("step %s condition %q: %w", s.ID, s.Condition, err)
 				}
 			}
@@ -216,25 +216,114 @@ func Validate(d Definition, r *capability.Registry) error {
 	return nil
 }
 
-func validateOutputPath(r *capability.Registry, source Step, field string) error {
+func validateOutputPath(r *capability.Registry, source Step, path []string) error {
 	implementation, ok := r.Get(source.Capability)
 	if !ok {
 		return fmt.Errorf("source capability %q is not registered", source.Capability)
 	}
 	raw := implementation.Manifest().OutputSchema
-	if len(raw) == 0 {
+	if len(raw) == 0 || len(path) == 0 {
 		return nil
 	}
-	var schema struct {
-		Properties map[string]json.RawMessage `json:"properties"`
-	}
-	if err := json.Unmarshal(raw, &schema); err != nil || len(schema.Properties) == 0 {
-		return nil
-	}
-	if _, ok := schema.Properties[field]; !ok {
-		return fmt.Errorf("source capability %q does not declare output field %q", source.Capability, field)
+	if err := walkOutputSchema(raw, path); err != nil {
+		return fmt.Errorf("source capability %q does not declare output path %q: %w", source.Capability, strings.Join(path, "."), err)
 	}
 	return nil
+}
+
+func walkOutputSchema(raw json.RawMessage, path []string) error {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil
+	}
+	defs := map[string]json.RawMessage{}
+	if rawDefs, ok := root["$defs"]; ok {
+		_ = json.Unmarshal(rawDefs, &defs)
+	}
+	return walkSchema(root, defs, path)
+}
+
+func walkSchema(schema map[string]json.RawMessage, defs map[string]json.RawMessage, path []string) error {
+	resolved, err := resolveLocalRef(schema, defs)
+	if err != nil {
+		return err
+	}
+	schema = resolved
+	if len(path) == 0 {
+		return nil
+	}
+	if schemaType(schema) == "array" {
+		items, ok := schema["items"]
+		if !ok {
+			return fmt.Errorf("array schema has no items")
+		}
+		var itemSchema map[string]json.RawMessage
+		if err := json.Unmarshal(items, &itemSchema); err != nil {
+			return fmt.Errorf("array items are not an object schema")
+		}
+		return walkSchema(itemSchema, defs, path)
+	}
+	part := path[0]
+	expectArray := strings.HasSuffix(part, "[]")
+	field := strings.TrimSuffix(part, "[]")
+	properties := map[string]json.RawMessage{}
+	if rawProperties, ok := schema["properties"]; ok {
+		_ = json.Unmarshal(rawProperties, &properties)
+	}
+	child, ok := properties[field]
+	if !ok {
+		return fmt.Errorf("field %q is not declared", field)
+	}
+	var childSchema map[string]json.RawMessage
+	if err := json.Unmarshal(child, &childSchema); err != nil {
+		return fmt.Errorf("field %q schema is invalid", field)
+	}
+	if expectArray {
+		childSchema, err = resolveLocalRef(childSchema, defs)
+		if err != nil {
+			return err
+		}
+		if schemaType(childSchema) != "array" {
+			return fmt.Errorf("field %q is not an array", field)
+		}
+		items, ok := childSchema["items"]
+		if !ok {
+			return fmt.Errorf("field %q array schema has no items", field)
+		}
+		if err := json.Unmarshal(items, &childSchema); err != nil {
+			return fmt.Errorf("field %q array items are invalid", field)
+		}
+	}
+	return walkSchema(childSchema, defs, path[1:])
+}
+
+func resolveLocalRef(schema map[string]json.RawMessage, defs map[string]json.RawMessage) (map[string]json.RawMessage, error) {
+	rawRef, ok := schema["$ref"]
+	if !ok {
+		return schema, nil
+	}
+	var ref string
+	if err := json.Unmarshal(rawRef, &ref); err != nil {
+		return nil, fmt.Errorf("schema $ref is invalid")
+	}
+	if !strings.HasPrefix(ref, "#/$defs/") {
+		return nil, fmt.Errorf("unsupported schema ref %q", ref)
+	}
+	raw, ok := defs[strings.TrimPrefix(ref, "#/$defs/")]
+	if !ok {
+		return nil, fmt.Errorf("schema ref %q not found", ref)
+	}
+	var resolved map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &resolved); err != nil {
+		return nil, fmt.Errorf("schema ref %q is invalid", ref)
+	}
+	return resolveLocalRef(resolved, defs)
+}
+
+func schemaType(schema map[string]json.RawMessage) string {
+	var value string
+	_ = json.Unmarshal(schema["type"], &value)
+	return value
 }
 
 func transitivelyDependsOn(stepID, sourceID string, definitions map[string]Step) bool {
@@ -535,7 +624,7 @@ func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain
 		if plan.Definition.Timeout > 0 {
 			attemptCtx, cancelAttempt = context.WithTimeout(ctx, plan.Definition.Timeout)
 		}
-		outcome.Result, outcome.Err = e.Executor.Execute(attemptCtx, capability.Request{Action: action, Provider: plan.Definition.Provider, Approved: plan.Approved, Policy: policy.ParallelShare(e.Policy, plan.ParallelShare), Scope: e.Scope})
+		outcome.Result, outcome.Err = e.Executor.Execute(attemptCtx, capability.Request{Action: action, Provider: plan.Provider, Approved: plan.Approved, Policy: policy.ParallelShare(e.Policy, plan.ParallelShare), Scope: e.Scope})
 		cancelAttempt()
 		if outcome.Err == nil {
 			break

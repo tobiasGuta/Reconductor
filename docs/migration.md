@@ -10,6 +10,8 @@ Migration `0004_scope_target_plans.sql` adds defaulted program targeting metadat
 
 Migration `0005_policy_enforcement.sql` adds nullable artifact expiry metadata and its collection index. Existing artifact rows remain indefinite (`expires_at IS NULL`); retention applies to newly created artifacts according to the runtime policy.
 
+Migration `0006_verification_verdicts.sql` adds persisted `evidence_verdict` and `impact_verdict` columns to `verification_results`. Existing `rejected` rows are backfilled as `not_observed` and `rejected`; legacy `confirmed`, `inconclusive`, and `manual_review` rows remain conservatively `inconclusive` and `unreviewed` because older verifiers did not reliably distinguish technical behavior from confirmed impact.
+
 ## Environment and Compose
 
 Replace `RATE_LIMIT` with `NUCLEI_RATE_LIMIT` and `CONCURRENCY` with explicit host/template/headless concurrency variables. Add `DATABASE_URL` and `REDIS_PASSWORD`. Compare the complete new `.env.example`; duplicated per-binary parsers no longer exist.

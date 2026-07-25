@@ -3,12 +3,14 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/execution"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
 )
@@ -64,6 +66,33 @@ func (s *workerArtifacts) Put(_ context.Context, req artifact.PutRequest) (domai
 type workerScope struct{}
 
 func (workerScope) Allows(string) bool { return true }
+
+type parityCapability struct {
+	fail bool
+}
+
+func (parityCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "parity.cap", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true}
+}
+func (parityCapability) Validate(context.Context, capability.Request) error { return nil }
+func (c parityCapability) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+	now := time.Now().UTC()
+	exitCode := 0
+	tool := &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: req.Provider, ToolVersion: "test", SanitizedArguments: json.RawMessage(`{"safe":true}`), ExecutionEnvironment: json.RawMessage(`{"kind":"test"}`), StartedAt: now, CompletedAt: &now, ExitCode: &exitCode}
+	result := capability.Result{
+		Action:    domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "parity ok", Output: json.RawMessage(`{"lines":["https://x.test/"]}`)},
+		ToolRun:   tool,
+		RawStdout: []byte("raw stdout\n"),
+		RawStderr: []byte("raw stderr\n"),
+	}
+	if c.fail {
+		result.Action.Status = "failed"
+		result.Action.Summary = "parity failed"
+		result.Action.Error = &domain.StructuredError{Classification: "provider_error", Message: "temporary parity failure", Retryable: true}
+		return result, errors.New("temporary parity failure")
+	}
+	return result, nil
+}
 
 func TestWorkerExecutionUsesSharedPipelineForHistoryAndArtifacts(t *testing.T) {
 	registry := capability.NewRegistry()
@@ -126,6 +155,79 @@ func TestWorkerExecutionUsesSharedPipelineForHistoryAndArtifacts(t *testing.T) {
 	for _, id := range store.result.ArtifactIDs {
 		if id == stdoutID {
 			t.Fatalf("raw stdout artifact leaked into normalized action artifact IDs: %#v", store.result.ArtifactIDs)
+		}
+	}
+}
+
+func TestLocalAndWorkerExecutionPipelineParityForSuccessAndRetryableFailure(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		fail       bool
+		wantStatus domain.StepStatus
+	}{
+		{name: "success", wantStatus: domain.StepSucceeded},
+		{name: "retryable-failure", fail: true, wantStatus: domain.StepRetryable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := capability.NewRegistry()
+			if err := registry.Register(parityCapability{fail: test.fail}); err != nil {
+				t.Fatal(err)
+			}
+			programID, taskID, runID := domain.NewID(), domain.NewID(), domain.NewID()
+			localStore, localArtifacts := &workerStore{}, &workerArtifacts{}
+			workerStore, workerArtifacts := &workerStore{}, &workerArtifacts{}
+			localReq := capability.Request{Action: parityAction(taskID, runID, domain.NewID()), Provider: "resolved-provider", Policy: policy.Policy{AllowedCapabilities: []string{"parity.cap"}, ArtifactRetention: time.Hour}, Scope: workerScope{}}
+			localResult, localErr := (execution.Service{Registry: registry, Store: localStore, Artifacts: localArtifacts, ProgramID: programID}).Execute(context.Background(), localReq)
+			workerDelivery := queue.Delivery{Job: queue.Job{ProgramID: programID, Action: parityAction(taskID, runID, domain.NewID()), Policy: policy.Policy{AllowedCapabilities: []string{"parity.cap"}, ArtifactRetention: time.Hour}}}
+			workerResult, workerErr := (&Service{Registry: registry, Results: workerStore, Artifacts: workerArtifacts}).executeJob(context.Background(), workerDelivery, "resolved-provider", workerScope{}, nil)
+			if (localErr == nil) != (workerErr == nil) {
+				t.Fatalf("local err=%v worker err=%v", localErr, workerErr)
+			}
+			if localResult.Action.Status != workerResult.Action.Status || localResult.Action.Summary != workerResult.Action.Summary {
+				t.Fatalf("action mismatch local=%#v worker=%#v", localResult.Action, workerResult.Action)
+			}
+			if localStore.step.Status != test.wantStatus || workerStore.step.Status != test.wantStatus {
+				t.Fatalf("step status local=%s worker=%s want=%s", localStore.step.Status, workerStore.step.Status, test.wantStatus)
+			}
+			if localStore.tool.Provider != "resolved-provider" || workerStore.tool.Provider != "resolved-provider" {
+				t.Fatalf("provider attribution local=%#v worker=%#v", localStore.tool, workerStore.tool)
+			}
+			assertArtifactRoles(t, "local", localStore, localArtifacts)
+			assertArtifactRoles(t, "worker", workerStore, workerArtifacts)
+		})
+	}
+}
+
+func parityAction(taskID, runID, stepID domain.ID) domain.ActionRequest {
+	return domain.ActionRequest{ID: domain.NewID(), TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "parity.cap", Input: json.RawMessage(`{"ok":true}`), IdempotencyKey: string(stepID)}
+}
+
+func assertArtifactRoles(t *testing.T, name string, store *workerStore, artifacts *workerArtifacts) {
+	t.Helper()
+	if len(artifacts.puts) != 3 || len(store.artifacts) != 3 {
+		t.Fatalf("%s artifact count puts=%d persisted=%d", name, len(artifacts.puts), len(store.artifacts))
+	}
+	roles := map[string]string{}
+	for _, put := range artifacts.puts {
+		roles[put.Name] = put.Type + "|" + put.ContentType
+	}
+	if roles["stdout.jsonl"] != "raw-provider-output|application/x-ndjson" || roles["stderr.txt"] != "raw-provider-output|text/plain" || roles["result.json"] != "normalized-result|application/json" {
+		t.Fatalf("%s artifact roles=%#v", name, roles)
+	}
+	for _, artifact := range store.artifacts {
+		if artifact.StorageLocation == "memory://stdout.jsonl" && (store.tool.StdoutArtifactID == nil || *store.tool.StdoutArtifactID != artifact.ID) {
+			t.Fatalf("%s stdout pointer mismatch", name)
+		}
+		if artifact.StorageLocation == "memory://stderr.txt" && (store.tool.StderrArtifactID == nil || *store.tool.StderrArtifactID != artifact.ID) {
+			t.Fatalf("%s stderr pointer mismatch", name)
+		}
+		if artifact.StorageLocation == "memory://result.json" {
+			for _, id := range store.result.ArtifactIDs {
+				if id == artifact.ID {
+					return
+				}
+			}
+			t.Fatalf("%s normalized result artifact not attached to action result", name)
 		}
 	}
 }

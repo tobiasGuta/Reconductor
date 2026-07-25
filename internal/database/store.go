@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/findings"
 	"github.com/tobiasGuta/Reconductor/internal/migrations"
 	"github.com/tobiasGuta/Reconductor/internal/normalize"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
@@ -364,6 +366,83 @@ func (s *Store) StepApprovalDecision(ctx context.Context, stepID domain.ID) (str
 	return decision, err
 }
 
+func (s *Store) RecordVerification(ctx context.Context, candidateID domain.ID, independentProvider string, verification findings.Verification, evidenceArtifactIDs []domain.ID) (domain.ID, error) {
+	if candidateID == "" {
+		return "", fmt.Errorf("candidate id is required")
+	}
+	if strings.TrimSpace(independentProvider) == "" {
+		return "", fmt.Errorf("independent provider is required")
+	}
+	if strings.TrimSpace(verification.Playbook) == "" {
+		return "", fmt.Errorf("verification playbook is required")
+	}
+	if strings.TrimSpace(verification.Summary) == "" {
+		return "", fmt.Errorf("verification summary is required")
+	}
+	if !validVerificationVerdict(verification.Verdict) || !validEvidenceVerdict(verification.EvidenceVerdict) || !validImpactVerdict(verification.ImpactVerdict) {
+		return "", fmt.Errorf("verification verdicts are invalid")
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+	id := domain.NewID()
+	if _, err := tx.Exec(ctx, `INSERT INTO verification_results(id,candidate_id,playbook,independent_provider,verdict,evidence_verdict,impact_verdict,summary,evidence_artifact_ids) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, candidateID, verification.Playbook, independentProvider, verification.Verdict, verification.EvidenceVerdict, verification.ImpactVerdict, verification.Summary, idStrings(evidenceArtifactIDs)); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,safe_message,details) SELECT $1,'verification_recorded','findings',$2,cf.task_id,t.program_id,cf.workflow_run_id,'verification verdict recorded',$3 FROM candidate_findings cf JOIN tasks t ON t.id=cf.task_id WHERE cf.id=$4`, domain.NewID(), independentProvider, mustJSON(map[string]any{"candidate_id": candidateID, "verification_id": id, "playbook": verification.Playbook, "verdict": verification.Verdict, "evidence_verdict": verification.EvidenceVerdict, "impact_verdict": verification.ImpactVerdict}), candidateID); err != nil {
+		return "", err
+	}
+	return id, tx.Commit(ctx)
+}
+
+func (s *Store) PromoteVerifiedFinding(ctx context.Context, candidateID domain.ID, actor string) (domain.ID, error) {
+	if candidateID == "" {
+		return "", fmt.Errorf("candidate id is required")
+	}
+	if strings.TrimSpace(actor) == "" {
+		actor = "verification"
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var programID, assetID domain.ID
+	var title, severity, impact string
+	err = tx.QueryRow(ctx, `WITH latest AS (
+		SELECT summary,evidence_verdict,impact_verdict
+		FROM verification_results
+		WHERE candidate_id=$1
+		ORDER BY created_at DESC,id DESC
+		LIMIT 1
+	)
+	SELECT t.program_id,cf.target_asset_id,cf.claimed_vulnerability,cf.severity,latest.summary
+	FROM candidate_findings cf
+	JOIN tasks t ON t.id=cf.task_id
+	JOIN latest ON latest.evidence_verdict='observed' AND latest.impact_verdict='confirmed'
+	WHERE cf.id=$1`, candidateID).Scan(&programID, &assetID, &title, &severity, &impact)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("candidate %s does not have observed evidence with confirmed impact", candidateID)
+	}
+	if err != nil {
+		return "", err
+	}
+	id := domain.NewID()
+	if err := tx.QueryRow(ctx, `INSERT INTO verified_findings(id,candidate_id,program_id,asset_id,title,severity,status,impact_statement) VALUES($1,$2,$3,$4,$5,$6,'open',$7) ON CONFLICT(candidate_id) DO UPDATE SET title=EXCLUDED.title,severity=EXCLUDED.severity,impact_statement=EXCLUDED.impact_statement,last_verified_at=now() RETURNING id`, id, candidateID, programID, assetID, title, severity, impact).Scan(&id); err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE candidate_findings SET status='confirmed',updated_at=now() WHERE id=$1`, candidateID); err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,program_id,safe_message,details) VALUES($1,'verified_finding_promoted','findings',$2,$3,'verified finding promoted',$4)`, domain.NewID(), actor, programID, mustJSON(map[string]any{"candidate_id": candidateID, "verified_finding_id": id})); err != nil {
+		return "", err
+	}
+	return id, tx.Commit(ctx)
+}
+
 func (s *Store) AlreadySucceeded(ctx context.Context, key string) (bool, error) {
 	var ok bool
 	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM step_runs WHERE idempotency_key=$1 AND status='succeeded')`, key).Scan(&ok)
@@ -576,6 +655,41 @@ func artifactStrings(items []domain.Artifact) []string {
 	}
 	return out
 }
+func idStrings(items []domain.ID) []string {
+	out := make([]string, 0, len(items))
+	for _, id := range items {
+		out = append(out, string(id))
+	}
+	return out
+}
+
+func validVerificationVerdict(value findings.Verdict) bool {
+	switch value {
+	case findings.VerdictConfirmed, findings.VerdictRejected, findings.VerdictInconclusive, findings.VerdictManual:
+		return true
+	default:
+		return false
+	}
+}
+
+func validEvidenceVerdict(value findings.EvidenceVerdict) bool {
+	switch value {
+	case findings.EvidenceObserved, findings.EvidenceNotObserved, findings.EvidenceInconclusive:
+		return true
+	default:
+		return false
+	}
+}
+
+func validImpactVerdict(value findings.ImpactVerdict) bool {
+	switch value {
+	case findings.ImpactUnreviewed, findings.ImpactConfirmed, findings.ImpactRejected:
+		return true
+	default:
+		return false
+	}
+}
+
 func persistEndpoints(ctx context.Context, tx pgx.Tx, programID domain.ID, raw json.RawMessage) error {
 	var payload struct {
 		Endpoints []normalize.EndpointKey `json:"endpoints"`

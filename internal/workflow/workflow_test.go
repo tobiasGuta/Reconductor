@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -97,7 +98,7 @@ func (c schemaCap) Execute(context.Context, capability.Request) (capability.Resu
 
 func TestValidationRejectsUndeclaredOutputBindingsAndConditions(t *testing.T) {
 	registry := capability.NewRegistry()
-	if err := registry.Register(schemaCap{name: "source", output: json.RawMessage(`{"type":"object","additionalProperties":false,"required":["lines"],"properties":{"lines":{"type":"array","items":{"type":"string"}}}}`)}); err != nil {
+	if err := registry.Register(schemaCap{name: "source", output: json.RawMessage(`{"type":"object","additionalProperties":false,"required":["lines","status_routes","records"],"properties":{"lines":{"type":"array","items":{"type":"string"}},"status_routes":{"type":"object","additionalProperties":false,"required":["active"],"properties":{"active":{"type":"array","items":{"type":"string"}}}},"records":{"type":"array","items":{"$ref":"#/$defs/record"}}},"$defs":{"record":{"type":"object","additionalProperties":false,"required":["provider","target"],"properties":{"provider":{"type":"string"},"target":{"type":"string"}}}}}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := registry.Register(schemaCap{name: "sink", output: json.RawMessage(`{"type":"object","additionalProperties":false,"required":["ok"],"properties":{"ok":{"type":"boolean"}}}`)}); err != nil {
@@ -105,7 +106,7 @@ func TestValidationRejectsUndeclaredOutputBindingsAndConditions(t *testing.T) {
 	}
 	valid := Definition{Name: "schema-bindings", Version: "1", Steps: []Step{
 		{ID: "source-step", Capability: "source", Input: json.RawMessage(`{}`)},
-		{ID: "sink-step", Capability: "sink", DependsOn: []string{"source-step"}, Input: json.RawMessage(`{"value":[]}`), Bindings: map[string]string{"value": "source-step.output.lines"}, Condition: "nonempty:source-step.output.lines"},
+		{ID: "sink-step", Capability: "sink", DependsOn: []string{"source-step"}, Input: json.RawMessage(`{"value":[]}`), Bindings: map[string]string{"value": "source-step.output.lines", "active": "source-step.output.status_routes.active", "provider": "source-step.output.records.provider", "target": "source-step.output.records[].target"}, Condition: "nonempty:source-step.output.status_routes.active"},
 	}}
 	if err := Validate(valid, registry); err != nil {
 		t.Fatalf("valid declared output binding rejected: %v", err)
@@ -121,6 +122,18 @@ func TestValidationRejectsUndeclaredOutputBindingsAndConditions(t *testing.T) {
 	invalidCondition.Steps[1].Condition = "nonempty:source-step.output.typo"
 	if err := Validate(invalidCondition, registry); err == nil {
 		t.Fatal("undeclared output condition was accepted")
+	}
+	invalidNested := valid
+	invalidNested.Steps = append([]Step(nil), valid.Steps...)
+	invalidNested.Steps[1].Bindings = map[string]string{"value": "source-step.output.status_routes.nonexistent_field"}
+	if err := Validate(invalidNested, registry); err == nil || !strings.Contains(err.Error(), `status_routes.nonexistent_field`) {
+		t.Fatal("undeclared nested output binding was accepted")
+	}
+	invalidArrayItem := valid
+	invalidArrayItem.Steps = append([]Step(nil), valid.Steps...)
+	invalidArrayItem.Steps[1].Bindings = map[string]string{"value": "source-step.output.records.nonexistent_field"}
+	if err := Validate(invalidArrayItem, registry); err == nil || !strings.Contains(err.Error(), `records.nonexistent_field`) {
+		t.Fatal("undeclared array item output binding was accepted")
 	}
 }
 func TestRetryIdempotencyAndResume(t *testing.T) {
@@ -469,6 +482,38 @@ func TestControlCancellationStopsActivelyRunningStep(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("active step did not stop after cancellation")
+	}
+}
+
+type defaultProviderCap struct{}
+
+func (defaultProviderCap) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "implicit.provider", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true, SupportedProviders: []string{"default-provider"}}
+}
+func (defaultProviderCap) Validate(context.Context, capability.Request) error { return nil }
+func (defaultProviderCap) Execute(context.Context, capability.Request) (capability.Result, error) {
+	return capability.Result{}, nil
+}
+
+type providerCaptureExecutor struct {
+	provider string
+}
+
+func (e *providerCaptureExecutor) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+	e.provider = req.Provider
+	return capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "ok", Output: json.RawMessage(`{"lines":[]}`)}}, nil
+}
+
+func TestExecuteStepUsesResolvedDefaultProvider(t *testing.T) {
+	registry := registryFor(t, defaultProviderCap{})
+	executor := &providerCaptureExecutor{}
+	engine := Engine{Registry: registry, Executor: executor, Policy: policy.Policy{AllowedCapabilities: []string{"implicit.provider"}}, Scope: allScope{}}
+	definition := Definition{ID: domain.NewID(), Name: "provider", Version: "1", Steps: []Step{{ID: "step", Capability: "implicit.provider", Input: json.RawMessage(`{}`)}}}
+	if _, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), ProgramID: domain.NewID()}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if executor.provider != "default-provider" {
+		t.Fatalf("provider=%q", executor.provider)
 	}
 }
 

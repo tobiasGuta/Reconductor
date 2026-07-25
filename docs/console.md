@@ -19,6 +19,7 @@ The default address is `http://127.0.0.1:8088`. A different loopback port may be
 - Stable assets and their latest persisted observations
 - New, changed, and removed asset summary from the latest completed comparison
 - Candidate findings kept separate from verified findings
+- Verification results with compatibility, evidence, and impact verdict labels
 - Redis pending count, sanitized dead-letter metadata, and manual retry controls
 - Sanitized provider execution metadata and safe audit messages
 

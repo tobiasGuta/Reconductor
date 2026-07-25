@@ -25,6 +25,7 @@ type ConsoleSnapshot struct {
 	Tools              []ConsoleToolRun         `json:"tool_runs"`
 	Assets             []ConsoleAsset           `json:"assets"`
 	Candidates         []ConsoleCandidate       `json:"candidate_findings"`
+	Verifications      []ConsoleVerification    `json:"verification_results"`
 	VerifiedFindings   []ConsoleVerifiedFinding `json:"verified_findings"`
 	Approvals          []ConsoleApproval        `json:"approvals"`
 	AuditEvents        []ConsoleAuditEvent      `json:"audit_events"`
@@ -108,17 +109,33 @@ type ConsoleAsset struct {
 }
 
 type ConsoleCandidate struct {
-	ID                   domain.ID `json:"id"`
-	WorkflowRunID        domain.ID `json:"workflow_run_id"`
-	Target               string    `json:"target"`
-	SourceCapability     string    `json:"source_capability"`
-	TemplateID           string    `json:"template_id"`
-	ClaimedVulnerability string    `json:"claimed_vulnerability"`
-	Severity             string    `json:"severity"`
-	DetectionConfidence  float64   `json:"detection_confidence"`
-	Status               string    `json:"status"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	ID                        domain.ID `json:"id"`
+	WorkflowRunID             domain.ID `json:"workflow_run_id"`
+	Target                    string    `json:"target"`
+	SourceCapability          string    `json:"source_capability"`
+	TemplateID                string    `json:"template_id"`
+	ClaimedVulnerability      string    `json:"claimed_vulnerability"`
+	Severity                  string    `json:"severity"`
+	DetectionConfidence       float64   `json:"detection_confidence"`
+	Status                    string    `json:"status"`
+	LatestVerdict             string    `json:"latest_verdict,omitempty"`
+	LatestEvidenceVerdict     string    `json:"latest_evidence_verdict,omitempty"`
+	LatestImpactVerdict       string    `json:"latest_impact_verdict,omitempty"`
+	LatestVerificationSummary string    `json:"latest_verification_summary,omitempty"`
+	CreatedAt                 time.Time `json:"created_at"`
+	UpdatedAt                 time.Time `json:"updated_at"`
+}
+
+type ConsoleVerification struct {
+	ID                  domain.ID `json:"id"`
+	CandidateID         domain.ID `json:"candidate_id"`
+	Playbook            string    `json:"playbook"`
+	IndependentProvider string    `json:"independent_provider"`
+	Verdict             string    `json:"verdict"`
+	EvidenceVerdict     string    `json:"evidence_verdict"`
+	ImpactVerdict       string    `json:"impact_verdict"`
+	Summary             string    `json:"summary"`
+	CreatedAt           time.Time `json:"created_at"`
 }
 
 type ConsoleVerifiedFinding struct {
@@ -173,6 +190,7 @@ func (s *Store) ConsoleSnapshot(ctx context.Context, requestedProgramID domain.I
 		Tools:            []ConsoleToolRun{},
 		Assets:           []ConsoleAsset{},
 		Candidates:       []ConsoleCandidate{},
+		Verifications:    []ConsoleVerification{},
 		VerifiedFindings: []ConsoleVerifiedFinding{},
 		Approvals:        []ConsoleApproval{},
 		AuditEvents:      []ConsoleAuditEvent{},
@@ -322,17 +340,35 @@ func (s *Store) loadConsoleAssets(ctx context.Context, programID domain.ID, out 
 }
 
 func (s *Store) loadConsoleFindings(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {
-	rows, err := s.Pool.Query(ctx, `SELECT cf.id,cf.workflow_run_id,a.canonical_value,cf.source_capability,cf.template_id,cf.claimed_vulnerability,cf.severity,cf.detection_confidence,cf.status,cf.created_at,cf.updated_at FROM candidate_findings cf JOIN tasks t ON t.id=cf.task_id JOIN assets a ON a.id=cf.target_asset_id WHERE t.program_id=$1 ORDER BY cf.updated_at DESC LIMIT 150`, programID)
+	rows, err := s.Pool.Query(ctx, `SELECT cf.id,cf.workflow_run_id,a.canonical_value,cf.source_capability,cf.template_id,cf.claimed_vulnerability,cf.severity,cf.detection_confidence,cf.status,COALESCE(latest.verdict,''),COALESCE(latest.evidence_verdict,''),COALESCE(latest.impact_verdict,''),COALESCE(latest.summary,''),cf.created_at,cf.updated_at FROM candidate_findings cf JOIN tasks t ON t.id=cf.task_id JOIN assets a ON a.id=cf.target_asset_id LEFT JOIN LATERAL (SELECT verdict,evidence_verdict,impact_verdict,summary FROM verification_results vr WHERE vr.candidate_id=cf.id ORDER BY vr.created_at DESC,vr.id DESC LIMIT 1) latest ON true WHERE t.program_id=$1 ORDER BY cf.updated_at DESC LIMIT 150`, programID)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
 		var item ConsoleCandidate
-		if err := rows.Scan(&item.ID, &item.WorkflowRunID, &item.Target, &item.SourceCapability, &item.TemplateID, &item.ClaimedVulnerability, &item.Severity, &item.DetectionConfidence, &item.Status, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.WorkflowRunID, &item.Target, &item.SourceCapability, &item.TemplateID, &item.ClaimedVulnerability, &item.Severity, &item.DetectionConfidence, &item.Status, &item.LatestVerdict, &item.LatestEvidenceVerdict, &item.LatestImpactVerdict, &item.LatestVerificationSummary, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			rows.Close()
 			return err
 		}
 		out.Candidates = append(out.Candidates, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	rows, err = s.Pool.Query(ctx, `SELECT vr.id,vr.candidate_id,vr.playbook,vr.independent_provider,vr.verdict,vr.evidence_verdict,vr.impact_verdict,vr.summary,vr.created_at FROM verification_results vr JOIN candidate_findings cf ON cf.id=vr.candidate_id JOIN tasks t ON t.id=cf.task_id WHERE t.program_id=$1 ORDER BY vr.created_at DESC LIMIT 150`, programID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var item ConsoleVerification
+		if err := rows.Scan(&item.ID, &item.CandidateID, &item.Playbook, &item.IndependentProvider, &item.Verdict, &item.EvidenceVerdict, &item.ImpactVerdict, &item.Summary, &item.CreatedAt); err != nil {
+			rows.Close()
+			return err
+		}
+		out.Verifications = append(out.Verifications, item)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()

@@ -1,6 +1,6 @@
 # Workflows
 
-Workflow definitions contain stable capability names, typed JSON inputs, dependency IDs, bounded retries, timeouts, supported conditions, and explicit output bindings. Validation rejects cycles, unknown capabilities, invalid JSON, missing dependencies, unsupported conditions, undeclared binding sources, and bindings or output conditions that reference fields absent from the source capability's output schema. There is no command or script field.
+Workflow definitions contain stable capability names, typed JSON inputs, dependency IDs, bounded retries, timeouts, supported conditions, and explicit output bindings. Validation rejects cycles, unknown capabilities, invalid JSON, missing dependencies, unsupported conditions, undeclared binding sources, and bindings or output conditions that reference paths absent from the source capability's output schema. Output-path validation walks nested object properties, array item schemas, local `$defs` references, and the `[]` binding notation. There is no command or script field.
 
 The engine persists before and after each meaningful state transition. A resumed run retains a succeeded step when its normalized input hash is unchanged. It reruns only when the definition opts into input-change reruns or the operator starts an explicit retry. Pause, cancellation, skipped steps, retryable failures, approvals, and terminal states are distinct.
 
