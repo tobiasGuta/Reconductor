@@ -12,6 +12,8 @@ Capability manifests also declare authentication, directory-fuzzing, cross-origi
 
 Internal capabilities use the same contract discipline as command providers: concrete typed inputs and outputs, closed JSON Schemas, strict unknown-field rejection, and semantic validation during workflow-definition loading and immediately before execution.
 
+Endpoint intelligence is deterministic and evidence-based. Scope-authorized HTTPX, Katana, and GAU records are classified using request shape, response metadata, JavaScript relationships, authentication indicators, technologies, API-schema evidence, history, and source confidence. Every promoted endpoint carries its labels, weighted signals, score, confidence, and provenance into the normalized result and changes report.
+
 Burp-compatible scope JSON is the targeting source of truth. Exact active seeds stay separate from passive discovery roots: `*.dev.example.test` may derive the passive root `dev.example.test`, but that root is never probed unless a complete protocol/host/port/path evaluation independently authorizes it. Exclusions always win.
 
 The built-in Nuclei profile excludes denial-of-service, brute-force, fuzzing, and intrusive tags. Scanner matches are persisted as candidate findings with a default confidence, not as verified findings. Independent deterministic verification or human review is required before promotion.

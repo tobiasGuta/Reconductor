@@ -11,3 +11,21 @@ External providers receive only validated structured fields. They construct fixe
 `discover.subdomains` supports Subfinder by default and Chaos when `CHAOS_KEY` is configured and the provider is explicitly selected. Katana receives `-headless` only when requested and policy-approved. Nuclei runs in a dedicated per-execution process so callback correlation never requires changing the target URL; it receives the centralized rate, host/template/headless concurrency, timeout, severity, include-tag, exclude-tag, and template-directory settings. Takeover is not added implicitly or executed twice.
 
 The internal `targeting.prepare` capability rechecks and deduplicates exact and discovered URLs immediately before active execution. Other internal capabilities classify normalized endpoint identities, compare snapshots, and produce changes-only reports without launching a subprocess. Each internal capability has a dedicated input/output Go type and a closed JSON Schema with required fields and `additionalProperties: false`. Definition validation and runtime validation both reject missing, null, mistyped, semantically invalid, and unexpected fields before capability execution. Redacted raw stdout/stderr and normalized result artifacts are stored separately.
+
+## Endpoint intelligence
+
+`classify.endpoint` version 3 consumes only scope-authorized structured records. Provider outputs retain a separate `authorized_records` collection after the protocol, host, port, path, and exclusion checks; raw normalized records are never bound into the classifier workflow input.
+
+Classification is deterministic and explainable. Each normalized endpoint contains labels, individual weighted signals, an interest score, source confidence, provider sources, technologies, statuses, redirects, JavaScript relationships, and historical behavior. Signals cover:
+
+- exact path and query-name keywords, without substring matches such as `api` inside `capistrano`;
+- query parameters and normalized path parameters;
+- non-read HTTP methods and API-oriented content types;
+- JavaScript source relationships;
+- authentication keywords, response statuses, and `WWW-Authenticate` evidence;
+- technology fingerprints;
+- declared API-schema membership and discovered schema documents;
+- response status, redirect destination, and server errors;
+- new endpoints, status changes, technology changes, and multi-source corroboration.
+
+Endpoints with a score of at least 2 enter `interesting_endpoints`; all normalized endpoints remain in `classifications`. Confidence is a bounded deterministic evidence score, not a vulnerability probability. The full evidence object is persisted as the normalized step-result artifact and is passed unchanged into the changes report.

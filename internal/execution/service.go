@@ -160,14 +160,38 @@ func historicalRecords(values []string) ([]any, error) {
 			return nil, fmt.Errorf("historical observation %d: %w", index, err)
 		}
 		if target, _ := item["target"].(string); target != "" {
+			if provider, _ := item["provider"].(string); provider == "" {
+				item["provider"] = "httpx"
+			}
+			if kind, _ := item["kind"].(string); kind == "" {
+				item["kind"] = "url"
+			}
 			out = append(out, item)
 			continue
 		}
-		legacy, _ := item["value"].(string)
+		legacy := firstHistoricalString(item, "value", "url", "input")
 		if legacy == "" {
 			return nil, fmt.Errorf("historical observation %d has no target", index)
 		}
-		out = append(out, map[string]any{"provider": "historical", "kind": "url", "target": legacy, "fields": map[string]any{}})
+		upgraded := map[string]any{"provider": "httpx", "kind": "url", "target": legacy, "fields": item}
+		if status, ok := item["status_code"]; ok {
+			upgraded["status_code"] = status
+		}
+		if technologies, ok := item["technologies"]; ok {
+			upgraded["technologies"] = technologies
+		} else if technologies, ok := item["tech"]; ok {
+			upgraded["technologies"] = technologies
+		}
+		out = append(out, upgraded)
 	}
 	return out, nil
+}
+
+func firstHistoricalString(item map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := item[key].(string); ok && value != "" {
+			return value
+		}
+	}
+	return ""
 }

@@ -67,6 +67,12 @@ type observation struct {
 	source string
 }
 
+type parsedObservation struct {
+	observation
+	key     normalize.EndpointKey
+	details recordDetails
+}
+
 type aggregate struct {
 	classification  EndpointClassification
 	signalSet       map[string]bool
@@ -98,19 +104,33 @@ func Classify(input Input) (Output, error) {
 	if err != nil {
 		return Output{}, err
 	}
-	history := historicalIndex(input.HistoricalObservations)
-	aggregates := map[string]*aggregate{}
+	history, err := historicalIndex(input.HistoricalObservations)
+	if err != nil {
+		return Output{}, err
+	}
+	parsed := make([]parsedObservation, 0, len(current))
 	for index, item := range current {
 		key, details, err := endpointFromRecord(item.record)
 		if err != nil {
 			return Output{}, fmt.Errorf("%s observation %d: %w", item.source, index, err)
 		}
+		parsed = append(parsed, parsedObservation{observation: item, key: key, details: details})
+	}
+	sort.Slice(parsed, func(i, j int) bool {
+		left, right := parsed[i], parsed[j]
+		leftKey := left.key.Digest + "\x00" + left.key.ExactURL + "\x00" + left.source + "\x00" + left.record.Provider
+		rightKey := right.key.Digest + "\x00" + right.key.ExactURL + "\x00" + right.source + "\x00" + right.record.Provider
+		return leftKey < rightKey
+	})
+	aggregates := map[string]*aggregate{}
+	for _, item := range parsed {
+		key, details := item.key, item.details
 		entry := aggregates[key.Digest]
 		if entry == nil {
 			entry = newAggregate(key)
 			aggregates[key.Digest] = entry
 		}
-		applyObservation(entry, item, details)
+		applyObservation(entry, item.observation, details)
 		if apiExact[key.ExactURL] || apiRoutes[key.RouteSignature] {
 			entry.addLabel("api_schema_member")
 			entry.addSignal("api_schema_membership", key.RouteSignature, 3, "api_schema")
@@ -157,22 +177,51 @@ func Classify(input Input) (Output, error) {
 }
 
 type recordDetails struct {
-	method, contentType, redirect, sourceURL string
-	status                                   int
-	technologies                             []string
+	method, requestContentType, responseContentType string
+	redirect, sourceURL                             string
+	status                                          int
+	technologies                                    []string
 }
 
 func endpointFromRecord(record provideroutput.Record) (normalize.EndpointKey, recordDetails, error) {
-	if record.Kind != "" && record.Kind != provideroutput.URLRecord {
+	if strings.TrimSpace(record.Provider) == "" {
+		return normalize.EndpointKey{}, recordDetails{}, fmt.Errorf("record provider is required")
+	}
+	if record.Kind != provideroutput.URLRecord {
 		return normalize.EndpointKey{}, recordDetails{}, fmt.Errorf("record kind %q is not a URL", record.Kind)
 	}
+	if record.StatusCode < 0 || record.StatusCode > 599 {
+		return normalize.EndpointKey{}, recordDetails{}, fmt.Errorf("record status code %d is outside 0-599", record.StatusCode)
+	}
+	parsedTarget, err := url.Parse(strings.TrimSpace(record.Target))
+	if err != nil || parsedTarget.Hostname() == "" || (parsedTarget.Scheme != "http" && parsedTarget.Scheme != "https") {
+		return normalize.EndpointKey{}, recordDetails{}, fmt.Errorf("record target must be an absolute HTTP URL")
+	}
+	requestFields := nestedObject(record.Fields, "request")
+	responseFields := nestedObject(record.Fields, "response")
+	requestContentType := directString(record.Fields, "request_content_type", "request-content-type")
+	if requestContentType == "" {
+		requestContentType = firstNestedString(requestFields, "content_type", "content-type")
+	}
+	responseContentType := directString(record.Fields, "response_content_type", "response-content-type")
+	if responseContentType == "" {
+		responseContentType = firstNestedString(responseFields, "content_type", "content-type")
+	}
+	if responseContentType == "" {
+		responseContentType = directString(record.Fields, "content_type", "content-type", "mime_type", "mime-type")
+	}
+	method := firstNestedString(requestFields, "method")
+	if method == "" {
+		method = directString(record.Fields, "method")
+	}
 	details := recordDetails{
-		method:       strings.ToUpper(firstNestedString(record.Fields, "method")),
-		contentType:  firstNestedString(record.Fields, "content_type", "content-type", "mime_type", "mime-type"),
-		redirect:     firstNestedString(record.Fields, "final-url", "final_url", "redirect", "location"),
-		sourceURL:    firstNestedString(record.Fields, "source_url", "source", "referer", "referrer"),
-		status:       record.StatusCode,
-		technologies: append([]string{}, record.Technologies...),
+		method:              strings.ToUpper(method),
+		requestContentType:  requestContentType,
+		responseContentType: responseContentType,
+		redirect:            firstNestedString(record.Fields, "final-url", "final_url", "redirect", "location"),
+		sourceURL:           firstNestedString(record.Fields, "source_url", "source", "referer", "referrer"),
+		status:              record.StatusCode,
+		technologies:        append([]string{}, record.Technologies...),
 	}
 	if details.method == "" {
 		details.method = "GET"
@@ -181,7 +230,7 @@ func endpointFromRecord(record provideroutput.Record) (normalize.EndpointKey, re
 		details.status = firstNestedInt(record.Fields, "status_code", "status-code", "status")
 	}
 	details.technologies = append(details.technologies, firstNestedStrings(record.Fields, "tech", "technologies")...)
-	key, err := normalize.Endpoint(record.Target, details.method, details.contentType)
+	key, err := normalize.Endpoint(record.Target, details.method, details.requestContentType)
 	if err != nil {
 		return normalize.EndpointKey{}, recordDetails{}, err
 	}
@@ -232,7 +281,10 @@ func applyObservation(entry *aggregate, item observation, details recordDetails)
 		entry.addLabel("non_read_method")
 		entry.addSignal("http_method", details.method, 2, source)
 	}
-	contentType := strings.ToLower(details.contentType)
+	contentType := strings.ToLower(details.responseContentType)
+	if contentType == "" {
+		contentType = strings.ToLower(details.requestContentType)
+	}
 	if strings.Contains(contentType, "json") || strings.Contains(contentType, "graphql") {
 		entry.addLabel("api_content")
 		entry.addSignal("content_type", contentType, 1, source)
@@ -281,15 +333,16 @@ func applyURLSignals(entry *aggregate, endpoint normalize.EndpointKey, source st
 	}
 }
 
-func historicalIndex(records []provideroutput.Record) map[string][]recordDetails {
+func historicalIndex(records []provideroutput.Record) (map[string][]recordDetails, error) {
 	out := map[string][]recordDetails{}
-	for _, record := range records {
+	for index, record := range records {
 		key, details, err := endpointFromRecord(record)
-		if err == nil {
-			out[historyKey(key)] = append(out[historyKey(key)], details)
+		if err != nil {
+			return nil, fmt.Errorf("historical observation %d: %w", index, err)
 		}
+		out[historyKey(key)] = append(out[historyKey(key)], details)
 	}
-	return out
+	return out, nil
 }
 
 func applyHistoricalComparison(entry *aggregate, current recordDetails, previous []recordDetails) {
@@ -347,7 +400,7 @@ func finalize(entry *aggregate) {
 func newAggregate(key normalize.EndpointKey) *aggregate {
 	return &aggregate{
 		classification: EndpointClassification{Endpoint: key, Labels: []string{}, MatchedKeywords: []string{}, Signals: []Signal{}, Sources: []string{}, Technologies: []string{}, StatusCodes: []int{}, RedirectDestinations: []string{}, Relationships: []Relationship{}},
-		signalSet: map[string]bool{}, labelSet: map[string]bool{}, keywordSet: map[string]bool{}, sourceSet: map[string]bool{}, technologySet: map[string]bool{}, statusSet: map[int]bool{}, redirectSet: map[string]bool{}, relationshipSet: map[string]bool{},
+		signalSet:      map[string]bool{}, labelSet: map[string]bool{}, keywordSet: map[string]bool{}, sourceSet: map[string]bool{}, technologySet: map[string]bool{}, statusSet: map[int]bool{}, redirectSet: map[string]bool{}, relationshipSet: map[string]bool{},
 	}
 }
 
@@ -381,6 +434,10 @@ func appendRecords(out []observation, records []provideroutput.Record, source st
 func schemaMembership(items []string) (map[string]bool, map[string]bool, error) {
 	exact, routes := map[string]bool{}, map[string]bool{}
 	for index, raw := range items {
+		parsed, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return nil, nil, fmt.Errorf("api schema endpoint %d must be an absolute HTTP URL", index)
+		}
 		key, err := normalize.Endpoint(raw, "GET", "")
 		if err != nil {
 			return nil, nil, fmt.Errorf("api schema endpoint %d: %w", index, err)
@@ -390,7 +447,7 @@ func schemaMembership(items []string) (map[string]bool, map[string]bool, error) 
 	return exact, routes, nil
 }
 
-func historyKey(key normalize.EndpointKey) string { return key.ExactURL + "\x00" + key.Method }
+func historyKey(key normalize.EndpointKey) string { return key.Digest }
 
 func sourceConfidence(source string) float64 {
 	switch source {
@@ -446,6 +503,22 @@ func firstNestedString(fields map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func directString(fields map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := fields[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func nestedObject(fields map[string]any, key string) map[string]any {
+	if value, ok := fields[key].(map[string]any); ok {
+		return value
+	}
+	return map[string]any{}
 }
 
 func firstNestedInt(fields map[string]any, keys ...string) int {

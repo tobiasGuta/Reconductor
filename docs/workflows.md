@@ -16,13 +16,15 @@ Every definition receives a deterministic target-plan digest. Exact host rules y
 
 ## `continuous-web-recon`
 
-Version `2.0.0` runs passive discovery only for planned roots, filters each result, merges authorized discovered URLs with exact seeds, then runs DNSx, an optional authorized port intersection in Naabu, HTTPX, asset comparison, crawling, GAU, endpoint classification, an approved safe Nuclei profile, and a changes report. It supports multiple unrelated domains without `--domain`.
+Version `2.1.0` runs passive discovery only for planned roots, filters each result, merges authorized discovered URLs with exact seeds, then runs DNSx, an optional authorized port intersection in Naabu, HTTPX, asset comparison, crawling, GAU, endpoint classification, an approved safe Nuclei profile, and a changes report. It supports multiple unrelated domains without `--domain`.
 
 ## `authorized-web-baseline`
 
-This workflow starts only from scope-derived exact seeds, then resolves, optionally scans a common authorized port intersection, probes, compares, crawls changed assets, classifies endpoints, pauses for Nuclei approval, and reports changes. It needs no discovery root.
+Version `1.1.0` starts only from scope-derived exact seeds, then resolves, optionally scans a common authorized port intersection, probes, compares, crawls changed assets, classifies endpoints, pauses for Nuclei approval, and reports changes. It needs no discovery root.
 
 HTTP observations are routed deterministically: 2xx assets may be crawled, 2xx/redirect/authentication responses may enter the approved safe scan profile, and other statuses are retained as observations but not scanned.
+
+The classifier receives only each provider's post-scope-filter `authorized_records`. HTTPX supplies response status, content type, redirect, and technology evidence; Katana supplies request and JavaScript relationship evidence; GAU supplies lower-confidence passive observations. Structured HTTP observations from the latest prior completed run are loaded for route-normalized historical comparisons. The complete evidence classification is persisted in the step result and forwarded into the report.
 
 Every scheduled invocation should create a new Task execution and WorkflowRun. The first run treats observed HTTP assets as new. Negative transitions require a complete successful source step; a failed or incomplete scan never marks an asset removed or a finding resolved.
 

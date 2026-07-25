@@ -102,8 +102,8 @@ func TestInternalCapabilitiesRejectMalformedMissingAndUnexpectedInput(t *testing
 		{"targeting.prepare", `{"exact_urls":[],"discovered_urls":[],"ports":[70000],"target_plan_digest":"plan"}`},
 		{"compare.assets", `{"current":"https://x.test","previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`},
 		{"compare.assets", `{"current":[],"previous":[],"coverage_complete":true}`},
-		{"classify.endpoint", `{"active":[],"target_plan_digest":"plan"}`},
-		{"classify.endpoint", `{"active":["not a url"],"passive":[],"target_plan_digest":"plan"}`},
+		{"classify.endpoint", `{"active":[],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan","command":"whoami"}`},
+		{"classify.endpoint", `{"active":["not a url"],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan"}`},
 		{"report.changes", `{"changes":[{"kind":"new_or_changed"}],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`},
 		{"report.changes", `{"changes":[{"kind":"invented","value":"https://x.test/"}],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`},
 		{"report.changes", `{"changes":[],"endpoints":[{"endpoint":{"exact_url":"https://x.test/"},"matched_keywords":["api"]}],"candidate_matches":[],"target_plan_digest":"plan"}`},
@@ -132,7 +132,7 @@ func TestInternalCapabilityValidDefinitionContracts(t *testing.T) {
 	valid := map[string]string{
 		"targeting.prepare": `{"exact_urls":[],"discovered_urls":[],"ports":[],"target_plan_digest":"plan"}`,
 		"compare.assets":    `{"current":[],"previous":[],"coverage_complete":false,"target_plan_digest":"plan"}`,
-		"classify.endpoint": `{"active":[],"passive":[],"target_plan_digest":"plan"}`,
+		"classify.endpoint": `{"active":[],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan"}`,
 		"report.changes":    `{"changes":[],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`,
 	}
 	for name, raw := range valid {
@@ -164,7 +164,7 @@ func TestInternalCapabilitiesEmitTypedNonNullOutputs(t *testing.T) {
 	}{
 		{"targeting.prepare", `{"exact_urls":["https://x.test/"],"discovered_urls":[],"ports":[443],"target_plan_digest":"plan"}`, &TargetingPrepareOutput{}},
 		{"compare.assets", `{"current":["{\"url\":\"https://x.test/\",\"status_code\":200}"],"previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`, &CompareAssetsOutput{}},
-		{"classify.endpoint", `{"active":["https://x.test/api/1"],"passive":[],"target_plan_digest":"plan"}`, &ClassifyEndpointOutput{}},
+		{"classify.endpoint", `{"active":["https://x.test/api/1"],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan"}`, &ClassifyEndpointOutput{}},
 		{"report.changes", `{"changes":[],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`, &ReportChangesOutput{}},
 	}
 	for _, test := range tests {
@@ -210,7 +210,7 @@ func TestAuditedProviderFlagMatrix(t *testing.T) {
 		{"subfinder", "-d example.test -silent", func() ([]string, error) { return subfinderArgs(input, pol) }},
 		{"chaos", "-d example.test -silent", func() ([]string, error) { return chaosArgs(input, "configured") }},
 		{"naabu", "-host app.example.test -silent -rate 20 -p 80,443", func() ([]string, error) { return naabuArgs(input, pol, recon) }},
-		{"httpx", "-u https://app.example.test/path -silent -json -status-code -tech-detect -threads 5", func() ([]string, error) { return httpxArgs(input, pol, recon) }},
+		{"httpx", "-u https://app.example.test/path -silent -json -status-code -content-type -location -tech-detect -threads 5", func() ([]string, error) { return httpxArgs(input, pol, recon) }},
 		{"katana", "-u https://app.example.test/path -silent -jsonl -fs fqdn -rate-limit 20 -concurrency 5 -headless", func() ([]string, error) { return katanaArgs(input, pol, recon) }},
 		{"gau", "--json example.test", func() ([]string, error) { return gauArgs(input) }},
 		{"nuclei", `-u https://app.example.test/path -jsonl -silent -dr -rl 20 -c 5 -bulk-size 5 -headc 2 -severity low,medium,high,critical -tags cve,exposure,misconfig -etags dos,fuzz,bruteforce,intrusive -t C:\nuclei-templates`, func() ([]string, error) { return nucleiArgs(input, pol, nuclei) }},

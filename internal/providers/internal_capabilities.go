@@ -142,7 +142,7 @@ func (c internalCap) Execute(_ context.Context, r capability.Request) (capabilit
 func internalCapabilities() []capability.Capability {
 	definitions := []struct {
 		name, description, version string
-		input, output     string
+		input, output              string
 	}{
 		{"targeting.prepare", "Filter and prepare scope-authorized active targets", "2", targetingPrepareInputSchema, targetingPrepareOutputSchema},
 		{"compare.assets", "Compare current and previous HTTP asset observations", "2", compareAssetsInputSchema, compareAssetsOutputSchema},

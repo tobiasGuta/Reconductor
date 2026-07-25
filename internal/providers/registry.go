@@ -94,7 +94,7 @@ func httpxArgs(i commandprovider.Input, p policy.Policy, c config.Recon) ([]stri
 	if err != nil {
 		return nil, err
 	}
-	return append(args, "-silent", "-json", "-status-code", "-tech-detect", "-threads", fmt.Sprint(bounded(c.Concurrency, p.Concurrency))), nil
+	return append(args, "-silent", "-json", "-status-code", "-content-type", "-location", "-tech-detect", "-threads", fmt.Sprint(bounded(c.Concurrency, p.Concurrency))), nil
 }
 
 func katanaArgs(i commandprovider.Input, p policy.Policy, c config.Recon) ([]string, error) {

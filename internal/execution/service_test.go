@@ -34,10 +34,81 @@ type capturedStore struct {
 	artifacts []domain.Artifact
 	result    domain.ActionResult
 	err       error
+	previous  []string
+	loadedFor string
 }
 
-func (*capturedStore) PreviousObservationValues(context.Context, domain.ID, domain.ID, string) ([]string, error) {
-	return nil, nil
+func (s *capturedStore) PreviousObservationValues(_ context.Context, _ domain.ID, _ domain.ID, capabilityName string) ([]string, error) {
+	s.loadedFor = capabilityName
+	return append([]string(nil), s.previous...), nil
+}
+
+func TestHistoricalRecordsPreserveStructuredEvidenceAndUpgradeLegacyValues(t *testing.T) {
+	records, err := historicalRecords([]string{
+		`{"provider":"httpx","kind":"url","target":"https://x.test/api","status_code":200,"fields":{"tech":["go"]}}`,
+		`{"value":"https://x.test/legacy"}`,
+		`{"url":"https://x.test/old-httpx","status_code":403,"tech":["Go"]}`,
+	})
+	if err != nil || len(records) != 3 {
+		t.Fatalf("records=%#v err=%v", records, err)
+	}
+	structured := records[0].(map[string]any)
+	if structured["provider"] != "httpx" || structured["status_code"] != float64(200) {
+		t.Fatalf("structured evidence was lost: %#v", structured)
+	}
+	legacy := records[1].(map[string]any)
+	if legacy["provider"] != "httpx" || legacy["target"] != "https://x.test/legacy" {
+		t.Fatalf("legacy observation was not upgraded: %#v", legacy)
+	}
+	oldHTTPX := records[2].(map[string]any)
+	if oldHTTPX["target"] != "https://x.test/old-httpx" || oldHTTPX["status_code"] != float64(403) {
+		t.Fatalf("legacy HTTPX evidence was not upgraded: %#v", oldHTTPX)
+	}
+	if _, err := historicalRecords([]string{`{"unexpected":true}`}); err == nil {
+		t.Fatal("invalid historical metadata was accepted")
+	}
+}
+
+type inputCaptureCapability struct {
+	input json.RawMessage
+}
+
+func (*inputCaptureCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "classify.endpoint", Version: "3", Risk: policy.Passive, RetrySafe: true, Idempotent: true}
+}
+func (*inputCaptureCapability) Validate(context.Context, capability.Request) error { return nil }
+func (c *inputCaptureCapability) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+	c.input = append(json.RawMessage(nil), req.Action.Input...)
+	return capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Output: json.RawMessage(`{"endpoints":[],"classifications":[],"interesting_endpoints":[],"relationships":[]}`)}}, nil
+}
+
+func TestClassifyExecutionLoadsPriorProbeEvidence(t *testing.T) {
+	registry := capability.NewRegistry()
+	classifier := &inputCaptureCapability{}
+	if err := registry.Register(classifier); err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{previous: []string{
+		`{"provider":"httpx","kind":"url","target":"https://x.test/api","status_code":401,"fields":{"content_type":"application/json"}}`,
+	}}
+	input := json.RawMessage(`{"active":[],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan"}`)
+	req := capability.Request{
+		Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "classify.endpoint", Input: input},
+		Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}},
+		Scope:  allowedScope{},
+	}
+	if _, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	var captured struct {
+		History []map[string]any `json:"historical_observations"`
+	}
+	if err := json.Unmarshal(classifier.input, &captured); err != nil {
+		t.Fatal(err)
+	}
+	if store.loadedFor != "probe.http" || len(captured.History) != 1 || captured.History[0]["status_code"] != float64(401) {
+		t.Fatalf("loaded_for=%q input=%s", store.loadedFor, classifier.input)
+	}
 }
 func (s *capturedStore) PersistResult(_ context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult) error {
 	s.called, s.step, s.tool, s.artifacts, s.result = true, step, tool, append([]domain.Artifact(nil), artifacts...), result
