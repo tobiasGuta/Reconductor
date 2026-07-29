@@ -22,3 +22,26 @@ func TestObservationLinesFallsBackToLegacyLines(t *testing.T) {
 		t.Fatalf("legacy observations=%q", lines)
 	}
 }
+
+func TestPreviousObservationValueOnlyUnwrapsLegacyValueMetadata(t *testing.T) {
+	tests := []struct {
+		name          string
+		metadata      json.RawMessage
+		observedValue string
+		want          string
+	}{
+		{"legacy value wrapper", json.RawMessage(`{"value":"https://example.test/"}`), "https://example.test/", "https://example.test/"},
+		{"plain URL wrapper remains rejected later when malformed", json.RawMessage(`{"value":"not a url"}`), "not a url", "not a url"},
+		{"structured HTTPX JSON", json.RawMessage(`{"url":"https://example.test/","status_code":200,"tech":["Go"]}`), "https://example.test/", `{"url":"https://example.test/","status_code":200,"tech":["Go"]}`},
+		{"normalized HTTPX record", json.RawMessage(`{"provider":"httpx","kind":"url","target":"https://example.test/","status_code":200}`), "https://example.test/", `{"provider":"httpx","kind":"url","target":"https://example.test/","status_code":200}`},
+		{"unexpected wrapper shape", json.RawMessage(`{"value":"https://other.test/","status_code":200}`), "https://other.test/", `{"value":"https://other.test/","status_code":200}`},
+		{"value mismatch", json.RawMessage(`{"value":"https://other.test/"}`), "https://example.test/", `{"value":"https://other.test/"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := previousObservationValue(test.metadata, test.observedValue); got != test.want {
+				t.Fatalf("value=%q want=%q", got, test.want)
+			}
+		})
+	}
+}

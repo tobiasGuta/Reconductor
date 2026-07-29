@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/normalize"
 )
 
 type Service struct {
@@ -155,36 +158,92 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 func historicalRecords(values []string) ([]any, error) {
 	out := make([]any, 0, len(values))
 	for index, value := range values {
-		var item map[string]any
-		if err := json.Unmarshal([]byte(value), &item); err != nil {
+		record, err := historicalRecord(value)
+		if err != nil {
 			return nil, fmt.Errorf("historical observation %d: %w", index, err)
 		}
-		if target, _ := item["target"].(string); target != "" {
-			if provider, _ := item["provider"].(string); provider == "" {
-				item["provider"] = "httpx"
-			}
-			if kind, _ := item["kind"].(string); kind == "" {
-				item["kind"] = "url"
-			}
-			out = append(out, item)
-			continue
-		}
-		legacy := firstHistoricalString(item, "value", "url", "input")
-		if legacy == "" {
-			return nil, fmt.Errorf("historical observation %d has no target", index)
-		}
-		upgraded := map[string]any{"provider": "httpx", "kind": "url", "target": legacy, "fields": item}
-		if status, ok := item["status_code"]; ok {
-			upgraded["status_code"] = status
-		}
-		if technologies, ok := item["technologies"]; ok {
-			upgraded["technologies"] = technologies
-		} else if technologies, ok := item["tech"]; ok {
-			upgraded["technologies"] = technologies
-		}
-		out = append(out, upgraded)
+		out = append(out, record)
 	}
 	return out, nil
+}
+
+func historicalRecord(raw string) (map[string]any, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty observation")
+	}
+	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+		target, err := historicalHTTPURL(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"provider": "httpx", "kind": "url", "target": target, "fields": map[string]any{"value": trimmed}}, nil
+	}
+	var item map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &item); err != nil {
+		return nil, err
+	}
+	if target, _ := item["target"].(string); target != "" {
+		normalizedTarget, err := historicalHTTPURL(target)
+		if err != nil {
+			return nil, err
+		}
+		item["target"] = normalizedTarget
+		if provider, _ := item["provider"].(string); provider == "" {
+			item["provider"] = "httpx"
+		}
+		if kind, _ := item["kind"].(string); kind == "" {
+			item["kind"] = "url"
+		} else if kind != "url" {
+			return nil, fmt.Errorf("record kind %q is not a URL", kind)
+		}
+		return item, nil
+	}
+	legacy := firstHistoricalString(item, "value", "url", "input")
+	if legacy == "" {
+		legacy = historicalHostCandidate(item)
+	}
+	if legacy == "" {
+		return nil, fmt.Errorf("has no target")
+	}
+	target, err := historicalHTTPURL(legacy)
+	if err != nil {
+		return nil, err
+	}
+	upgraded := map[string]any{"provider": "httpx", "kind": "url", "target": target, "fields": item}
+	if status, ok := item["status_code"]; ok {
+		upgraded["status_code"] = status
+	}
+	if technologies, ok := item["technologies"]; ok {
+		upgraded["technologies"] = technologies
+	} else if technologies, ok := item["tech"]; ok {
+		upgraded["technologies"] = technologies
+	}
+	return upgraded, nil
+}
+
+func historicalHTTPURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("record target must be an absolute HTTP URL")
+	}
+	return normalize.URL(trimmed)
+}
+
+func historicalHostCandidate(item map[string]any) string {
+	host := firstHistoricalString(item, "host")
+	if host == "" || strings.Contains(host, "://") {
+		return host
+	}
+	scheme := firstHistoricalString(item, "scheme")
+	if scheme == "" {
+		return ""
+	}
+	return scheme + "://" + host
 }
 
 func firstHistoricalString(item map[string]any, keys ...string) string {

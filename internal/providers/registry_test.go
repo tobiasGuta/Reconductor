@@ -47,6 +47,48 @@ func TestCompareAssetsStatusRouting(t *testing.T) {
 	}
 }
 
+func TestCompareAssetsPreservesHistoricalPlainWrappedAndStructuredObservations(t *testing.T) {
+	tests := []struct {
+		name     string
+		current  []string
+		previous []string
+	}{
+		{"plain URL", []string{"https://example.test/"}, []string{"https://example.test/"}},
+		{"legacy value wrapper", []string{"https://example.test/"}, []string{`{"value":"https://example.test/"}`}},
+		{"structured HTTPX JSON", []string{`{"url":"https://example.test/","status_code":200,"tech":["Go"]}`}, []string{`{"url":"https://example.test/","status_code":200,"tech":["Go"]}`}},
+		{"normalized HTTPX record", []string{`{"provider":"httpx","kind":"url","target":"https://example.test/path","host":"example.test","status_code":200,"technologies":["Go"]}`}, []string{`{"provider":"httpx","kind":"url","target":"https://example.test/path","host":"example.test","status_code":200,"technologies":["Go"]}`}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input, _ := json.Marshal(CompareAssetsInput{Current: test.current, Previous: test.previous, CoverageComplete: true, TargetPlanDigest: "plan"})
+			result, _, err := executeCompareAssets(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.NewOrChanged) != 0 || len(result.Removed) != 0 || len(result.Changes) != 0 {
+				t.Fatalf("unchanged observations were reported as changed: %#v", result)
+			}
+		})
+	}
+}
+
+func TestCompareAssetsRejectsMalformedHistoricalValueWrappers(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, _ := json.Marshal(CompareAssetsInput{Current: []string{}, Previous: []string{`{"value":"not a url"}`}, CoverageComplete: true, TargetPlanDigest: "plan"})
+	_, err = Registry(cfg).Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "compare.assets", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}}, Scope: testScope{}})
+	if err == nil || !strings.Contains(err.Error(), "does not contain a valid HTTP URL") {
+		t.Fatalf("malformed value wrapper was not rejected: %v", err)
+	}
+}
+
 func TestInternalCapabilitiesPublishConcreteStrictSchemas(t *testing.T) {
 	cfg, err := config.LoadWith(func(k string) string {
 		if k == "DATABASE_URL" {
@@ -210,7 +252,6 @@ func TestAuditedProviderFlagMatrix(t *testing.T) {
 		{"subfinder", "-d example.test -silent", func() ([]string, error) { return subfinderArgs(input, pol) }},
 		{"chaos", "-d example.test -silent", func() ([]string, error) { return chaosArgs(input, "configured") }},
 		{"naabu", "-host app.example.test -silent -rate 20 -p 80,443", func() ([]string, error) { return naabuArgs(input, pol, recon) }},
-		{"httpx", "-u https://app.example.test/path -silent -json -status-code -content-type -location -tech-detect -threads 5", func() ([]string, error) { return httpxArgs(input, pol, recon) }},
 		{"katana", "-u https://app.example.test/path -silent -jsonl -fs fqdn -rate-limit 20 -concurrency 5 -headless", func() ([]string, error) { return katanaArgs(input, pol, recon) }},
 		{"gau", "--json example.test", func() ([]string, error) { return gauArgs(input) }},
 		{"nuclei", `-u https://app.example.test/path -jsonl -silent -dr -rl 20 -c 5 -bulk-size 5 -headc 2 -severity low,medium,high,critical -tags cve,exposure,misconfig -etags dos,fuzz,bruteforce,intrusive -t C:\nuclei-templates`, func() ([]string, error) { return nucleiArgs(input, pol, nuclei) }},
@@ -226,12 +267,82 @@ func TestAuditedProviderFlagMatrix(t *testing.T) {
 			}
 		})
 	}
+	httpx, err := httpxInvocation(input, pol, recon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(httpx.Args, " "), "-silent -json -status-code -content-type -location -tech-detect -threads 5"; got != want {
+		t.Fatalf("httpx args=%q want=%q", got, want)
+	}
+	if got, want := string(httpx.Stdin), "https://app.example.test/path\n"; got != want {
+		t.Fatalf("httpx stdin=%q want=%q", got, want)
+	}
 	invocation, err := dnsxInvocation(input, pol)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(invocation.Args, " "); got != "-silent" || string(invocation.Stdin) != "app.example.test\n" {
 		t.Fatalf("dnsx args=%q stdin=%q", got, invocation.Stdin)
+	}
+}
+
+func TestHTTPXInvocationUsesNewlineDelimitedTargetStdin(t *testing.T) {
+	targets := []string{
+		"https://app.example.test/path?view=full",
+		"http://api.example.test:8080/v1/items?id=42",
+		"https://[2001:db8::1]:8443/a/b?x=1&y=2",
+	}
+	invocation, err := httpxInvocation(commandprovider.Input{Targets: targets}, policy.Policy{Concurrency: 5}, config.Recon{Concurrency: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, arg := range invocation.Args {
+		if arg == "-u" {
+			t.Fatalf("HTTPX target flag appeared in args: %v", invocation.Args)
+		}
+	}
+	wantStdin := strings.Join(targets, "\n") + "\n"
+	if got := string(invocation.Stdin); got != wantStdin {
+		t.Fatalf("stdin=%q want=%q", got, wantStdin)
+	}
+	if !strings.HasSuffix(string(invocation.Stdin), "\n") {
+		t.Fatalf("stdin does not end in a newline: %q", invocation.Stdin)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(invocation.Stdin), "\n"), "\n")
+	if len(lines) != len(targets) {
+		t.Fatalf("stdin lines=%d want=%d", len(lines), len(targets))
+	}
+	for i, target := range targets {
+		if lines[i] != target {
+			t.Fatalf("stdin line %d=%q want=%q", i, lines[i], target)
+		}
+	}
+}
+
+func TestHTTPXInvocationKeepsLargeTargetListsOffCommandLine(t *testing.T) {
+	targets := make([]string, 5000)
+	for i := range targets {
+		targets[i] = fmt.Sprintf("https://host-%04d.example.test:8443/path/%d?source=regression", i, i)
+	}
+	invocation, err := httpxInvocation(commandprovider.Input{Targets: targets}, policy.Policy{Concurrency: 5}, config.Recon{Concurrency: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(invocation.Args), 8; got != want {
+		t.Fatalf("args=%d want=%d", got, want)
+	}
+	if len(invocation.Stdin) == 0 {
+		t.Fatal("HTTPX stdin is empty")
+	}
+	if got, want := string(invocation.Stdin), strings.Join(targets, "\n")+"\n"; got != want {
+		t.Fatalf("HTTPX stdin did not contain the complete target list: bytes=%d want=%d", len(got), len(want))
+	}
+}
+
+func TestHTTPXInvocationRejectsEmptyTargets(t *testing.T) {
+	_, err := httpxInvocation(commandprovider.Input{}, policy.Policy{}, config.Recon{})
+	if err == nil || err.Error() != "targets are required" {
+		t.Fatalf("err=%v want=%q", err, "targets are required")
 	}
 }
 

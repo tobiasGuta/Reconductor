@@ -32,8 +32,8 @@ func Registry(cfg config.Config) *capability.Registry {
 	defs := []commandprovider.Definition{
 		{Name: "resolve.dns", Description: "Resolve scope-authorized names", Provider: "dnsx", Executable: cfg.Tools.DNSx, Version: "3", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "dnsx", Probe: probes["dnsx"], BuildInvocation: dnsxInvocation},
 		{Name: "scan.ports", Description: "Discover scope-authorized network ports", Provider: "naabu", Executable: cfg.Tools.Naabu, Version: "2", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "naabu", Probe: probes["naabu"], BuildArgs: func(i commandprovider.Input, p policy.Policy) ([]string, error) { return naabuArgs(i, p, cfg.Recon) }},
-		{Name: "probe.http", Description: "Probe authorized HTTP services", Provider: "httpx", Executable: cfg.Tools.HTTPX, Version: "3", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "httpx", Probe: probes["httpx"], BuildArgs: func(i commandprovider.Input, p policy.Policy) ([]string, error) {
-			return httpxArgs(i, p, cfg.Recon)
+		{Name: "probe.http", Description: "Probe authorized HTTP services", Provider: "httpx", Executable: cfg.Tools.HTTPX, Version: "3", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "httpx", Probe: probes["httpx"], BuildInvocation: func(i commandprovider.Input, p policy.Policy) (commandprovider.Invocation, error) {
+			return httpxInvocation(i, p, cfg.Recon)
 		}},
 		{Name: "crawl.web", Description: "Crawl an authorized web target", Provider: "katana", Executable: cfg.Tools.Katana, Version: "2", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "katana", Probe: probes["katana"], BuildArgs: func(i commandprovider.Input, p policy.Policy) ([]string, error) {
 			return katanaArgs(i, p, cfg.Recon)
@@ -89,12 +89,14 @@ func naabuArgs(i commandprovider.Input, p policy.Policy, c config.Recon) ([]stri
 	return args, nil
 }
 
-func httpxArgs(i commandprovider.Input, p policy.Policy, c config.Recon) ([]string, error) {
-	args, err := targetsArgs(i, "-u")
-	if err != nil {
-		return nil, err
+func httpxInvocation(i commandprovider.Input, p policy.Policy, c config.Recon) (commandprovider.Invocation, error) {
+	if len(i.Targets) == 0 {
+		return commandprovider.Invocation{}, fmt.Errorf("targets are required")
 	}
-	return append(args, "-silent", "-json", "-status-code", "-content-type", "-location", "-tech-detect", "-threads", fmt.Sprint(bounded(c.Concurrency, p.Concurrency))), nil
+	return commandprovider.Invocation{
+		Args:  []string{"-silent", "-json", "-status-code", "-content-type", "-location", "-tech-detect", "-threads", fmt.Sprint(bounded(c.Concurrency, p.Concurrency))},
+		Stdin: []byte(strings.Join(i.Targets, "\n") + "\n"),
+	}, nil
 }
 
 func katanaArgs(i commandprovider.Input, p policy.Policy, c config.Recon) ([]string, error) {
