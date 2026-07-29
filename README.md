@@ -20,21 +20,113 @@ The built-in Nuclei profile excludes denial-of-service, brute-force, fuzzing, an
 
 ## Architecture
 
-```text
-Human / CLI / local console API / scheduler / future local AI proposal
-                           |
-                 validated platform intent
-                           |
-            schema + scope + policy checks
-                           |
-                  approval if required
-                           |
-       deterministic capability/provider registry
-                           |
-        results + artifacts + observations + audit
-                           |
-       candidates -> verification -> verified findings
+```mermaid
+flowchart TD
+    A[Researcher] --> B{How is the run started?}
+
+    B --> C[Direct manual workflow run<br/>CLI]
+    B --> D[Persistent scheduled execution<br/>Cron or Run Now from CLI / local console]
+
+    D --> D1[Materialize or enqueue ScheduledExecution]
+    D1 --> D2[Claim execution with a lease]
+    D2 --> E
+    C --> E
+
+    E[Shared orchestration service] --> E1[Load current program scope]
+    E1 --> E2[Rebuild target plan]
+    E2 --> E3{Unacknowledged scope expansion?}
+    E3 -->|Yes| E4{Scheduled execution?}
+    E4 -->|Yes| D3[Close as blocked_scope_change<br/>Pending scope review]
+    E4 -->|No| C1[Stop; rerun with explicit acknowledgement]
+    C1 --> C
+    E3 -->|No| F[Build and validate selected workflow]
+
+    F --> F1[Create or resume Task]
+    F1 --> F2[Create or resume WorkflowRun<br/>Attach scheduled lineage atomically when present]
+    F2 --> G[Apply policy, scope, rate, and concurrency checks<br/>to each capability execution]
+
+    G --> H0{Continuous workflow<br/>with discovery roots?}
+    H0 -->|Yes| H1[discover.subdomains<br/>Subfinder]
+    H0 -->|No| H[targeting.prepare<br/>Normalize, deduplicate, scope-filter]
+    H1 --> H
+
+    H --> I1[resolve.dns<br/>DNSx]
+    I1 --> I2{Authorized common ports?}
+    I2 -->|Yes| I3[scan.ports<br/>Naabu]
+    I2 -->|No| I4[probe.http<br/>HTTPX]
+    I3 --> I4
+
+    I4 --> J[compare.assets]
+    J --> K1[crawl.web<br/>Katana when changed crawl targets exist]
+    K1 --> L[classify.endpoint]
+
+    H --> K0{Archive discovery configured?}
+    K0 -->|Yes| K2[discover.archive_urls<br/>GAU]
+    K0 -->|No| L
+    K2 --> L
+
+    L --> M[Preliminary recon brief<br/>report.changes]
+    M --> N[Persistent change inbox]
+    N --> N1[High, medium, and low priority changes]
+    N --> N2[Researcher review state<br/>unreviewed, interesting, investigating,<br/>expected_change, not_relevant, resolved]
+
+    L --> O0{Changed Nuclei scan targets?}
+    O0 -->|No| M2[Enriched recon brief<br/>without scanner matches]
+    O0 -->|Yes| O{Approve moderate step?}
+    O -->|Rejected| P[Close StepRun, WorkflowRun, Task,<br/>and related ScheduledExecution immediately]
+    O -->|Approved| Q[scan.nuclei<br/>Constrained safe profile]
+
+    M --> M2
+    Q --> M2
+    M2 --> N
+
+    Q --> R[Candidate findings]
+    R --> N
+    R --> S[Verification records]
+    S --> S1[Compatibility verdict]
+    S --> S2[Evidence verdict]
+    S --> S3[Impact verdict]
+
+    S1 --> T{Latest evidence observed<br/>and impact confirmed?}
+    S2 --> T
+    S3 --> T
+    T -->|No| U[Remain candidate / reviewed evidence]
+    T -->|Yes| V[Verified finding]
+
+    D3 --> W[Researcher reviews and acknowledges scope expansion]
+    W --> X[Queue Run Now or wait for a later cron occurrence]
+    X --> D
+
+    N --> Y[Persist execution state, artifacts, observations,<br/>change items, findings, and audit events]
+    P --> Y
+    U --> Y
+    V --> Y
+    D3 --> Y
+
+    Y --> Z[Local operator console<br/>Sanitized read models]
+    Z --> Z1[Programs]
+    Z --> Z2[Schedules]
+    Z --> Z3[Scheduled executions]
+    Z --> Z4[Pending scope expansions]
+    Z --> Z5[Change inbox]
+    Z --> Z6[Approvals]
+    Z --> Z7[Candidates and verified findings]
+    Z --> Z8[Audit events]
+
+    Y --> DB[(PostgreSQL)]
+    Y --> FS[(Artifact store and<br/>workflow-state files)]
+
+    style A fill:#1f2937,color:#fff
+    style E fill:#2563eb,color:#fff
+    style L fill:#2563eb,color:#fff
+    style N fill:#059669,color:#fff
+    style Q fill:#d97706,color:#fff
+    style V fill:#7c3aed,color:#fff
+    style D3 fill:#b91c1c,color:#fff
+    style W fill:#b91c1c,color:#fff
 ```
+
+The local console's **Run Now** action enqueues a persistent scheduled execution; only `platform workflow run` is the direct manual path. Scope acknowledgement closes the review item but does not revive the blocked execution, so the operator must queue a new run or wait for a later cron occurrence.
 
 The persisted hierarchy is `Program -> Task -> WorkflowRun -> StepRun -> ToolRun`. Artifacts, observations, candidates, approvals, and audit events retain those execution IDs.
 
