@@ -19,7 +19,9 @@
       <nav class="nav-list">
         <button class="nav-item active" data-view="overview"><span class="nav-glyph">⌂</span>Overview</button>
         <button class="nav-item" data-view="runs"><span class="nav-glyph">↳</span>Workflow runs</button>
+        <button class="nav-item" data-view="schedules"><span class="nav-glyph">◷</span>Schedules</button>
         <button class="nav-item" data-view="assets"><span class="nav-glyph">◇</span>Assets</button>
+        <button class="nav-item" data-view="changes"><span class="nav-glyph">≠</span>Change inbox <span id="changes-nav-count" class="nav-count hidden">0</span></button>
         <button class="nav-item" data-view="findings"><span class="nav-glyph">△</span>Findings</button>
         <button class="nav-item" data-view="approvals"><span class="nav-glyph">✓</span>Approvals <span id="approval-nav-count" class="nav-count hidden">0</span></button>
         <button class="nav-item" data-view="queue"><span class="nav-glyph">≋</span>Failed jobs <span id="queue-nav-count" class="nav-count hidden">0</span></button>
@@ -101,9 +103,23 @@
           <div id="runs-list" class="stack-list"></div>
         </section>
 
+        <section class="view" data-view-panel="schedules" aria-labelledby="schedules-title">
+          <div class="page-heading"><div><p class="eyebrow">Persistent dispatch</p><h1 id="schedules-title">Schedules</h1><p>Cron occurrences and run-now requests enter the same durable queue.</p></div></div>
+          <div class="overview-grid">
+            <article class="panel"><div class="panel-heading"><div><p class="eyebrow">Create</p><h2>New schedule</h2></div></div><form id="schedule-form" class="stack-list compact"><input name="name" placeholder="Schedule name" required><input name="objective" placeholder="Objective" required><input name="cron" placeholder="0 9 * * 1" required><input name="timezone" placeholder="America/New_York" value="UTC" required><button class="primary-button" type="submit">Create schedule</button></form></article>
+            <article class="panel"><div class="panel-heading"><div><p class="eyebrow">Configured</p><h2>Schedules</h2></div></div><div id="schedule-list" class="stack-list compact"></div></article>
+            <article class="panel"><div class="panel-heading"><div><p class="eyebrow">History</p><h2>Scheduled executions</h2></div></div><div id="scheduled-execution-list" class="stack-list compact"></div></article>
+          </div>
+        </section>
+
         <section class="view" data-view-panel="assets" aria-labelledby="assets-title">
           <div class="page-heading"><div><p class="eyebrow">Observed inventory</p><h1 id="assets-title">Assets</h1><p>Stable identities and their latest persisted observations.</p></div><div class="filter-row"><select id="asset-type-filter" aria-label="Filter asset type"><option value="">All types</option></select><input id="asset-search" type="search" placeholder="Search assets" aria-label="Search assets"></div></div>
           <div id="asset-table" class="table-wrap"></div>
+        </section>
+
+        <section class="view" data-view-panel="changes" aria-labelledby="changes-title">
+          <div class="page-heading"><div><p class="eyebrow">Research review</p><h1 id="changes-title">Change inbox</h1><p>Immutable structured changes with separate researcher disposition.</p></div></div>
+          <div id="change-inbox-list" class="stack-list"></div>
         </section>
 
         <section class="view" data-view-panel="findings" aria-labelledby="findings-title">

@@ -15,22 +15,26 @@ import (
 // It intentionally excludes artifact storage paths, raw provider output, step
 // input, and other fields that could disclose credentials or unredacted data.
 type ConsoleSnapshot struct {
-	GeneratedAt        time.Time                `json:"generated_at"`
-	SelectedProgramID  domain.ID                `json:"selected_program_id,omitempty"`
-	Programs           []domain.Program         `json:"programs"`
-	Scope              *ConsoleScope            `json:"scope,omitempty"`
-	Stats              ConsoleStats             `json:"stats"`
-	Runs               []ConsoleRun             `json:"runs"`
-	Steps              []ConsoleStep            `json:"steps"`
-	Tools              []ConsoleToolRun         `json:"tool_runs"`
-	Assets             []ConsoleAsset           `json:"assets"`
-	Candidates         []ConsoleCandidate       `json:"candidate_findings"`
-	Verifications      []ConsoleVerification    `json:"verification_results"`
-	VerifiedFindings   []ConsoleVerifiedFinding `json:"verified_findings"`
-	Approvals          []ConsoleApproval        `json:"approvals"`
-	AuditEvents        []ConsoleAuditEvent      `json:"audit_events"`
-	LatestChanges      json.RawMessage          `json:"latest_changes"`
-	WorkflowDefinition json.RawMessage          `json:"workflow_definition,omitempty"`
+	GeneratedAt            time.Time                   `json:"generated_at"`
+	SelectedProgramID      domain.ID                   `json:"selected_program_id,omitempty"`
+	Programs               []domain.Program            `json:"programs"`
+	Scope                  *ConsoleScope               `json:"scope,omitempty"`
+	Stats                  ConsoleStats                `json:"stats"`
+	Runs                   []ConsoleRun                `json:"runs"`
+	Steps                  []ConsoleStep               `json:"steps"`
+	Tools                  []ConsoleToolRun            `json:"tool_runs"`
+	Assets                 []ConsoleAsset              `json:"assets"`
+	Candidates             []ConsoleCandidate          `json:"candidate_findings"`
+	Verifications          []ConsoleVerification       `json:"verification_results"`
+	VerifiedFindings       []ConsoleVerifiedFinding    `json:"verified_findings"`
+	Approvals              []ConsoleApproval           `json:"approvals"`
+	Schedules              []domain.Schedule           `json:"schedules"`
+	ScheduledExecutions    []domain.ScheduledExecution `json:"scheduled_executions"`
+	ChangeItems            []ConsoleChangeItem         `json:"change_items"`
+	PendingScopeExpansions []domain.ScopeSnapshot      `json:"pending_scope_expansions"`
+	AuditEvents            []ConsoleAuditEvent         `json:"audit_events"`
+	LatestChanges          json.RawMessage             `json:"latest_changes"`
+	WorkflowDefinition     json.RawMessage             `json:"workflow_definition,omitempty"`
 }
 
 type ConsoleScope struct {
@@ -164,6 +168,14 @@ type ConsoleApproval struct {
 	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
 }
 
+type ConsoleChangeItem struct {
+	domain.ChangeItem
+	Disposition string     `json:"disposition"`
+	ReviewNote  string     `json:"review_note,omitempty"`
+	ReviewedBy  string     `json:"reviewed_by,omitempty"`
+	ReviewedAt  *time.Time `json:"reviewed_at,omitempty"`
+}
+
 type ConsoleAuditEvent struct {
 	ID            domain.ID       `json:"id"`
 	OccurredAt    time.Time       `json:"occurred_at"`
@@ -183,18 +195,22 @@ func (s *Store) ConsoleSnapshot(ctx context.Context, requestedProgramID domain.I
 		return ConsoleSnapshot{}, err
 	}
 	snapshot := ConsoleSnapshot{
-		GeneratedAt:      time.Now().UTC(),
-		Programs:         nonNil(programs),
-		Runs:             []ConsoleRun{},
-		Steps:            []ConsoleStep{},
-		Tools:            []ConsoleToolRun{},
-		Assets:           []ConsoleAsset{},
-		Candidates:       []ConsoleCandidate{},
-		Verifications:    []ConsoleVerification{},
-		VerifiedFindings: []ConsoleVerifiedFinding{},
-		Approvals:        []ConsoleApproval{},
-		AuditEvents:      []ConsoleAuditEvent{},
-		LatestChanges:    json.RawMessage(`{}`),
+		GeneratedAt:            time.Now().UTC(),
+		Programs:               nonNil(programs),
+		Runs:                   []ConsoleRun{},
+		Steps:                  []ConsoleStep{},
+		Tools:                  []ConsoleToolRun{},
+		Assets:                 []ConsoleAsset{},
+		Candidates:             []ConsoleCandidate{},
+		Verifications:          []ConsoleVerification{},
+		VerifiedFindings:       []ConsoleVerifiedFinding{},
+		Approvals:              []ConsoleApproval{},
+		Schedules:              []domain.Schedule{},
+		ScheduledExecutions:    []domain.ScheduledExecution{},
+		ChangeItems:            []ConsoleChangeItem{},
+		PendingScopeExpansions: []domain.ScopeSnapshot{},
+		AuditEvents:            []ConsoleAuditEvent{},
+		LatestChanges:          json.RawMessage(`{}`),
 	}
 	if len(programs) == 0 {
 		return snapshot, nil
@@ -232,6 +248,12 @@ func (s *Store) ConsoleSnapshot(ctx context.Context, requestedProgramID domain.I
 	if err := s.loadConsoleApprovals(ctx, selected, &snapshot); err != nil {
 		return ConsoleSnapshot{}, err
 	}
+	if err := s.loadConsoleSchedules(ctx, selected, &snapshot); err != nil {
+		return ConsoleSnapshot{}, err
+	}
+	if err := s.loadConsoleChangeItems(ctx, selected, &snapshot); err != nil {
+		return ConsoleSnapshot{}, err
+	}
 	if err := s.loadConsoleAudit(ctx, selected, &snapshot); err != nil {
 		return ConsoleSnapshot{}, err
 	}
@@ -241,6 +263,51 @@ func (s *Store) ConsoleSnapshot(ctx context.Context, requestedProgramID domain.I
 		return ConsoleSnapshot{}, err
 	}
 	return snapshot, nil
+}
+
+func (s *Store) loadConsoleSchedules(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {
+	schedules, err := s.ListSchedules(ctx, programID)
+	if err != nil {
+		return err
+	}
+	out.Schedules = nonNil(schedules)
+	executions, err := s.ListScheduledExecutions(ctx, "", 100)
+	if err != nil {
+		return err
+	}
+	allowed := map[domain.ID]bool{}
+	for _, schedule := range schedules {
+		allowed[schedule.ID] = true
+	}
+	for _, execution := range executions {
+		if allowed[execution.ScheduleID] {
+			out.ScheduledExecutions = append(out.ScheduledExecutions, execution)
+		}
+	}
+	pending, err := s.ListPendingScopeExpansions(ctx, programID)
+	if err != nil {
+		return err
+	}
+	out.PendingScopeExpansions = nonNil(pending)
+	return nil
+}
+
+func (s *Store) loadConsoleChangeItems(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {
+	rows, err := s.Pool.Query(ctx, `SELECT ci.id,ci.program_id,ci.workflow_run_id,ci.scheduled_execution_id,ci.kind,ci.entity_type,ci.entity_key,ci.priority,ci.title,ci.safe_summary,ci.reasons,ci.previous_value,ci.current_value,ci.source_capabilities,ci.evidence_artifact_ids,ci.observed_at,ci.created_at,COALESCE(cr.disposition,'unreviewed'),COALESCE(cr.note,''),COALESCE(cr.reviewed_by,''),cr.reviewed_at FROM change_items ci LEFT JOIN change_reviews cr ON cr.change_item_id=ci.id WHERE ci.program_id=$1 ORDER BY CASE ci.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, ci.observed_at DESC LIMIT 150`, programID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item ConsoleChangeItem
+		var evidence []string
+		if err := rows.Scan(&item.ID, &item.ProgramID, &item.WorkflowRunID, &item.ScheduledExecutionID, &item.Kind, &item.EntityType, &item.EntityKey, &item.Priority, &item.Title, &item.Summary, &item.Reasons, &item.Previous, &item.Current, &item.SourceCapabilities, &evidence, &item.ObservedAt, &item.CreatedAt, &item.Disposition, &item.ReviewNote, &item.ReviewedBy, &item.ReviewedAt); err != nil {
+			return err
+		}
+		item.EvidenceArtifactIDs = idsFromStrings(evidence)
+		out.ChangeItems = append(out.ChangeItems, item)
+	}
+	return rows.Err()
 }
 
 func (s *Store) loadConsoleScope(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {

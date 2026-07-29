@@ -78,6 +78,12 @@ go run ./cmd/platform migrate
 go run ./cmd/platform capabilities
 ```
 
+Start the persistent scheduler on a Reconductor host that can read each program's stored `scope_reference` path:
+
+```powershell
+go run ./cmd/scheduler
+```
+
 Create a program using an explicit Burp-compatible scope file:
 
 ```powershell
@@ -325,13 +331,13 @@ go build ./...
 
 PostgreSQL and Redis integration tests run when `TEST_DATABASE_URL` and `TEST_REDIS_ADDR` are set. All network tests use local test services; they do not contact public targets. CI runs formatting, vet, unit/integration/race tests, migrations, build, vulnerability scanning, and a worker image build.
 
-More detail: [architecture](docs/architecture.md), [operator console](docs/console.md), [workflows](docs/workflows.md), [capabilities](docs/capabilities.md), [policies](docs/policies.md), [data model](docs/data-model.md), [artifacts](docs/artifacts.md), [environment diagnostics](docs/doctor.md), [AI readiness](docs/ai-readiness.md), and [migration](docs/migration.md).
+More detail: [architecture](docs/architecture.md), [operator console](docs/console.md), [scheduler](docs/scheduler.md), [workflows](docs/workflows.md), [capabilities](docs/capabilities.md), [policies](docs/policies.md), [data model](docs/data-model.md), [artifacts](docs/artifacts.md), [environment diagnostics](docs/doctor.md), [AI readiness](docs/ai-readiness.md), and [migration](docs/migration.md).
 
 ## Current limitations
 
 - Local workflow execution requires compatible external tools; `platform doctor` reports missing, wrong, or incompatible binaries before a workflow starts. The versioned worker image bundles all registered external providers and the pinned Nuclei template snapshot.
 - Ambiguous host/protocol/port regexes remain enforceable by the full scope evaluator, but produce warnings and no invented active targets or ports.
 - The first successful workflow run necessarily treats all observed HTTP assets as new; later runs load the previous successful HTTP observation snapshot and compare stable status/technology fields.
-- `continuous-web-recon` currently runs end to end in the local CLI. Distributed workers execute reliable individual capability jobs; a distributed workflow coordinator/scheduler is not yet included.
+- `continuous-web-recon` runs end to end from the CLI and the persistent scheduler daemon. Distributed workers execute reliable individual capability jobs; high-availability distributed workflow coordination is not included.
 - Safe verification playbooks currently evaluate independently captured response evidence. An approved HTTP evidence-acquisition capability is still needed for one-command live verification.
-- The CLI and loopback-only operator console are supported interfaces. Remote authentication, multi-user authorization, a scheduler, and a distributed workflow coordinator have not yet been added.
+- The CLI, persistent local scheduler, and loopback-only operator console are supported interfaces. Remote authentication, multi-user authorization, and a distributed workflow coordinator have not been added.

@@ -29,6 +29,7 @@ COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -o /out/platform-worker ./cmd/worker
 RUN CGO_ENABLED=0 go build -trimpath -o /out/platform ./cmd/platform
+RUN CGO_ENABLED=0 go build -trimpath -o /out/platform-scheduler ./cmd/scheduler
 
 FROM ${ALPINE_IMAGE} AS templates
 ARG NUCLEI_TEMPLATES_VERSION=v10.4.3
@@ -52,6 +53,7 @@ RUN apk add --no-cache libpcap
 COPY --from=provider-tools /out/ /usr/local/bin/
 COPY --from=platform-build /out/platform-worker /usr/local/bin/platform-worker
 COPY --from=platform-build /out/platform /usr/local/bin/platform
+COPY --from=platform-build /out/platform-scheduler /usr/local/bin/platform-scheduler
 COPY --from=templates /opt/nuclei-templates /opt/nuclei-templates
 ENV NUCLEI_TEMPLATE_DIR=/opt/nuclei-templates
 RUN subfinder -version

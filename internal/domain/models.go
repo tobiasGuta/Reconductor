@@ -97,10 +97,112 @@ type ScopeChange struct {
 	Changed               bool     `json:"changed"`
 	ExpandsScope          bool     `json:"expands_scope"`
 	Acknowledged          bool     `json:"acknowledged"`
+	ScopeVersionID        ID       `json:"scope_version_id,omitempty"`
 	AddedIncludeDigests   []string `json:"added_include_digests"`
 	RemovedIncludeDigests []string `json:"removed_include_digests"`
 	AddedExcludeDigests   []string `json:"added_exclude_digests"`
 	RemovedExcludeDigests []string `json:"removed_exclude_digests"`
+}
+
+type ScheduledExecutionStatus string
+
+const (
+	ScheduledExecutionPending            ScheduledExecutionStatus = "pending"
+	ScheduledExecutionClaimed            ScheduledExecutionStatus = "claimed"
+	ScheduledExecutionRunning            ScheduledExecutionStatus = "running"
+	ScheduledExecutionPausedForApproval  ScheduledExecutionStatus = "paused_for_approval"
+	ScheduledExecutionCompleted          ScheduledExecutionStatus = "completed"
+	ScheduledExecutionFailed             ScheduledExecutionStatus = "failed"
+	ScheduledExecutionCancelled          ScheduledExecutionStatus = "cancelled"
+	ScheduledExecutionBlockedScopeChange ScheduledExecutionStatus = "blocked_scope_change"
+	ScheduledExecutionApprovalRejected   ScheduledExecutionStatus = "approval_rejected"
+	ScheduledExecutionSkippedOverlap     ScheduledExecutionStatus = "skipped_overlap"
+	ScheduledExecutionInterrupted        ScheduledExecutionStatus = "interrupted"
+)
+
+const (
+	ScheduleTriggerScheduled = "scheduled"
+	ScheduleTriggerRunNow    = "run_now"
+	ScheduleTriggerResume    = "resume"
+)
+
+type Schedule struct {
+	ID             ID         `json:"id"`
+	ProgramID      ID         `json:"program_id"`
+	Name           string     `json:"name"`
+	WorkflowName   string     `json:"workflow_name"`
+	Objective      string     `json:"objective"`
+	CronExpression string     `json:"cron_expression"`
+	Timezone       string     `json:"timezone"`
+	Enabled        bool       `json:"enabled"`
+	Headless       bool       `json:"headless"`
+	CreatedBy      string     `json:"created_by"`
+	LastRunAt      *time.Time `json:"last_run_at,omitempty"`
+	NextRunAt      time.Time  `json:"next_run_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+type ScheduledExecution struct {
+	ID                  ID                       `json:"id"`
+	ScheduleID          ID                       `json:"schedule_id"`
+	PlannedAt           time.Time                `json:"planned_at"`
+	TriggerSource       string                   `json:"trigger_source"`
+	Status              ScheduledExecutionStatus `json:"status"`
+	TaskID              *ID                      `json:"task_id,omitempty"`
+	WorkflowRunID       *ID                      `json:"workflow_run_id,omitempty"`
+	ScopeVersionID      *ID                      `json:"scope_version_id,omitempty"`
+	AttemptCount        int                      `json:"attempt_count"`
+	LeaseOwner          string                   `json:"lease_owner,omitempty"`
+	LeaseExpiresAt      *time.Time               `json:"lease_expires_at,omitempty"`
+	ErrorClassification string                   `json:"error_classification,omitempty"`
+	ErrorSummary        string                   `json:"error_summary,omitempty"`
+	StartedAt           *time.Time               `json:"started_at,omitempty"`
+	CompletedAt         *time.Time               `json:"completed_at,omitempty"`
+	CreatedAt           time.Time                `json:"created_at"`
+	UpdatedAt           time.Time                `json:"updated_at"`
+}
+
+type ChangeReviewDisposition string
+
+const (
+	ChangeReviewUnreviewed     ChangeReviewDisposition = "unreviewed"
+	ChangeReviewInteresting    ChangeReviewDisposition = "interesting"
+	ChangeReviewInvestigating  ChangeReviewDisposition = "investigating"
+	ChangeReviewExpectedChange ChangeReviewDisposition = "expected_change"
+	ChangeReviewNotRelevant    ChangeReviewDisposition = "not_relevant"
+	ChangeReviewResolved       ChangeReviewDisposition = "resolved"
+)
+
+type ChangeItem struct {
+	ID                   ID              `json:"id"`
+	ProgramID            ID              `json:"program_id"`
+	WorkflowRunID        ID              `json:"workflow_run_id"`
+	ScheduledExecutionID *ID             `json:"scheduled_execution_id,omitempty"`
+	Kind                 string          `json:"kind"`
+	EntityType           string          `json:"entity_type"`
+	EntityKey            string          `json:"entity_key"`
+	Priority             string          `json:"priority"`
+	Title                string          `json:"title"`
+	Summary              string          `json:"summary"`
+	Reasons              json.RawMessage `json:"reasons"`
+	Previous             json.RawMessage `json:"previous,omitempty"`
+	Current              json.RawMessage `json:"current,omitempty"`
+	SourceCapabilities   []string        `json:"source_capabilities"`
+	EvidenceArtifactIDs  []ID            `json:"evidence_artifact_ids"`
+	ObservedAt           time.Time       `json:"observed_at"`
+	CreatedAt            time.Time       `json:"created_at"`
+}
+
+type ChangeReview struct {
+	ID           ID                      `json:"id"`
+	ChangeItemID ID                      `json:"change_item_id"`
+	Disposition  ChangeReviewDisposition `json:"disposition"`
+	Note         string                  `json:"note"`
+	ReviewedBy   string                  `json:"reviewed_by"`
+	ReviewedAt   time.Time               `json:"reviewed_at"`
+	CreatedAt    time.Time               `json:"created_at"`
+	UpdatedAt    time.Time               `json:"updated_at"`
 }
 type Task struct {
 	ID                   ID         `json:"id"`

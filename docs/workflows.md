@@ -26,7 +26,7 @@ HTTP observations are routed deterministically: 2xx assets may be crawled, 2xx/r
 
 The classifier receives only each provider's post-scope-filter `authorized_records`. HTTPX supplies response status, content type, redirect, and technology evidence; Katana supplies request and JavaScript relationship evidence; GAU supplies lower-confidence passive observations. Structured HTTP observations from the latest prior completed run are loaded by the shared execution service for route-normalized historical comparisons in both local and Redis worker modes. The complete evidence classification is persisted in the step result and forwarded into the preliminary and enriched reports.
 
-Every scheduled invocation should create a new Task execution and WorkflowRun. The first run treats observed HTTP assets as new. Negative transitions require a complete successful source step; a failed or incomplete scan never marks an asset removed or a finding resolved.
+Every scheduled invocation creates a new Task execution and WorkflowRun through the shared orchestration service. Run Now uses the same persistent scheduled-execution queue as cron. The first run treats observed HTTP assets as new. Negative transitions require a complete successful source step; a failed or incomplete scan never marks an asset removed or a finding resolved.
 
 Moderate Nuclei execution pauses without approval. The preliminary recon brief is an independent safe branch after endpoint classification, so the researcher can review endpoint and change intelligence before approving scanner enrichment. Intrusive, destructive, denial-of-service, brute-force, credential-stuffing, and state-changing behavior is not part of this workflow.
 
@@ -34,4 +34,6 @@ Moderate Nuclei execution pauses without approval. The preliminary recon brief i
 go run ./cmd/platform scope plan --scope .\scope\mixed-example.json
 go run ./cmd/platform workflow plan --program-id <uuid> --scope .\scope\mixed-example.json --workflow authorized-web-baseline
 go run ./cmd/platform workflow run --program-id <uuid> --scope .\scope\mixed-example.json --workflow authorized-web-baseline
+go run ./cmd/platform schedule create --program-id <uuid> --name weekly-baseline --workflow authorized-web-baseline --cron "0 9 * * 1" --timezone "UTC" --objective "weekly authorized baseline"
+go run ./cmd/scheduler
 ```

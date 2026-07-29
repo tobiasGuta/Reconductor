@@ -125,6 +125,8 @@ function render() {
   renderNavCounts();
   renderOverview();
   renderRuns();
+  renderSchedules();
+  renderChangeInbox();
   renderAssets();
   renderFindings();
   renderApprovals();
@@ -151,8 +153,10 @@ function renderProgramSelect(programs) {
 function renderNavCounts() {
   const approvals = state.data.approvals?.filter((item) => item.decision === "pending").length || 0;
   const failed = state.data.queue?.dead_letters?.length || 0;
+  const changes = state.data.change_items?.filter((item) => ["unreviewed", ""].includes(item.disposition || "unreviewed") && ["high", "medium"].includes(item.priority)).length || 0;
   setNavCount("#approval-nav-count", approvals);
   setNavCount("#queue-nav-count", failed);
+  setNavCount("#changes-nav-count", changes);
 }
 
 function setNavCount(selector, count) {
@@ -347,6 +351,76 @@ function renderRuns() {
     card.append(copy, status, timing, finish);
     card.addEventListener("click", () => openRunDrawer(run));
     card.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openRunDrawer(run); } });
+    return card;
+  }));
+}
+
+function renderSchedules() {
+  const schedules = state.data.schedules || [];
+  const executions = state.data.scheduled_executions || [];
+  const scheduleList = $("#schedule-list");
+  if (!schedules.length) {
+    setChildren(scheduleList, empty("No persistent schedules have been created."));
+  } else {
+    setChildren(scheduleList, ...schedules.map((item) => {
+      const card = element("article", "list-card");
+      const copy = element("div");
+      copy.append(element("h3", "", item.name), element("p", "", `${item.workflow_name} · ${item.cron_expression} · ${item.timezone}`));
+      const meta = element("div", "run-meta");
+      meta.append(element("span", "", "Next run"), element("strong", "", relativeTime(item.next_run_at)));
+      const actions = element("div", "card-actions");
+      const toggle = element("button", "secondary-button", item.enabled ? "Disable" : "Enable");
+      toggle.addEventListener("click", () => postAction(`/api/v1/schedules/${encodeURIComponent(item.id)}/${item.enabled ? "disable" : "enable"}`, {}, `Schedule ${item.enabled ? "disabled" : "enabled"}.`));
+      const runNow = element("button", "primary-button", "Run now");
+      runNow.addEventListener("click", () => postAction(`/api/v1/schedules/${encodeURIComponent(item.id)}/run-now`, {}, "Run now queued."));
+      actions.append(toggle, runNow);
+      card.append(copy, statusBadge(item.enabled ? "enabled" : "disabled"), meta, actions);
+      return card;
+    }));
+  }
+  const executionList = $("#scheduled-execution-list");
+  if (!executions.length) {
+    setChildren(executionList, empty("No scheduled executions have been recorded."));
+    return;
+  }
+  setChildren(executionList, ...executions.slice(0, 25).map((item) => {
+    const card = element("article", "list-card");
+    const copy = element("div");
+    copy.append(element("h3", "", `${item.trigger_source.replaceAll("_", " ")} · ${formatTime(item.planned_at, true)}`), element("p", "", item.error_summary || `task ${shortID(item.task_id)} · run ${shortID(item.workflow_run_id)}`));
+    const actions = element("div", "card-actions");
+    if (item.status === "paused_for_approval") {
+      const resume = element("button", "primary-button", "Resume");
+      resume.addEventListener("click", () => postAction(`/api/v1/scheduled-executions/${encodeURIComponent(item.id)}/resume`, {}, "Scheduled execution queued for resume."));
+      actions.append(resume);
+    }
+    card.append(copy, statusBadge(item.status), actions);
+    return card;
+  }));
+}
+
+function renderChangeInbox() {
+  const items = state.data.change_items || [];
+  const visible = items.filter((item) => ["high", "medium"].includes(item.priority) || item.disposition !== "unreviewed");
+  if (!visible.length) {
+    setChildren($("#change-inbox-list"), empty("No high- or medium-priority unreviewed changes are waiting."));
+    return;
+  }
+  setChildren($("#change-inbox-list"), ...visible.map((item) => {
+    const card = element("article", "list-card");
+    const copy = element("div");
+    copy.append(element("h3", "", item.title), element("p", "", `${item.entity_type} · ${item.summary}`));
+    const reasons = element("div", "warning-list");
+    (Array.isArray(item.reasons) ? item.reasons : []).slice(0, 4).forEach((reason) => reasons.append(element("div", "warning-row", reason)));
+    copy.append(reasons);
+    const meta = element("div", "run-meta");
+    meta.append(element("span", "", item.kind), statusBadge(item.priority));
+    const actions = element("div", "card-actions");
+    for (const disposition of ["interesting", "investigating", "expected_change", "not_relevant", "resolved"]) {
+      const button = element("button", disposition === "interesting" ? "primary-button" : "secondary-button", disposition.replaceAll("_", " "));
+      button.addEventListener("click", () => postAction(`/api/v1/change-items/${encodeURIComponent(item.id)}/review`, { disposition, note: "", actor: "console-operator" }, "Change review saved."));
+      actions.append(button);
+    }
+    card.append(copy, meta, statusBadge(item.disposition || "unreviewed"), actions);
     return card;
   }));
 }
@@ -601,6 +675,30 @@ function bindEvents() {
   $("#modal-cancel").addEventListener("click", closeModal);
   $("#action-modal").addEventListener("click", (event) => { if (event.target === $("#action-modal")) closeModal(); });
   $("#modal-confirm").addEventListener("click", () => { if (state.modalAction) state.modalAction(); });
+  $("#schedule-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const body = {
+      program_id: state.data?.selected_program_id || state.selectedProgram,
+      name: String(form.get("name") || ""),
+      workflow_name: "continuous-web-recon",
+      objective: String(form.get("objective") || ""),
+      cron_expression: String(form.get("cron") || ""),
+      timezone: String(form.get("timezone") || "UTC"),
+      headless: false,
+      actor: "console-operator",
+    };
+    try {
+      const response = await fetch("/api/v1/schedules", { method: "POST", headers: { "Content-Type": "application/json", "X-Reconductor-Request": "operator-console", Accept: "application/json" }, body: JSON.stringify(body) });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Schedule was not accepted.");
+      event.currentTarget.reset();
+      toast("Schedule created.");
+      await loadData({ quiet: true });
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
     if (!$("#action-modal").classList.contains("hidden")) closeModal();

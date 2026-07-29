@@ -21,6 +21,9 @@ The default address is `http://127.0.0.1:8088`. A different loopback port may be
 - Candidate findings kept separate from verified findings
 - Verification results with compatibility, evidence, and impact verdict labels
 - Redis pending count, sanitized dead-letter metadata, and manual retry controls
+- Persistent schedules, recent scheduled executions, and explicit Run Now enqueue
+- Persistent change inbox with review dispositions
+- Pending scope expansions with digest-only acknowledgement controls
 - Sanitized provider execution metadata and safe audit messages
 
 ## Exposure boundary
@@ -29,8 +32,8 @@ The console read model deliberately omits step input, artifact storage locations
 
 Approval and retry mutations require JSON, a console-specific request header, and a same-origin browser context. These protections reduce browser-origin request forgery risk; they are not a substitute for authentication. Do not place the console behind a remote proxy or expose it on a shared interface.
 
-Approving a paused step records the human decision. It does not silently resume or create a workflow. Dead-letter retry returns the existing validated job to Redis; execution still passes through the normal worker scope, policy, and provider checks.
+Approving a paused step records the human decision. It does not silently resume or create a workflow. Scheduled executions require an explicit resume action after approval. Run Now creates a pending scheduled execution and returns immediately; the scheduler daemon claims it through the same persistent dispatch path as cron. Dead-letter retry returns the existing validated job to Redis; execution still passes through the normal worker scope, policy, and provider checks.
 
 ## Current boundary
 
-This console makes existing local operation usable, but it is not the future distributed coordinator. Scheduled full-workflow execution, authenticated remote access, roles, multiple operators, and arbitrary run-to-run comparison remain separate milestones.
+This console makes existing local operation usable, including persistent scheduling and change review. It is not a remote authenticated console, role system, multi-operator system, high-availability scheduler, or distributed workflow coordinator.

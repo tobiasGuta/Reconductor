@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
+	"github.com/tobiasGuta/Reconductor/internal/changes"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/findings"
 	"github.com/tobiasGuta/Reconductor/internal/migrations"
@@ -98,6 +99,12 @@ func (s *Store) ListPrograms(ctx context.Context) ([]domain.Program, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) GetProgram(ctx context.Context, id domain.ID) (domain.Program, error) {
+	var p domain.Program
+	err := s.Pool.QueryRow(ctx, `SELECT id,name,platform,description,scope_reference,policy_reference,scope_digest,include_rule_digests,exclude_rule_digests,target_plan_digest,scope_plan_warnings,created_at,updated_at FROM programs WHERE id=$1`, id).Scan(&p.ID, &p.Name, &p.Platform, &p.Description, &p.ScopeReference, &p.PolicyReference, &p.ScopeDigest, &p.IncludeRuleDigests, &p.ExcludeRuleDigests, &p.TargetPlanDigest, &p.ScopePlanWarnings, &p.CreatedAt, &p.UpdatedAt)
+	return p, err
+}
+
 func (s *Store) CheckAndRecordScopeSnapshot(ctx context.Context, snapshot domain.ScopeSnapshot, acknowledgeExpansion bool, actor string) (domain.ScopeChange, error) {
 	normalizeScopeSnapshotSlices(&snapshot)
 	tx, err := s.Pool.Begin(ctx)
@@ -105,9 +112,10 @@ func (s *Store) CheckAndRecordScopeSnapshot(ctx context.Context, snapshot domain
 		return domain.ScopeChange{}, err
 	}
 	defer tx.Rollback(ctx)
+	var previousID domain.ID
 	var previousInclude, previousExclude []string
 	var previousPlan string
-	err = tx.QueryRow(ctx, `SELECT include_rule_digests,exclude_rule_digests,target_plan_digest FROM scope_versions WHERE program_id=$1 AND (expands_scope=false OR acknowledged_at IS NOT NULL) ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, snapshot.ProgramID).Scan(&previousInclude, &previousExclude, &previousPlan)
+	err = tx.QueryRow(ctx, `SELECT id,include_rule_digests,exclude_rule_digests,target_plan_digest FROM scope_versions WHERE program_id=$1 AND (expands_scope=false OR acknowledged_at IS NOT NULL) ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, snapshot.ProgramID).Scan(&previousID, &previousInclude, &previousExclude, &previousPlan)
 	if err != nil && err != pgx.ErrNoRows {
 		return domain.ScopeChange{}, err
 	}
@@ -115,6 +123,7 @@ func (s *Store) CheckAndRecordScopeSnapshot(ctx context.Context, snapshot domain
 		previousInclude, previousExclude, previousPlan = nil, nil, ""
 	}
 	change := scopeChange(previousPlan, previousInclude, previousExclude, snapshot)
+	change.ScopeVersionID = previousID
 	if !change.Changed {
 		for _, event := range []struct{ eventType, message string }{{"scope_file_loaded", "scope file loaded"}, {"target_plan_generated", "target plan generated"}} {
 			if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,program_id,safe_message,details) VALUES($1,$2,'targeting',$3,$4,$5,$6)`, domain.NewID(), event.eventType, actor, snapshot.ProgramID, event.message, mustJSON(map[string]string{"scope_digest": snapshot.ScopeDigest, "target_plan_digest": snapshot.TargetPlanDigest})); err != nil {
@@ -140,7 +149,7 @@ func (s *Store) CheckAndRecordScopeSnapshot(ctx context.Context, snapshot domain
 	if change.Acknowledged {
 		acknowledgedAt, acknowledgedBy = now, actor
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO scope_versions(id,program_id,scope_reference,scope_digest,include_rule_digests,exclude_rule_digests,target_plan_digest,planning_warnings,target_plan,expands_scope,added_include_digests,removed_include_digests,added_exclude_digests,removed_exclude_digests,acknowledged_by,acknowledged_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(program_id,target_plan_digest) DO UPDATE SET acknowledged_by=COALESCE(scope_versions.acknowledged_by,EXCLUDED.acknowledged_by),acknowledged_at=COALESCE(scope_versions.acknowledged_at,EXCLUDED.acknowledged_at)`, snapshot.ID, snapshot.ProgramID, snapshot.ScopeReference, snapshot.ScopeDigest, snapshot.IncludeRuleDigests, snapshot.ExcludeRuleDigests, snapshot.TargetPlanDigest, snapshot.PlanningWarnings, snapshot.TargetPlan, snapshot.ExpandsScope, snapshot.AddedIncludeDigests, snapshot.RemovedIncludeDigests, snapshot.AddedExcludeDigests, snapshot.RemovedExcludeDigests, acknowledgedBy, acknowledgedAt, now)
+	err = tx.QueryRow(ctx, `INSERT INTO scope_versions(id,program_id,scope_reference,scope_digest,include_rule_digests,exclude_rule_digests,target_plan_digest,planning_warnings,target_plan,expands_scope,added_include_digests,removed_include_digests,added_exclude_digests,removed_exclude_digests,acknowledged_by,acknowledged_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(program_id,target_plan_digest) DO UPDATE SET acknowledged_by=COALESCE(scope_versions.acknowledged_by,EXCLUDED.acknowledged_by),acknowledged_at=COALESCE(scope_versions.acknowledged_at,EXCLUDED.acknowledged_at) RETURNING id`, snapshot.ID, snapshot.ProgramID, snapshot.ScopeReference, snapshot.ScopeDigest, snapshot.IncludeRuleDigests, snapshot.ExcludeRuleDigests, snapshot.TargetPlanDigest, snapshot.PlanningWarnings, snapshot.TargetPlan, snapshot.ExpandsScope, snapshot.AddedIncludeDigests, snapshot.RemovedIncludeDigests, snapshot.AddedExcludeDigests, snapshot.RemovedExcludeDigests, acknowledgedBy, acknowledgedAt, now).Scan(&change.ScopeVersionID)
 	if err != nil {
 		return change, err
 	}
@@ -249,7 +258,7 @@ func (s *Store) CreateTask(ctx context.Context, t domain.Task) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, `INSERT INTO tasks(id,program_id,objective,workflow_definition_id,status,requested_by,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, t.ID, t.ProgramID, t.Objective, t.WorkflowDefinitionID, t.Status, t.RequestedBy, t.CreatedAt, t.UpdatedAt); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO tasks(id,program_id,objective,workflow_definition_id,status,requested_by,schedule_reference,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, t.ID, t.ProgramID, t.Objective, t.WorkflowDefinitionID, t.Status, t.RequestedBy, t.ScheduleReference, t.CreatedAt, t.UpdatedAt); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,safe_message,details) VALUES($1,'task_created','platform',$2,$3,'task created',$4)`, domain.NewID(), t.RequestedBy, t.ID, mustJSON(t)); err != nil {
@@ -504,6 +513,11 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 				return err
 			}
 		}
+		if step.Capability == "report.changes" {
+			if err := persistChangeItemsFromResult(ctx, tx, programID, step.WorkflowRunID, nil, result.Output); err != nil {
+				return err
+			}
+		}
 		if step.Capability == "classify.endpoint" {
 			if err := persistEndpoints(ctx, tx, programID, result.Output); err != nil {
 				return err
@@ -601,6 +615,43 @@ func persistCandidates(ctx context.Context, tx pgx.Tx, programID domain.ID, step
 			return err
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO candidate_findings(id,task_id,workflow_run_id,target_asset_id,source_capability,template_id,claimed_vulnerability,severity,evidence_artifact_ids,detection_confidence,status) SELECT $1,wr.task_id,$2,$3,$4,$5,$6,$7,$8,$9,'new' FROM workflow_runs wr WHERE wr.id=$2 ON CONFLICT(workflow_run_id,target_asset_id,template_id) DO UPDATE SET evidence_artifact_ids=EXCLUDED.evidence_artifact_ids,updated_at=now()`, domain.NewID(), step.WorkflowRunID, assetID, step.Capability, templateID, name, severity, artifactStrings(artifacts), 0.7)
+		if err != nil {
+			return err
+		}
+		evidence := make([]domain.ID, 0, len(artifacts))
+		for _, artifact := range artifacts {
+			evidence = append(evidence, artifact.ID)
+		}
+		if item, ok := changes.CandidateFromLine(line, evidence, time.Now().UTC()); ok {
+			if err := persistChangeItems(ctx, tx, programID, step.WorkflowRunID, nil, []changes.Item{item}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func persistChangeItemsFromResult(ctx context.Context, tx pgx.Tx, programID, workflowRunID domain.ID, scheduledExecutionID *domain.ID, raw json.RawMessage) error {
+	items, err := changes.FromReportRaw(raw, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	return persistChangeItems(ctx, tx, programID, workflowRunID, scheduledExecutionID, items)
+}
+
+func persistChangeItems(ctx context.Context, tx pgx.Tx, programID, workflowRunID domain.ID, scheduledExecutionID *domain.ID, items []changes.Item) error {
+	for _, item := range items {
+		reasons, _ := json.Marshal(item.Reasons)
+		if len(item.Previous) == 0 {
+			item.Previous = nil
+		}
+		if len(item.Current) == 0 {
+			item.Current = nil
+		}
+		if item.ObservedAt.IsZero() {
+			item.ObservedAt = time.Now().UTC()
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO change_items(id,program_id,workflow_run_id,scheduled_execution_id,kind,entity_type,entity_key,priority,title,safe_summary,reasons,previous_value,current_value,source_capabilities,evidence_artifact_ids,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT(workflow_run_id,kind,entity_type,entity_key) DO NOTHING`, domain.NewID(), programID, workflowRunID, scheduledExecutionID, item.Kind, item.EntityType, item.EntityKey, item.Priority, item.Title, item.Summary, reasons, item.Previous, item.Current, item.SourceCapabilities, idStrings(item.EvidenceArtifactIDs), item.ObservedAt)
 		if err != nil {
 			return err
 		}

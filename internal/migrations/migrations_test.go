@@ -10,7 +10,7 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) != 6 {
+	if len(versions) != 7 {
 		t.Fatalf("migrations=%v", versions)
 	}
 	for _, name := range versions {

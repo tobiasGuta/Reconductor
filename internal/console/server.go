@@ -16,6 +16,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
+	schedulecron "github.com/tobiasGuta/Reconductor/internal/scheduler"
 )
 
 //go:embed static/*
@@ -24,6 +25,20 @@ var staticFiles embed.FS
 type Store interface {
 	ConsoleSnapshot(context.Context, domain.ID) (database.ConsoleSnapshot, error)
 	DecideApproval(context.Context, domain.ID, string, string) error
+}
+
+type scheduleMutationStore interface {
+	CreateSchedule(context.Context, domain.Schedule) error
+	GetSchedule(context.Context, domain.ID) (domain.Schedule, error)
+	UpdateSchedule(context.Context, domain.Schedule, string) error
+	SetScheduleEnabled(context.Context, domain.ID, bool, string) error
+	EnqueueRunNow(context.Context, domain.ID, string) (domain.ScheduledExecution, error)
+	RequestScheduledExecutionResume(context.Context, domain.ID, string) error
+}
+
+type reviewMutationStore interface {
+	ReviewChangeItem(context.Context, domain.ID, domain.ChangeReviewDisposition, string, string) error
+	AcknowledgeScopeVersion(context.Context, domain.ID, string) error
 }
 
 type Queue interface {
@@ -63,6 +78,14 @@ func New(store Store, workQueue Queue) http.Handler {
 	s := &Server{store: store, queue: workQueue, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /api/v1/snapshot", s.snapshot)
 	s.mux.HandleFunc("POST /api/v1/approvals/{id}/decision", s.decideApproval)
+	s.mux.HandleFunc("POST /api/v1/schedules", s.createSchedule)
+	s.mux.HandleFunc("POST /api/v1/schedules/{id}/update", s.updateSchedule)
+	s.mux.HandleFunc("POST /api/v1/schedules/{id}/enable", s.enableSchedule)
+	s.mux.HandleFunc("POST /api/v1/schedules/{id}/disable", s.disableSchedule)
+	s.mux.HandleFunc("POST /api/v1/schedules/{id}/run-now", s.runNow)
+	s.mux.HandleFunc("POST /api/v1/scheduled-executions/{id}/resume", s.resumeScheduledExecution)
+	s.mux.HandleFunc("POST /api/v1/change-items/{id}/review", s.reviewChangeItem)
+	s.mux.HandleFunc("POST /api/v1/scope-versions/{id}/acknowledge", s.acknowledgeScopeVersion)
 	s.mux.HandleFunc("POST /api/v1/dead-letters/{id}/retry", s.retryDeadLetter)
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -83,6 +106,242 @@ func New(store Store, workQueue Queue) http.Handler {
 		assets.ServeHTTP(w, r)
 	}))
 	return s.securityHeaders(s.mux)
+}
+
+func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request) {
+	if !validOperatorRequest(r) {
+		writeError(w, http.StatusForbidden, "operator request validation failed")
+		return
+	}
+	store, ok := s.store.(scheduleMutationStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "schedule mutations unavailable")
+		return
+	}
+	var body struct {
+		ProgramID      domain.ID `json:"program_id"`
+		Name           string    `json:"name"`
+		WorkflowName   string    `json:"workflow_name"`
+		Objective      string    `json:"objective"`
+		CronExpression string    `json:"cron_expression"`
+		Timezone       string    `json:"timezone"`
+		Headless       bool      `json:"headless"`
+		Actor          string    `json:"actor"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.Actor == "" {
+		body.Actor = "console-operator"
+	}
+	if body.WorkflowName == "" {
+		body.WorkflowName = "continuous-web-recon"
+	}
+	next, err := schedulecron.NextRun(body.CronExpression, body.Timezone, time.Now())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(body.Name) == "" || strings.TrimSpace(body.Objective) == "" || body.ProgramID == "" {
+		writeError(w, http.StatusBadRequest, "program_id, name, and objective are required")
+		return
+	}
+	now := time.Now().UTC()
+	item := domain.Schedule{ID: domain.NewID(), ProgramID: body.ProgramID, Name: body.Name, WorkflowName: body.WorkflowName, Objective: body.Objective, CronExpression: body.CronExpression, Timezone: body.Timezone, Enabled: true, Headless: body.Headless, CreatedBy: body.Actor, NextRunAt: next, CreatedAt: now, UpdatedAt: now}
+	if err := store.CreateSchedule(r.Context(), item); err != nil {
+		writeError(w, http.StatusConflict, "schedule could not be created")
+		return
+	}
+	writeJSON(w, http.StatusCreated, item)
+}
+
+func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
+	if !validOperatorRequest(r) {
+		writeError(w, http.StatusForbidden, "operator request validation failed")
+		return
+	}
+	store, ok := s.store.(scheduleMutationStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "schedule mutations unavailable")
+		return
+	}
+	current, err := store.GetSchedule(r.Context(), domain.ID(r.PathValue("id")))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "schedule not found")
+		return
+	}
+	var body struct {
+		Name           string `json:"name"`
+		WorkflowName   string `json:"workflow_name"`
+		Objective      string `json:"objective"`
+		CronExpression string `json:"cron_expression"`
+		Timezone       string `json:"timezone"`
+		Enabled        *bool  `json:"enabled"`
+		Headless       *bool  `json:"headless"`
+		Actor          string `json:"actor"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.Name != "" {
+		current.Name = body.Name
+	}
+	if body.WorkflowName != "" {
+		current.WorkflowName = body.WorkflowName
+	}
+	if body.Objective != "" {
+		current.Objective = body.Objective
+	}
+	if body.CronExpression != "" {
+		current.CronExpression = body.CronExpression
+	}
+	if body.Timezone != "" {
+		current.Timezone = body.Timezone
+	}
+	if body.Enabled != nil {
+		current.Enabled = *body.Enabled
+	}
+	if body.Headless != nil {
+		current.Headless = *body.Headless
+	}
+	next, err := schedulecron.NextRun(current.CronExpression, current.Timezone, time.Now())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	current.NextRunAt = next
+	if body.Actor == "" {
+		body.Actor = "console-operator"
+	}
+	if err := store.UpdateSchedule(r.Context(), current, body.Actor); err != nil {
+		writeError(w, http.StatusConflict, "schedule could not be updated")
+		return
+	}
+	writeJSON(w, http.StatusOK, current)
+}
+
+func (s *Server) enableSchedule(w http.ResponseWriter, r *http.Request) {
+	s.setScheduleEnabled(w, r, true)
+}
+
+func (s *Server) disableSchedule(w http.ResponseWriter, r *http.Request) {
+	s.setScheduleEnabled(w, r, false)
+}
+
+func (s *Server) setScheduleEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	if !validOperatorRequest(r) {
+		writeError(w, http.StatusForbidden, "operator request validation failed")
+		return
+	}
+	if !jsonContentType(r) {
+		writeError(w, http.StatusBadRequest, "content type must be application/json")
+		return
+	}
+	store, ok := s.store.(scheduleMutationStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "schedule mutations unavailable")
+		return
+	}
+	if err := store.SetScheduleEnabled(r.Context(), domain.ID(r.PathValue("id")), enabled, "console-operator"); err != nil {
+		writeError(w, http.StatusConflict, "schedule state could not be changed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"enabled": enabled})
+}
+
+func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
+	if !validOperatorRequest(r) {
+		writeError(w, http.StatusForbidden, "operator request validation failed")
+		return
+	}
+	if !jsonContentType(r) {
+		writeError(w, http.StatusBadRequest, "content type must be application/json")
+		return
+	}
+	store, ok := s.store.(scheduleMutationStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "schedule mutations unavailable")
+		return
+	}
+	item, err := store.EnqueueRunNow(r.Context(), domain.ID(r.PathValue("id")), "console-operator")
+	if err != nil {
+		writeError(w, http.StatusConflict, "run now could not be queued")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, item)
+}
+
+func (s *Server) resumeScheduledExecution(w http.ResponseWriter, r *http.Request) {
+	if !validOperatorRequest(r) {
+		writeError(w, http.StatusForbidden, "operator request validation failed")
+		return
+	}
+	if !jsonContentType(r) {
+		writeError(w, http.StatusBadRequest, "content type must be application/json")
+		return
+	}
+	store, ok := s.store.(scheduleMutationStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "schedule mutations unavailable")
+		return
+	}
+	if err := store.RequestScheduledExecutionResume(r.Context(), domain.ID(r.PathValue("id")), "console-operator"); err != nil {
+		writeError(w, http.StatusConflict, "scheduled execution is not ready to resume")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "pending"})
+}
+
+func (s *Server) reviewChangeItem(w http.ResponseWriter, r *http.Request) {
+	if !validOperatorRequest(r) {
+		writeError(w, http.StatusForbidden, "operator request validation failed")
+		return
+	}
+	store, ok := s.store.(reviewMutationStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "review mutations unavailable")
+		return
+	}
+	var body struct {
+		Disposition string `json:"disposition"`
+		Note        string `json:"note"`
+		Actor       string `json:"actor"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.Actor == "" {
+		body.Actor = "console-operator"
+	}
+	if err := store.ReviewChangeItem(r.Context(), domain.ID(r.PathValue("id")), domain.ChangeReviewDisposition(body.Disposition), body.Note, body.Actor); err != nil {
+		writeError(w, http.StatusBadRequest, "change review was not accepted")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"disposition": body.Disposition})
+}
+
+func (s *Server) acknowledgeScopeVersion(w http.ResponseWriter, r *http.Request) {
+	if !validOperatorRequest(r) {
+		writeError(w, http.StatusForbidden, "operator request validation failed")
+		return
+	}
+	if !jsonContentType(r) {
+		writeError(w, http.StatusBadRequest, "content type must be application/json")
+		return
+	}
+	store, ok := s.store.(reviewMutationStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "review mutations unavailable")
+		return
+	}
+	if err := store.AcknowledgeScopeVersion(r.Context(), domain.ID(r.PathValue("id")), "console-operator"); err != nil {
+		writeError(w, http.StatusConflict, "scope version could not be acknowledged")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "acknowledged"})
 }
 
 func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
@@ -207,7 +466,7 @@ func validOperatorRequest(r *http.Request) bool {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
-	if !strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+	if !jsonContentType(r) {
 		return errors.New("content type must be application/json")
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
@@ -217,6 +476,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
 		return errors.New("request body must be valid JSON")
 	}
 	return nil
+}
+
+func jsonContentType(r *http.Request) bool {
+	return strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json")
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

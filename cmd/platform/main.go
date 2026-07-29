@@ -15,19 +15,17 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/tobiasGuta/Reconductor/internal/artifact"
-	"github.com/tobiasGuta/Reconductor/internal/budget"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/console"
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/doctor"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
-	"github.com/tobiasGuta/Reconductor/internal/execution"
+	"github.com/tobiasGuta/Reconductor/internal/orchestration"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/providers"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
-	"github.com/tobiasGuta/Reconductor/internal/redaction"
+	schedulecron "github.com/tobiasGuta/Reconductor/internal/scheduler"
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
 	"github.com/tobiasGuta/Reconductor/internal/targeting"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
@@ -82,6 +80,10 @@ func run(ctx context.Context, args []string) error {
 		return queueCommand(ctx, cfg, args[1:])
 	case "report":
 		return reportCommand(ctx, cfg, args[1:])
+	case "schedule":
+		return scheduleCommand(ctx, cfg, args[1:])
+	case "changes":
+		return changesCommand(ctx, cfg, args[1:])
 	case "console":
 		return consoleCommand(ctx, cfg, args[1:])
 	case "capabilities":
@@ -93,7 +95,7 @@ func run(ctx context.Context, args []string) error {
 	}
 }
 func usage() error {
-	return fmt.Errorf("usage: platform <migrate|program|task|scope|workflow|run|approvals|queue|report|console|capabilities|doctor> ...")
+	return fmt.Errorf("usage: platform <migrate|program|task|scope|workflow|run|approvals|queue|report|schedule|changes|console|capabilities|doctor> ...")
 }
 
 func consoleCommand(ctx context.Context, cfg config.Config, args []string) error {
@@ -486,9 +488,6 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *programID == "" || *scopePath == "" {
-		return fmt.Errorf("--program-id and --scope are required")
-	}
 	manual, err := manualRoots(discoveryRoots, *discoveryReason, *domainName)
 	if err != nil {
 		return err
@@ -496,122 +495,37 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 	if *domainName != "" {
 		fmt.Fprintln(os.Stderr, "warning: --domain is deprecated; it is treated only as a passive discovery root")
 	}
-	sc, err := platformscope.LoadBurp(*scopePath)
-	if err != nil {
-		return err
-	}
-	plan, err := targeting.Plan(sc, manual)
-	if err != nil {
-		return err
-	}
-	if !plan.HasExecutableTargets() {
-		return fmt.Errorf("target plan has no executable authorized targets")
-	}
 	s, err := readyStore(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
-	change, err := s.CheckAndRecordScopeSnapshot(ctx, scopeSnapshot(domain.ID(*programID), *scopePath, sc, plan), *ackScopeExpansion, "cli")
-	if err != nil {
-		return err
+	if *programID == "" && *resumeID != "" {
+		fileStore := workflow.FileStore{Root: cfg.Scheduler.WorkflowStateRoot}
+		state, err := fileStore.Load(*resumeID)
+		if err != nil {
+			return err
+		}
+		task, err := s.GetTask(ctx, state.Run.TaskID)
+		if err != nil {
+			return err
+		}
+		*programID = string(task.ProgramID)
 	}
-	if change.ExpandsScope && !change.Acknowledged {
+	if *programID == "" {
+		return fmt.Errorf("--program-id is required")
+	}
+	req := orchestration.WorkflowRequest{ProgramID: domain.ID(*programID), WorkflowName: *workflowName, Objective: *objective, RequestedBy: "cli", ScopeReference: *scopePath, ManualDiscoveryRoots: manual, AcknowledgeScopeExpansion: *ackScopeExpansion, ResumeRunID: domain.ID(*resumeID), ExistingTaskID: domain.ID(*taskID), ApproveModerate: *approve, Headless: *headless}
+	result, err := (orchestration.Service{Config: cfg, Store: s, Registry: registry}).Run(ctx, req)
+	_ = printJSON(result.State)
+	if errors.Is(err, orchestration.ErrScopeExpansion) {
 		return fmt.Errorf("scope change expands authorization; review the plan and rerun with --acknowledge-scope-expansion")
 	}
-	def, err := workflows.Build(*workflowName, plan, *headless)
-	if err != nil {
-		return err
-	}
-	defJSON, _ := json.Marshal(def)
-	if err := s.CreateWorkflowDefinition(ctx, def.ID, def.Name, def.Version, def.Description, defJSON); err != nil {
-		return err
-	}
-	fileStore := workflow.FileStore{Root: "state/runs"}
-	var state *workflow.State
-	if *resumeID != "" {
-		state, err = fileStore.Load(*resumeID)
-		if err != nil {
-			return err
-		}
-	}
-	var task domain.Task
-	if state != nil {
-		task, err = s.GetTask(ctx, state.Run.TaskID)
-		if err != nil {
-			return err
-		}
-	} else if *taskID != "" {
-		task, err = s.GetTask(ctx, domain.ID(*taskID))
-		if err != nil {
-			return err
-		}
-	} else {
-		now := time.Now().UTC()
-		task = domain.Task{ID: domain.NewID(), ProgramID: domain.ID(*programID), Objective: *objective, WorkflowDefinitionID: def.ID, Status: domain.TaskRunning, RequestedBy: "cli", CreatedAt: now, UpdatedAt: now}
-		if err := s.CreateTask(ctx, task); err != nil {
-			return err
-		}
-	}
-	if task.ProgramID != domain.ID(*programID) {
-		return fmt.Errorf("task %s belongs to program %s, not %s", task.ID, task.ProgramID, *programID)
-	}
-	redactor := redaction.New(cfg.Logging.SecretNames...)
-	artifacts, err := artifact.NewLocal(cfg.ArtifactStorage.Root, redactor)
-	if err != nil {
-		return err
-	}
-	if _, err := artifact.PurgeExpired(ctx, s, artifacts, 1000); err != nil {
-		return fmt.Errorf("purge expired artifacts: %w", err)
-	}
-	pol := policy.Policy{ID: "runtime", AllowedCapabilities: registry.Names(), RateLimit: cfg.Policy.DefaultRateLimit, Concurrency: cfg.Policy.DefaultConcurrency, ProviderConcurrency: cfg.Policy.DefaultProviderConcurrency, HostConcurrency: cfg.Policy.DefaultHostConcurrency, ScanWindows: cfg.Policy.ScanWindows, AllowedHTTPMethods: cfg.Policy.AllowedMethods, AuthenticationUsage: cfg.Policy.AuthenticationUsage, HeadlessBrowser: *headless, DirectoryFuzzing: cfg.Policy.DirectoryFuzzing, MaximumPayloadSize: cfg.Policy.MaxPayloadBytes, FollowRedirects: cfg.Policy.FollowRedirects, CrossOrigin: cfg.Policy.CrossOrigin, IntrusiveChecks: cfg.Policy.IntrusiveChecks, ArtifactRetention: cfg.Policy.ArtifactRetention, ExcludedTemplateTags: cfg.Nuclei.ExcludeTags}
-	maxParallel := policy.ProgramParallelism(pol)
-	limiter := budget.NewLocal(budget.Limits{Program: maxParallel, Provider: pol.ProviderConcurrency, Host: pol.HostConcurrency})
-	engine := workflow.Engine{Registry: registry, Executor: execution.Service{Registry: registry, Store: s, Artifacts: artifacts, ProgramID: task.ProgramID}, Persister: database.WorkflowPersister{Store: s, File: fileStore}, Policy: pol, Scope: sc, Budget: limiter, MaxParallel: maxParallel}
-	approvedByRecord := false
-	if state != nil {
-		for _, ss := range state.Steps {
-			if ss.Run.Status == domain.StepAwaitingApproval {
-				decision, checkErr := s.StepApprovalDecision(ctx, ss.Run.ID)
-				if checkErr != nil {
-					return checkErr
-				}
-				if decision == "rejected" {
-					return fmt.Errorf("approval for step %s was rejected", ss.Run.StepDefinitionID)
-				}
-				approvedByRecord = approvedByRecord || decision == "approved"
-			}
-		}
-	}
-	if *approve || approvedByRecord {
-		engine.Approval = func(_ context.Context, _ workflow.Step, _ policy.Risk) (bool, error) { return true, nil }
-	}
-	controls := &workflow.Controls{}
-	if task.Status == domain.TaskCancelled {
-		controls.Cancel()
-	} else if task.Status == domain.TaskPaused {
-		controls.Pause()
-	}
-	watchCtx, stopWatching := context.WithCancel(ctx)
-	defer stopWatching()
-	go watchTaskControls(watchCtx, s, task.ID, controls)
-	state, runErr := engine.Run(ctx, def, state, task, controls)
-	_ = printJSON(state)
-	if state != nil {
-		status := map[domain.RunStatus]domain.TaskStatus{domain.RunCompleted: domain.TaskCompleted, domain.RunPaused: domain.TaskPaused, domain.RunFailed: domain.TaskFailed, domain.RunCancelled: domain.TaskCancelled}[state.Run.Status]
-		if status != "" {
-			_ = s.SetTaskStatus(ctx, task.ID, status, "")
-		}
-	}
-	return runErr
+	return err
 }
 
 type taskReader interface {
 	GetTask(context.Context, domain.ID) (domain.Task, error)
-}
-
-func watchTaskControls(ctx context.Context, store taskReader, taskID domain.ID, controls *workflow.Controls) {
-	watchTaskControlsInterval(ctx, store, taskID, controls, 500*time.Millisecond)
 }
 
 func watchTaskControlsInterval(ctx context.Context, store taskReader, taskID domain.ID, controls *workflow.Controls, interval time.Duration) {
@@ -739,6 +653,192 @@ func reportCommand(ctx context.Context, cfg config.Config, args []string) error 
 	}
 	fmt.Println(string(v))
 	return nil
+}
+
+func scheduleCommand(ctx context.Context, cfg config.Config, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("schedule requires create, list, show, update, enable, disable, run-now, executions, or resume")
+	}
+	s, err := readyStore(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("schedule create", flag.ContinueOnError)
+		programID := fs.String("program-id", "", "program UUID")
+		name := fs.String("name", "", "schedule name")
+		workflowName := fs.String("workflow", workflows.ContinuousName, "workflow name")
+		cronExpr := fs.String("cron", "", "five-field cron expression")
+		timezone := fs.String("timezone", "UTC", "IANA timezone")
+		objective := fs.String("objective", "", "scheduled objective")
+		actor := fs.String("created-by", "cli", "creating actor")
+		headless := fs.Bool("headless", cfg.Recon.Headless, "enable policy-approved headless mode")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *programID == "" || strings.TrimSpace(*name) == "" || strings.TrimSpace(*objective) == "" {
+			return fmt.Errorf("--program-id, --name, and --objective are required")
+		}
+		program, err := s.GetProgram(ctx, domain.ID(*programID))
+		if err != nil {
+			return err
+		}
+		if err := schedulecron.ValidateCron(*cronExpr, *timezone); err != nil {
+			return err
+		}
+		sc, err := platformscope.LoadBurp(program.ScopeReference)
+		if err != nil {
+			return fmt.Errorf("load current scope: %w", err)
+		}
+		plan, err := targeting.Plan(sc, nil)
+		if err != nil {
+			return err
+		}
+		def, err := workflows.Build(*workflowName, plan, *headless)
+		if err != nil {
+			return err
+		}
+		if err := workflow.Validate(def, providers.Registry(cfg)); err != nil {
+			return err
+		}
+		next, err := schedulecron.NextRun(*cronExpr, *timezone, time.Now())
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		item := domain.Schedule{ID: domain.NewID(), ProgramID: domain.ID(*programID), Name: *name, WorkflowName: *workflowName, Objective: *objective, CronExpression: *cronExpr, Timezone: *timezone, Enabled: true, Headless: *headless, CreatedBy: *actor, NextRunAt: next, CreatedAt: now, UpdatedAt: now}
+		if err := s.CreateSchedule(ctx, item); err != nil {
+			return err
+		}
+		return printJSON(item)
+	case "list":
+		fs := flag.NewFlagSet("schedule list", flag.ContinueOnError)
+		programID := fs.String("program-id", "", "program UUID")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		items, err := s.ListSchedules(ctx, domain.ID(*programID))
+		if err != nil {
+			return err
+		}
+		return printJSON(items)
+	case "show":
+		if len(args) < 2 {
+			return fmt.Errorf("schedule show <schedule-id>")
+		}
+		item, err := s.GetSchedule(ctx, domain.ID(args[1]))
+		if err != nil {
+			return err
+		}
+		return printJSON(item)
+	case "update":
+		if len(args) < 2 {
+			return fmt.Errorf("schedule update <schedule-id> [flags]")
+		}
+		item, err := s.GetSchedule(ctx, domain.ID(args[1]))
+		if err != nil {
+			return err
+		}
+		fs := flag.NewFlagSet("schedule update", flag.ContinueOnError)
+		name := fs.String("name", item.Name, "schedule name")
+		workflowName := fs.String("workflow", item.WorkflowName, "workflow name")
+		objective := fs.String("objective", item.Objective, "objective")
+		cronExpr := fs.String("cron", item.CronExpression, "five-field cron")
+		timezone := fs.String("timezone", item.Timezone, "IANA timezone")
+		headless := fs.Bool("headless", item.Headless, "headless mode")
+		actor := fs.String("actor", "cli", "actor")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		if err := schedulecron.ValidateCron(*cronExpr, *timezone); err != nil {
+			return err
+		}
+		next, err := schedulecron.NextRun(*cronExpr, *timezone, time.Now())
+		if err != nil {
+			return err
+		}
+		item.Name, item.WorkflowName, item.Objective, item.CronExpression, item.Timezone, item.Headless, item.NextRunAt = *name, *workflowName, *objective, *cronExpr, *timezone, *headless, next
+		if err := s.UpdateSchedule(ctx, item, *actor); err != nil {
+			return err
+		}
+		return printJSON(item)
+	case "enable", "disable":
+		if len(args) < 2 {
+			return fmt.Errorf("schedule %s <schedule-id>", args[0])
+		}
+		return s.SetScheduleEnabled(ctx, domain.ID(args[1]), args[0] == "enable", "cli")
+	case "run-now":
+		if len(args) < 2 {
+			return fmt.Errorf("schedule run-now <schedule-id>")
+		}
+		item, err := s.EnqueueRunNow(ctx, domain.ID(args[1]), "cli")
+		if err != nil {
+			return err
+		}
+		return printJSON(item)
+	case "executions":
+		fs := flag.NewFlagSet("schedule executions", flag.ContinueOnError)
+		scheduleID := fs.String("schedule-id", "", "schedule UUID")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		items, err := s.ListScheduledExecutions(ctx, domain.ID(*scheduleID), 100)
+		if err != nil {
+			return err
+		}
+		return printJSON(items)
+	case "resume":
+		if len(args) < 2 {
+			return fmt.Errorf("schedule resume <scheduled-execution-id>")
+		}
+		return s.RequestScheduledExecutionResume(ctx, domain.ID(args[1]), "cli")
+	default:
+		return fmt.Errorf("unknown schedule command %q", args[0])
+	}
+}
+
+func changesCommand(ctx context.Context, cfg config.Config, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("changes requires list or review")
+	}
+	s, err := readyStore(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	switch args[0] {
+	case "list":
+		fs := flag.NewFlagSet("changes list", flag.ContinueOnError)
+		programID := fs.String("program-id", "", "program UUID")
+		all := fs.Bool("all", false, "include reviewed items")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *programID == "" {
+			return fmt.Errorf("--program-id is required")
+		}
+		items, err := s.ListChangeItems(ctx, domain.ID(*programID), *all, 100)
+		if err != nil {
+			return err
+		}
+		return printJSON(items)
+	case "review":
+		if len(args) < 2 {
+			return fmt.Errorf("changes review <change-id> --disposition <value> --note <note> --actor <actor>")
+		}
+		fs := flag.NewFlagSet("changes review", flag.ContinueOnError)
+		disposition := fs.String("disposition", "", "review disposition")
+		note := fs.String("note", "", "safe review note")
+		actor := fs.String("actor", "human", "reviewing actor")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		return s.ReviewChangeItem(ctx, domain.ID(args[1]), domain.ChangeReviewDisposition(*disposition), *note, *actor)
+	default:
+		return fmt.Errorf("unknown changes command %q", args[0])
+	}
 }
 func redisClient(cfg config.Config) *redis.Client {
 	opts := &redis.Options{Addr: cfg.Redis.Address, Username: cfg.Redis.Username, Password: cfg.Redis.Password, DB: cfg.Redis.DB, DialTimeout: 5 * time.Second, ReadTimeout: cfg.Worker.ReadBlock + time.Second, WriteTimeout: 5 * time.Second}
