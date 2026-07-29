@@ -114,17 +114,54 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 	if err := store.MarkScheduledExecutionPausedForApproval(ctx, rejectedExecution.ID, "owner-b"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Pool.Exec(ctx, `UPDATE approvals SET decision='rejected',decided_by='integration',decided_at=now() WHERE request_id=$1`, rejectedStepID); err != nil {
+	var approvalID domain.ID
+	if err := store.Pool.QueryRow(ctx, `SELECT id FROM approvals WHERE request_id=$1`, rejectedStepID).Scan(&approvalID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RequestScheduledExecutionResume(ctx, rejectedExecution.ID, "integration"); !errors.Is(err, ErrApprovalRejected) {
-		t.Fatalf("rejected resume error = %v", err)
+	if err := store.DecideApproval(ctx, approvalID, "rejected", "integration"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTaskStatusFromWorkflow(ctx, rejectedTask.ID, domain.TaskPaused); err != nil {
+		t.Fatal(err)
 	}
 	if err := store.Pool.QueryRow(ctx, `SELECT status FROM scheduled_executions WHERE id=$1`, rejectedExecution.ID).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
 	if status != domain.ScheduledExecutionApprovalRejected {
 		t.Fatalf("rejected execution status = %s", status)
+	}
+	var runStatus domain.RunStatus
+	var taskStatus domain.TaskStatus
+	var stepStatus domain.StepStatus
+	if err := store.Pool.QueryRow(ctx, `SELECT status FROM workflow_runs WHERE id=$1`, rejectedRunID).Scan(&runStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id=$1`, rejectedTask.ID).Scan(&taskStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Pool.QueryRow(ctx, `SELECT status FROM step_runs WHERE id=$1`, rejectedStepID).Scan(&stepStatus); err != nil {
+		t.Fatal(err)
+	}
+	if runStatus != domain.RunFailed || taskStatus != domain.TaskFailed || stepStatus != domain.StepFailed {
+		t.Fatalf("rejected lineage remained active: task=%s run=%s step=%s", taskStatus, runStatus, stepStatus)
+	}
+	var activeOverlap bool
+	if err := store.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM scheduled_executions WHERE schedule_id=$1 AND status IN ('claimed','running','paused_for_approval','paused_operator'))`, rejectedSchedule.ID).Scan(&activeOverlap); err != nil {
+		t.Fatal(err)
+	}
+	if activeOverlap {
+		t.Fatal("approval rejection left an active overlap")
+	}
+	laterExecution, err := store.EnqueueRunNow(ctx, rejectedSchedule.ID, "integration")
+	if err != nil {
+		t.Fatalf("run now remained blocked after rejection: %v", err)
+	}
+	laterClaim, _, ok, err := store.ClaimPendingScheduledExecution(ctx, "owner-b-later", time.Minute)
+	if err != nil || !ok || laterClaim.ID != laterExecution.ID {
+		t.Fatalf("later run-now claim = %#v ok=%v err=%v", laterClaim, ok, err)
+	}
+	if err := store.MarkScheduledExecutionFailed(ctx, laterClaim.ID, "owner-b-later", "test", "cleanup"); err != nil {
+		t.Fatal(err)
 	}
 
 	cancelledSchedule := createIntegrationSchedule(t, ctx, store, programID, "cancelled")

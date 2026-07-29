@@ -466,9 +466,10 @@ function renderPendingScopeExpansions() {
 
 function renderChangeInbox() {
   const items = state.data.change_items || [];
-  const visible = items.filter((item) => ["high", "medium"].includes(item.priority) || item.disposition !== "unreviewed");
+  const showLowPriority = $("#show-low-priority").checked;
+  const visible = items.filter((item) => showLowPriority || ["high", "medium"].includes(item.priority) || item.disposition !== "unreviewed");
   if (!visible.length) {
-    setChildren($("#change-inbox-list"), empty("No high- or medium-priority unreviewed changes are waiting."));
+    setChildren($("#change-inbox-list"), empty(showLowPriority ? "No change items are waiting." : "No high- or medium-priority unreviewed changes are waiting."));
     return;
   }
   setChildren($("#change-inbox-list"), ...visible.map((item) => {
@@ -477,13 +478,18 @@ function renderChangeInbox() {
     copy.append(element("h3", "", item.title), element("p", "", `${item.entity_type} · ${item.summary}`));
     const reasons = element("div", "warning-list");
     (Array.isArray(item.reasons) ? item.reasons : []).slice(0, 4).forEach((reason) => reasons.append(element("div", "warning-row", reason)));
-    copy.append(reasons);
+    const note = element("input", "review-note");
+    note.type = "text";
+    note.placeholder = "Optional review note";
+    note.value = item.review_note || "";
+    note.setAttribute("aria-label", `Review note for ${item.title}`);
+    copy.append(reasons, note);
     const meta = element("div", "run-meta");
     meta.append(element("span", "", item.kind), statusBadge(item.priority));
     const actions = element("div", "card-actions");
     for (const disposition of ["interesting", "investigating", "expected_change", "not_relevant", "resolved"]) {
       const button = element("button", disposition === "interesting" ? "primary-button" : "secondary-button", disposition.replaceAll("_", " "));
-      button.addEventListener("click", () => postAction(`/api/v1/change-items/${encodeURIComponent(item.id)}/review`, { disposition, note: "", actor: "console-operator" }, "Change review saved."));
+      button.addEventListener("click", () => postAction(`/api/v1/change-items/${encodeURIComponent(item.id)}/review`, { disposition, note: note.value.trim(), actor: "console-operator" }, "Change review saved."));
       actions.append(button);
     }
     card.append(copy, meta, statusBadge(item.disposition || "unreviewed"), actions);
@@ -735,6 +741,7 @@ function bindEvents() {
   $("#retry-load").addEventListener("click", () => loadData());
   $("#asset-search").addEventListener("input", renderAssetTable);
   $("#asset-type-filter").addEventListener("change", renderAssetTable);
+  $("#show-low-priority").addEventListener("change", renderChangeInbox);
   $("#drawer-close").addEventListener("click", closeDrawer);
   $("#drawer-backdrop").addEventListener("click", closeDrawer);
   $("#mobile-menu").addEventListener("click", () => $(".sidebar").classList.toggle("open"));

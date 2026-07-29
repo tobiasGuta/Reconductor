@@ -268,7 +268,15 @@ func (s *Store) MarkScheduledExecutionPaused(ctx context.Context, id domain.ID, 
 }
 
 func (s *Store) MarkScheduledExecutionPausedForApproval(ctx context.Context, id domain.ID, owner string) error {
-	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionPausedForApproval, owner, "", "", []domain.ScheduledExecutionStatus{domain.ScheduledExecutionRunning}, "scheduled_execution_paused_for_approval", "scheduled execution paused for approval")
+	err := s.markScheduledExecution(ctx, id, domain.ScheduledExecutionPausedForApproval, owner, "", "", []domain.ScheduledExecutionStatus{domain.ScheduledExecutionRunning}, "scheduled_execution_paused_for_approval", "scheduled execution paused for approval")
+	if err == nil {
+		return nil
+	}
+	var status domain.ScheduledExecutionStatus
+	if queryErr := s.Pool.QueryRow(ctx, `SELECT status FROM scheduled_executions WHERE id=$1`, id).Scan(&status); queryErr == nil && status == domain.ScheduledExecutionApprovalRejected {
+		return nil
+	}
+	return err
 }
 
 func (s *Store) MarkScheduledExecutionCompleted(ctx context.Context, id domain.ID, owner string) error {
@@ -367,6 +375,46 @@ func lockedScheduledExecution(ctx context.Context, tx pgx.Tx, id domain.ID) (dom
 		JOIN schedules s ON s.id=se.schedule_id
 		WHERE se.id=$1
 		FOR UPDATE OF se`, id))
+}
+
+func lockedScheduledExecutionByWorkflow(ctx context.Context, tx pgx.Tx, workflowRunID domain.ID) (domain.ScheduledExecution, domain.ID, bool, error) {
+	item, programID, err := scanScheduledExecution(tx.QueryRow(ctx, `SELECT se.id,se.schedule_id,se.planned_at,se.trigger_source,se.status,se.task_id,se.workflow_run_id,se.scope_version_id,se.attempt_count,se.lease_owner,se.lease_expires_at,se.error_classification,se.error_summary,se.started_at,se.completed_at,se.created_at,se.updated_at,s.program_id
+		FROM scheduled_executions se
+		JOIN schedules s ON s.id=se.schedule_id
+		WHERE se.workflow_run_id=$1
+		FOR UPDATE OF se`, workflowRunID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ScheduledExecution{}, "", false, nil
+	}
+	return item, programID, err == nil, err
+}
+
+func rejectLockedScheduledExecutionForApproval(ctx context.Context, tx pgx.Tx, item domain.ScheduledExecution, programID domain.ID, actor string) error {
+	if item.Status == domain.ScheduledExecutionApprovalRejected {
+		return nil
+	}
+	if item.Status != domain.ScheduledExecutionPausedForApproval && item.Status != domain.ScheduledExecutionRunning {
+		return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionApprovalRejected)
+	}
+	now := time.Now().UTC()
+	tag, err := tx.Exec(ctx, `UPDATE scheduled_executions
+		SET status='approval_rejected',
+		    error_classification='approval_rejected',
+		    error_summary='moderate step approval was rejected',
+		    completed_at=$2,
+		    lease_owner='',
+		    lease_expires_at=NULL,
+		    updated_at=$2
+		WHERE id=$1 AND status=$3`, item.ID, now, item.Status)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionApprovalRejected)
+	}
+	item.Status, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = domain.ScheduledExecutionApprovalRejected, "approval_rejected", "moderate step approval was rejected", &now, now
+	item.LeaseOwner, item.LeaseExpiresAt = "", nil
+	return auditExecution(ctx, tx, "scheduled_execution_approval_rejected", actor, programID, item, "scheduled execution approval rejected", nil)
 }
 
 func markScheduledExecutionRunning(ctx context.Context, tx pgx.Tx, id, taskID, workflowRunID domain.ID, scopeVersionID *domain.ID, owner string) error {

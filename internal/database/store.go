@@ -309,6 +309,42 @@ func (s *Store) SetTaskStatus(ctx context.Context, id domain.ID, status domain.T
 	}
 	return tx.Commit(ctx)
 }
+
+func (s *Store) SetTaskStatusFromWorkflow(ctx context.Context, id domain.ID, status domain.TaskStatus) error {
+	var cancelled any
+	if status == domain.TaskCancelled {
+		cancelled = time.Now().UTC()
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `UPDATE tasks
+		SET status=$2,
+		    updated_at=now(),
+		    cancelled_at=COALESCE($3,cancelled_at),
+		    cancellation_reason=CASE WHEN $2='cancelled' AND cancellation_reason='' THEN 'workflow was cancelled' ELSE cancellation_reason END
+		WHERE id=$1 AND status IN ('pending','running','paused')`, id, status, cancelled)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		var current domain.TaskStatus
+		if err := tx.QueryRow(ctx, `SELECT status FROM tasks WHERE id=$1`, id).Scan(&current); err != nil {
+			return err
+		}
+		if current == domain.TaskCompleted || current == domain.TaskFailed || current == domain.TaskCancelled {
+			return tx.Commit(ctx)
+		}
+		return fmt.Errorf("task %s cannot transition from %s to %s", id, current, status)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,safe_message,details) VALUES($1,'task_status_changed','workflow','workflow',$2,'task status reconciled from workflow',$3)`, domain.NewID(), id, mustJSON(map[string]any{"status": status})); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Store) CreateWorkflowRun(ctx context.Context, r domain.WorkflowRun) error {
 	_, err := s.Pool.Exec(ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,previous_run_id,trigger_source,summary) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, r.ID, r.TaskID, r.WorkflowDefinitionID, r.WorkflowVersion, r.Status, r.StartedAt, r.CompletedAt, r.PreviousRunID, r.TriggerSource, r.Summary)
 	return err
@@ -348,6 +384,24 @@ func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, acto
 		return err
 	}
 	defer tx.Rollback(ctx)
+	var stepID, workflowRunID, taskID, programID domain.ID
+	if err := tx.QueryRow(ctx, `SELECT a.request_id,sr.workflow_run_id,wr.task_id,t.program_id
+		FROM approvals a
+		JOIN step_runs sr ON sr.id=a.request_id
+		JOIN workflow_runs wr ON wr.id=sr.workflow_run_id
+		JOIN tasks t ON t.id=wr.task_id
+		WHERE a.id=$1`, id).Scan(&stepID, &workflowRunID, &taskID, &programID); err != nil {
+		return err
+	}
+	var scheduledExecution domain.ScheduledExecution
+	var scheduledProgramID domain.ID
+	var hasScheduledExecution bool
+	if decision == "rejected" {
+		scheduledExecution, scheduledProgramID, hasScheduledExecution, err = lockedScheduledExecutionByWorkflow(ctx, tx, workflowRunID)
+		if err != nil {
+			return err
+		}
+	}
 	tag, err := tx.Exec(ctx, `UPDATE approvals SET decision=$2,decided_by=$3,decided_at=now() WHERE id=$1 AND decision='pending'`, id, decision, actor)
 	if err == nil && tag.RowsAffected() == 0 {
 		return fmt.Errorf("pending approval %s not found", id)
@@ -359,8 +413,49 @@ func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, acto
 	if decision == "approved" {
 		eventType = "moderate_approval_accepted"
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,safe_message,details) SELECT $1,$2,'platform',$3,a.task_id,t.program_id,'moderate approval decided',$4 FROM approvals a JOIN tasks t ON t.id=a.task_id WHERE a.id=$5`, domain.NewID(), eventType, actor, mustJSON(map[string]string{"decision": decision}), id); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,safe_message,details) VALUES($1,$2,'platform',$3,$4,$5,$6,$7,'moderate approval decided',$8)`, domain.NewID(), eventType, actor, taskID, programID, workflowRunID, stepID, mustJSON(map[string]string{"decision": decision})); err != nil {
 		return err
+	}
+	if decision == "rejected" {
+		now := time.Now().UTC()
+		stepTag, updateErr := tx.Exec(ctx, `UPDATE step_runs
+			SET status='failed',
+			    approval_state='rejected',
+			    error_classification='approval_rejected',
+			    error_details='moderate step approval was rejected',
+			    completed_at=$2
+			WHERE id=$1 AND status='awaiting_approval'`, stepID, now)
+		if updateErr != nil {
+			return updateErr
+		}
+		if stepTag.RowsAffected() != 1 {
+			return fmt.Errorf("approval step %s is not awaiting approval", stepID)
+		}
+		runTag, updateErr := tx.Exec(ctx, `UPDATE workflow_runs SET status='failed',completed_at=$2 WHERE id=$1 AND status IN ('running','paused')`, workflowRunID, now)
+		if updateErr != nil {
+			return updateErr
+		}
+		if runTag.RowsAffected() != 1 {
+			return fmt.Errorf("workflow run %s cannot be rejected", workflowRunID)
+		}
+		taskTag, updateErr := tx.Exec(ctx, `UPDATE tasks SET status='failed',updated_at=$2 WHERE id=$1 AND status IN ('pending','running','paused')`, taskID, now)
+		if updateErr != nil {
+			return updateErr
+		}
+		if taskTag.RowsAffected() != 1 {
+			return fmt.Errorf("task %s cannot be rejected", taskID)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,safe_message,details) VALUES($1,'workflow_approval_rejected','workflow',$2,$3,$4,$5,$6,'workflow closed after approval rejection',$7)`, domain.NewID(), actor, taskID, programID, workflowRunID, stepID, mustJSON(map[string]any{"status": domain.RunFailed, "reason": "approval_rejected"})); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,safe_message,details) VALUES($1,'task_status_changed','platform',$2,$3,$4,$5,'task failed after approval rejection',$6)`, domain.NewID(), actor, taskID, programID, workflowRunID, mustJSON(map[string]any{"status": domain.TaskFailed, "reason": "approval_rejected"})); err != nil {
+			return err
+		}
+		if hasScheduledExecution {
+			if err := rejectLockedScheduledExecutionForApproval(ctx, tx, scheduledExecution, scheduledProgramID, actor); err != nil {
+				return err
+			}
+		}
 	}
 	return tx.Commit(ctx)
 }

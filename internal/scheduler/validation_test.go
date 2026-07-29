@@ -44,6 +44,10 @@ func TestScheduleValidatorUsesProgramScopeAndWorkflowRegistry(t *testing.T) {
 		t.Fatalf("validated schedule = %#v", validated)
 	}
 
+	item.WorkflowName = workflows.BaselineName
+	if _, err := validator.Validate(context.Background(), item, time.Now()); err != nil {
+		t.Fatalf("authorized web baseline was rejected: %v", err)
+	}
 	item.WorkflowName = "unsupported"
 	if _, err := validator.Validate(context.Background(), item, time.Now()); err == nil {
 		t.Fatal("unsupported workflow was accepted")

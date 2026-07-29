@@ -143,7 +143,7 @@ func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, 
 	if state != nil {
 		status := map[domain.RunStatus]domain.TaskStatus{domain.RunCompleted: domain.TaskCompleted, domain.RunPaused: domain.TaskPaused, domain.RunFailed: domain.TaskFailed, domain.RunCancelled: domain.TaskCancelled}[state.Run.Status]
 		if status != "" {
-			_ = s.Store.SetTaskStatus(context.WithoutCancel(ctx), task.ID, status, "")
+			_ = s.Store.SetTaskStatusFromWorkflow(context.WithoutCancel(ctx), task.ID, status)
 		}
 	}
 	return WorkflowResult{Task: task, State: state, ScopeChange: change}, runErr
