@@ -473,12 +473,14 @@ func containsIntValue(items []int, value int) bool {
 
 func extractURL(raw string) string {
 	var value struct {
-		URL   string `json:"url"`
-		Input string `json:"input"`
-		Host  string `json:"host"`
+		URL    string `json:"url"`
+		Input  string `json:"input"`
+		Target string `json:"target"`
+		Host   string `json:"host"`
+		Value  string `json:"value"`
 	}
 	if json.Unmarshal([]byte(raw), &value) == nil {
-		for _, candidate := range []string{value.URL, value.Input, value.Host} {
+		for _, candidate := range []string{value.URL, value.Input, value.Target, value.Host, value.Value} {
 			if candidate != "" {
 				return candidate
 			}
@@ -504,6 +506,11 @@ func observationFingerprint(raw string) string {
 	var value map[string]any
 	if json.Unmarshal([]byte(raw), &value) != nil {
 		return raw
+	}
+	if len(value) == 1 {
+		if legacy, ok := value["value"].(string); ok && legacy != "" {
+			return legacy
+		}
 	}
 	stable := map[string]any{}
 	for _, key := range []string{"status_code", "status-code", "host", "url", "input", "tech", "technologies", "webserver", "ip", "a", "cname", "port", "scheme", "title"} {

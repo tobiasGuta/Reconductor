@@ -12,8 +12,10 @@ import (
 
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
+	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
+	"github.com/tobiasGuta/Reconductor/internal/providers"
 	commandprovider "github.com/tobiasGuta/Reconductor/internal/providers/command"
 	"github.com/tobiasGuta/Reconductor/internal/redaction"
 )
@@ -45,27 +47,73 @@ func (s *capturedStore) PreviousObservationValues(_ context.Context, _ domain.ID
 
 func TestHistoricalRecordsPreserveStructuredEvidenceAndUpgradeLegacyValues(t *testing.T) {
 	records, err := historicalRecords([]string{
+		`https://x.test/plain-https`,
+		`http://x.test/plain-http`,
 		`{"provider":"httpx","kind":"url","target":"https://x.test/api","status_code":200,"fields":{"tech":["go"]}}`,
 		`{"value":"https://x.test/legacy"}`,
 		`{"url":"https://x.test/old-httpx","status_code":403,"tech":["Go"]}`,
+		`{"input":"https://x.test/input","status_code":204}`,
+		`{"host":"x.test","scheme":"https","status_code":302}`,
 	})
-	if err != nil || len(records) != 3 {
+	if err != nil || len(records) != 7 {
 		t.Fatalf("records=%#v err=%v", records, err)
 	}
-	structured := records[0].(map[string]any)
+	plainHTTPS := records[0].(map[string]any)
+	if plainHTTPS["provider"] != "httpx" || plainHTTPS["kind"] != "url" || plainHTTPS["target"] != "https://x.test/plain-https" {
+		t.Fatalf("plain HTTPS observation was not upgraded: %#v", plainHTTPS)
+	}
+	plainHTTP := records[1].(map[string]any)
+	if plainHTTP["target"] != "http://x.test/plain-http" {
+		t.Fatalf("plain HTTP observation was not upgraded: %#v", plainHTTP)
+	}
+	structured := records[2].(map[string]any)
 	if structured["provider"] != "httpx" || structured["status_code"] != float64(200) {
 		t.Fatalf("structured evidence was lost: %#v", structured)
 	}
-	legacy := records[1].(map[string]any)
+	legacy := records[3].(map[string]any)
 	if legacy["provider"] != "httpx" || legacy["target"] != "https://x.test/legacy" {
 		t.Fatalf("legacy observation was not upgraded: %#v", legacy)
 	}
-	oldHTTPX := records[2].(map[string]any)
+	oldHTTPX := records[4].(map[string]any)
 	if oldHTTPX["target"] != "https://x.test/old-httpx" || oldHTTPX["status_code"] != float64(403) {
 		t.Fatalf("legacy HTTPX evidence was not upgraded: %#v", oldHTTPX)
 	}
-	if _, err := historicalRecords([]string{`{"unexpected":true}`}); err == nil {
-		t.Fatal("invalid historical metadata was accepted")
+	input := records[5].(map[string]any)
+	if input["target"] != "https://x.test/input" || input["status_code"] != float64(204) {
+		t.Fatalf("legacy input evidence was not upgraded: %#v", input)
+	}
+	host := records[6].(map[string]any)
+	if host["target"] != "https://x.test/" || host["status_code"] != float64(302) {
+		t.Fatalf("legacy host evidence was not upgraded: %#v", host)
+	}
+}
+
+func TestHistoricalRecordsPreserveNormalizedTargetRecords(t *testing.T) {
+	records, err := historicalRecords([]string{`{"provider":"httpx","kind":"url","target":"HTTPS://X.Test:443/path/../api?b=2&a=1","host":"x.test","status_code":201,"technologies":["Go"],"fields":{"content_type":"application/json"}}`})
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records=%#v err=%v", records, err)
+	}
+	record := records[0].(map[string]any)
+	if record["provider"] != "httpx" || record["kind"] != "url" || record["target"] != "https://x.test/api?a=1&b=2" || record["status_code"] != float64(201) {
+		t.Fatalf("normalized record evidence was not preserved: %#v", record)
+	}
+}
+
+func TestHistoricalRecordsRejectMalformedInputs(t *testing.T) {
+	tests := []string{
+		`not a url`,
+		`ftp://x.test/`,
+		`{"unexpected":true}`,
+		`{"value":"not a url"}`,
+		`{"target":"https://x.test/","kind":"host"}`,
+		`{"url":`,
+	}
+	for _, raw := range tests {
+		t.Run(raw, func(t *testing.T) {
+			if _, err := historicalRecords([]string{raw}); err == nil {
+				t.Fatal("invalid historical observation was accepted")
+			}
+		})
 	}
 }
 
@@ -108,6 +156,74 @@ func TestClassifyExecutionLoadsPriorProbeEvidence(t *testing.T) {
 	}
 	if store.loadedFor != "probe.http" || len(captured.History) != 1 || captured.History[0]["status_code"] != float64(401) {
 		t.Fatalf("loaded_for=%q input=%s", store.loadedFor, classifier.input)
+	}
+}
+
+func TestClassifyExecutionConvertsMixedPriorProbeValues(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{previous: []string{
+		`https://x.test/plain`,
+		`http://x.test/plain-http`,
+		`{"value":"https://x.test/legacy"}`,
+		`{"url":"https://x.test/old-httpx","status_code":403,"tech":["Go"]}`,
+		`{"provider":"httpx","kind":"url","target":"https://x.test/api","status_code":401,"fields":{"content_type":"application/json"}}`,
+	}}
+	input := json.RawMessage(`{"active":[],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan"}`)
+	req := capability.Request{
+		Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "classify.endpoint", Input: input},
+		Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}},
+		Scope:  allowedScope{},
+	}
+	result, err := (Service{Registry: providers.Registry(cfg), Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.loadedFor != "probe.http" || result.Action.Status != "succeeded" {
+		t.Fatalf("historical probe values were not injected successfully: loaded_for=%q result=%#v", store.loadedFor, result.Action)
+	}
+}
+
+func TestCompareAssetsExecutionLoadsPriorProbeValues(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{previous: []string{`{"value":"https://example.test/"}`}}
+	input := json.RawMessage(`{"current":["https://example.test/"],"previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`)
+	req := capability.Request{
+		Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "compare.assets", Input: input},
+		Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}},
+		Scope:  allowedScope{},
+	}
+	result, err := (Service{Registry: providers.Registry(cfg), Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.loadedFor != "probe.http" {
+		t.Fatalf("historical probe values were not loaded: %q", store.loadedFor)
+	}
+	var output struct {
+		NewOrChanged []string `json:"new_or_changed"`
+		Removed      []string `json:"removed"`
+	}
+	if err := json.Unmarshal(result.Action.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.NewOrChanged) != 0 || len(output.Removed) != 0 {
+		t.Fatalf("loaded historical value did not match current asset: %s", result.Action.Output)
 	}
 }
 func (s *capturedStore) PersistResult(_ context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult) error {

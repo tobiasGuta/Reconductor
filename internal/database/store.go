@@ -961,20 +961,32 @@ func (s *Store) LatestChanges(ctx context.Context, programID domain.ID) (json.Ra
 	return summary, err
 }
 func (s *Store) PreviousObservationValues(ctx context.Context, programID, currentRunID domain.ID, capabilityName string) ([]string, error) {
-	rows, err := s.Pool.Query(ctx, `WITH previous_run AS (SELECT wr.id FROM workflow_runs wr JOIN tasks t ON t.id=wr.task_id WHERE t.program_id=$1 AND wr.status='completed' AND wr.id<>$2 ORDER BY wr.completed_at DESC NULLS LAST LIMIT 1) SELECT ao.metadata::text FROM asset_observations ao JOIN previous_run pr ON pr.id=ao.workflow_run_id WHERE ao.source_capability=$3 ORDER BY ao.observed_value`, programID, currentRunID, capabilityName)
+	rows, err := s.Pool.Query(ctx, `WITH previous_run AS (SELECT wr.id FROM workflow_runs wr JOIN tasks t ON t.id=wr.task_id WHERE t.program_id=$1 AND wr.status='completed' AND wr.id<>$2 ORDER BY wr.completed_at DESC NULLS LAST LIMIT 1) SELECT ao.metadata, ao.observed_value FROM asset_observations ao JOIN previous_run pr ON pr.id=ao.workflow_run_id WHERE ao.source_capability=$3 ORDER BY ao.observed_value`, programID, currentRunID, capabilityName)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []string
 	for rows.Next() {
-		var v string
-		if err := rows.Scan(&v); err != nil {
+		var metadata json.RawMessage
+		var observedValue string
+		if err := rows.Scan(&metadata, &observedValue); err != nil {
 			return nil, err
 		}
-		out = append(out, v)
+		out = append(out, previousObservationValue(metadata, observedValue))
 	}
 	return out, rows.Err()
+}
+
+func previousObservationValue(metadata json.RawMessage, observedValue string) string {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(metadata, &fields) == nil && len(fields) == 1 {
+		var value string
+		if raw, ok := fields["value"]; ok && json.Unmarshal(raw, &value) == nil && value == observedValue {
+			return observedValue
+		}
+	}
+	return string(metadata)
 }
 
 type transactionContextKey struct{}
