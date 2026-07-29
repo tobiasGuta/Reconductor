@@ -111,6 +111,7 @@ const (
 	ScheduledExecutionClaimed            ScheduledExecutionStatus = "claimed"
 	ScheduledExecutionRunning            ScheduledExecutionStatus = "running"
 	ScheduledExecutionPausedForApproval  ScheduledExecutionStatus = "paused_for_approval"
+	ScheduledExecutionPausedOperator     ScheduledExecutionStatus = "paused_operator"
 	ScheduledExecutionCompleted          ScheduledExecutionStatus = "completed"
 	ScheduledExecutionFailed             ScheduledExecutionStatus = "failed"
 	ScheduledExecutionCancelled          ScheduledExecutionStatus = "cancelled"

@@ -118,7 +118,8 @@ func consoleCommand(ctx context.Context, cfg config.Config, args []string) error
 	if err := workQueue.EnsureGroup(ctx); err != nil {
 		return fmt.Errorf("initialize console queue view: %w", err)
 	}
-	server := console.HTTPServer(*listen, console.New(store, workQueue))
+	validator := &schedulecron.ScheduleValidator{Programs: store, Registry: providers.Registry(cfg)}
+	server := console.HTTPServer(*listen, console.New(store, workQueue, validator))
 	slog.Info("Reconductor operator console ready", "url", "http://"+*listen)
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
@@ -681,34 +682,12 @@ func scheduleCommand(ctx context.Context, cfg config.Config, args []string) erro
 		if *programID == "" || strings.TrimSpace(*name) == "" || strings.TrimSpace(*objective) == "" {
 			return fmt.Errorf("--program-id, --name, and --objective are required")
 		}
-		program, err := s.GetProgram(ctx, domain.ID(*programID))
-		if err != nil {
-			return err
-		}
-		if err := schedulecron.ValidateCron(*cronExpr, *timezone); err != nil {
-			return err
-		}
-		sc, err := platformscope.LoadBurp(program.ScopeReference)
-		if err != nil {
-			return fmt.Errorf("load current scope: %w", err)
-		}
-		plan, err := targeting.Plan(sc, nil)
-		if err != nil {
-			return err
-		}
-		def, err := workflows.Build(*workflowName, plan, *headless)
-		if err != nil {
-			return err
-		}
-		if err := workflow.Validate(def, providers.Registry(cfg)); err != nil {
-			return err
-		}
-		next, err := schedulecron.NextRun(*cronExpr, *timezone, time.Now())
-		if err != nil {
-			return err
-		}
 		now := time.Now().UTC()
-		item := domain.Schedule{ID: domain.NewID(), ProgramID: domain.ID(*programID), Name: *name, WorkflowName: *workflowName, Objective: *objective, CronExpression: *cronExpr, Timezone: *timezone, Enabled: true, Headless: *headless, CreatedBy: *actor, NextRunAt: next, CreatedAt: now, UpdatedAt: now}
+		item := domain.Schedule{ID: domain.NewID(), ProgramID: domain.ID(*programID), Name: *name, WorkflowName: *workflowName, Objective: *objective, CronExpression: *cronExpr, Timezone: *timezone, Enabled: true, Headless: *headless, CreatedBy: *actor, CreatedAt: now, UpdatedAt: now}
+		item, err = (schedulecron.ScheduleValidator{Programs: s, Registry: providers.Registry(cfg)}).Validate(ctx, item, now)
+		if err != nil {
+			return err
+		}
 		if err := s.CreateSchedule(ctx, item); err != nil {
 			return err
 		}
@@ -752,14 +731,11 @@ func scheduleCommand(ctx context.Context, cfg config.Config, args []string) erro
 		if err := fs.Parse(args[2:]); err != nil {
 			return err
 		}
-		if err := schedulecron.ValidateCron(*cronExpr, *timezone); err != nil {
-			return err
-		}
-		next, err := schedulecron.NextRun(*cronExpr, *timezone, time.Now())
+		item.Name, item.WorkflowName, item.Objective, item.CronExpression, item.Timezone, item.Headless = *name, *workflowName, *objective, *cronExpr, *timezone, *headless
+		item, err = (schedulecron.ScheduleValidator{Programs: s, Registry: providers.Registry(cfg)}).Validate(ctx, item, time.Now())
 		if err != nil {
 			return err
 		}
-		item.Name, item.WorkflowName, item.Objective, item.CronExpression, item.Timezone, item.Headless, item.NextRunAt = *name, *workflowName, *objective, *cronExpr, *timezone, *headless, next
 		if err := s.UpdateSchedule(ctx, item, *actor); err != nil {
 			return err
 		}

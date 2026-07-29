@@ -13,6 +13,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/orchestration"
+	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
 type Store interface {
@@ -22,8 +23,10 @@ type Store interface {
 	HeartbeatScheduledExecution(context.Context, domain.ID, string, time.Duration) error
 	MarkScheduledExecutionRunning(context.Context, domain.ID, domain.ID, domain.ID, *domain.ID, string) error
 	MarkScheduledExecutionPaused(context.Context, domain.ID, string) error
+	MarkScheduledExecutionPausedForApproval(context.Context, domain.ID, string) error
 	MarkScheduledExecutionCompleted(context.Context, domain.ID, string) error
 	MarkScheduledExecutionFailed(context.Context, domain.ID, string, string, string) error
+	MarkScheduledExecutionCancelled(context.Context, domain.ID, string) error
 	MarkScheduledExecutionBlocked(context.Context, domain.ID, domain.ID, string) error
 }
 
@@ -135,6 +138,7 @@ func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, s
 		RequestedBy:       exec.TriggerSource,
 		ScheduleReference: stringPtr(string(schedule.ID)),
 		Headless:          schedule.Headless,
+		Lifecycle:         scheduledExecutionLifecycle{Store: s.Store, ExecutionID: exec.ID, Owner: s.Owner},
 	}
 	if exec.TaskID != nil {
 		request.ExistingTaskID = *exec.TaskID
@@ -146,12 +150,11 @@ func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, s
 	if errors.Is(err, orchestration.ErrScopeExpansion) {
 		return s.Store.MarkScheduledExecutionBlocked(context.WithoutCancel(ctx), exec.ID, result.ScopeChange.ScopeVersionID, s.Owner)
 	}
-	if result.State != nil {
-		var scopeVersion *domain.ID
-		if result.ScopeChange.ScopeVersionID != "" {
-			scopeVersion = &result.ScopeChange.ScopeVersionID
-		}
-		_ = s.Store.MarkScheduledExecutionRunning(context.WithoutCancel(ctx), exec.ID, result.Task.ID, result.State.Run.ID, scopeVersion, s.Owner)
+	if result.State != nil && result.State.Run.Status == domain.RunCancelled {
+		return s.Store.MarkScheduledExecutionCancelled(context.WithoutCancel(ctx), exec.ID, s.Owner)
+	}
+	if errors.Is(err, context.Canceled) {
+		return s.Store.MarkScheduledExecutionCancelled(context.WithoutCancel(ctx), exec.ID, s.Owner)
 	}
 	if err != nil {
 		return s.Store.MarkScheduledExecutionFailed(context.WithoutCancel(ctx), exec.ID, s.Owner, "execution", err.Error())
@@ -163,12 +166,38 @@ func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, s
 	case domain.RunCompleted:
 		return s.Store.MarkScheduledExecutionCompleted(context.WithoutCancel(ctx), exec.ID, s.Owner)
 	case domain.RunPaused:
+		if runAwaitingApproval(result.State) {
+			return s.Store.MarkScheduledExecutionPausedForApproval(context.WithoutCancel(ctx), exec.ID, s.Owner)
+		}
 		return s.Store.MarkScheduledExecutionPaused(context.WithoutCancel(ctx), exec.ID, s.Owner)
 	case domain.RunCancelled:
-		return s.Store.MarkScheduledExecutionFailed(context.WithoutCancel(ctx), exec.ID, s.Owner, "cancelled", "workflow was cancelled")
+		return s.Store.MarkScheduledExecutionCancelled(context.WithoutCancel(ctx), exec.ID, s.Owner)
 	default:
 		return s.Store.MarkScheduledExecutionFailed(context.WithoutCancel(ctx), exec.ID, s.Owner, "execution", fmt.Sprintf("workflow ended as %s", result.State.Run.Status))
 	}
+}
+
+type scheduledExecutionLifecycle struct {
+	Store       Store
+	ExecutionID domain.ID
+	Owner       string
+}
+
+func (l scheduledExecutionLifecycle) WorkflowCreated(ctx context.Context, task domain.Task, run domain.WorkflowRun, scopeVersionID domain.ID) error {
+	var scopeVersion *domain.ID
+	if scopeVersionID != "" {
+		scopeVersion = &scopeVersionID
+	}
+	return l.Store.MarkScheduledExecutionRunning(ctx, l.ExecutionID, task.ID, run.ID, scopeVersion, l.Owner)
+}
+
+func runAwaitingApproval(state *workflow.State) bool {
+	for _, step := range state.Steps {
+		if step.Run.Status == domain.StepAwaitingApproval {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) Run(ctx context.Context) error {

@@ -24,6 +24,9 @@ func TestValidateCronRejectsInvalidAndSixField(t *testing.T) {
 	if err := ValidateCron("0 9 * * 1", "Mars/Olympus"); err == nil {
 		t.Fatal("expected invalid timezone rejection")
 	}
+	if err := ValidateCron("0 9 * * 1", ""); err == nil {
+		t.Fatal("expected empty timezone rejection")
+	}
 }
 
 func TestNextRunUTC(t *testing.T) {

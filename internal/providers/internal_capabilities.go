@@ -52,10 +52,7 @@ type StatusRoutes struct {
 	Ignored        []string `json:"ignored"`
 }
 
-type AssetChange struct {
-	Kind  string `json:"kind"`
-	Value string `json:"value"`
-}
+type AssetChange = changes.AssetChange
 
 type CompareAssetsOutput struct {
 	NewOrChanged []string      `json:"new_or_changed"`
@@ -218,6 +215,15 @@ func validateInternalInput(name string, raw json.RawMessage) error {
 			if change.Kind != "new_or_changed" && change.Kind != "removed" {
 				return fmt.Errorf("report.changes input: change %d has unsupported kind %q", index, change.Kind)
 			}
+			if len(change.Reasons) == 0 {
+				return fmt.Errorf("report.changes input: change %d requires structured reasons", index)
+			}
+			if change.Kind == "removed" && len(change.Previous) == 0 {
+				return fmt.Errorf("report.changes input: removed change %d requires previous evidence", index)
+			}
+			if change.Kind == "new_or_changed" && len(change.Current) == 0 {
+				return fmt.Errorf("report.changes input: change %d requires current evidence", index)
+			}
 		}
 		for index, endpoint := range input.Endpoints {
 			if err := validateInterestingEndpoint(endpoint); err != nil {
@@ -276,16 +282,29 @@ func executeCompareAssets(raw json.RawMessage) (CompareAssetsOutput, string, err
 	if err := strictInternal(raw, &input, "current", "previous", "coverage_complete", "target_plan_digest"); err != nil {
 		return CompareAssetsOutput{}, "", err
 	}
-	previous := map[string]string{}
+	type observation struct {
+		raw         string
+		fingerprint string
+	}
+	previous := map[string]observation{}
 	for _, value := range input.Previous {
-		previous[extractURL(value)] = observationFingerprint(value)
+		previous[extractURL(value)] = observation{raw: value, fingerprint: observationFingerprint(value)}
 	}
 	changed := []string{}
+	changes := []AssetChange{}
 	routes := StatusRoutes{Active: []string{}, Redirects: []string{}, Authentication: []string{}, Ignored: []string{}}
 	for _, value := range input.Current {
 		target := extractURL(value)
-		if old, exists := previous[target]; !exists || old != observationFingerprint(value) {
+		old, exists := previous[target]
+		if !exists || old.fingerprint != observationFingerprint(value) {
 			changed = append(changed, target)
+			reasons := []string{"HTTP asset is newly observed"}
+			var previousValue json.RawMessage
+			if exists {
+				reasons = comparisonReasons(old.raw, value)
+				previousValue = structuredObservation(old.raw)
+			}
+			changes = append(changes, AssetChange{Kind: "new_or_changed", Value: target, Previous: previousValue, Current: structuredObservation(value), Reasons: reasons})
 			switch status := extractStatus(value); {
 			case status >= 200 && status <= 299:
 				routes.Active = append(routes.Active, target)
@@ -306,12 +325,13 @@ func executeCompareAssets(raw json.RawMessage) (CompareAssetsOutput, string, err
 		}
 		for _, value := range input.Previous {
 			if !current[extractURL(value)] {
-				removed = append(removed, extractURL(value))
+				target := extractURL(value)
+				removed = append(removed, target)
+				changes = append(changes, AssetChange{Kind: "removed", Value: target, Previous: structuredObservation(value), Reasons: []string{"asset was absent from a complete current comparison"}})
 			}
 		}
 	}
 	scanTargets := append(append(append([]string{}, routes.Active...), routes.Redirects...), routes.Authentication...)
-	changes := append(changeRows("new_or_changed", changed), changeRows("removed", removed)...)
 	output := CompareAssetsOutput{NewOrChanged: changed, CrawlTargets: routes.Active, ScanTargets: scanTargets, StatusRoutes: routes, Removed: removed, Changes: changes}
 	return output, fmt.Sprintf("asset comparison found %d new or changed and %d removed", len(changed), len(removed)), nil
 }
@@ -495,18 +515,41 @@ func observationFingerprint(raw string) string {
 	return string(b)
 }
 
-func changeRows(kind string, items []string) []AssetChange {
-	out := make([]AssetChange, 0, len(items))
-	for _, item := range items {
-		out = append(out, AssetChange{Kind: kind, Value: item})
+func structuredObservation(raw string) json.RawMessage {
+	var object map[string]any
+	if json.Unmarshal([]byte(raw), &object) == nil && object != nil {
+		value, _ := json.Marshal(object)
+		return value
 	}
-	return out
+	value, _ := json.Marshal(map[string]string{"value": raw})
+	return value
+}
+
+func comparisonReasons(previous, current string) []string {
+	reasons := []string{}
+	if extractStatus(previous) != extractStatus(current) {
+		reasons = append(reasons, "HTTP status changed")
+	}
+	var before, after map[string]any
+	if json.Unmarshal([]byte(previous), &before) == nil && json.Unmarshal([]byte(current), &after) == nil {
+		for _, key := range []string{"tech", "technologies", "webserver"} {
+			if fmt.Sprint(before[key]) != fmt.Sprint(after[key]) {
+				reasons = append(reasons, "technology changed")
+				break
+			}
+		}
+	}
+	if len(reasons) == 0 {
+		reasons = append(reasons, "HTTP asset metadata changed")
+	}
+	return reasons
 }
 
 const targetingPrepareInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["exact_urls","discovered_urls","ports","target_plan_digest"],"properties":{"exact_urls":{"type":"array","items":{"type":"string"}},"discovered_urls":{"type":"array","items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer","minimum":1,"maximum":65535},"uniqueItems":true},"target_plan_digest":{"type":"string","minLength":1}}}`
 const targetingPrepareOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["urls","port_targets","filtered","accepted_count","filtered_count","target_plan_digest"],"properties":{"urls":{"type":"array","items":{"type":"string","format":"uri"}},"port_targets":{"type":"array","items":{"type":"string","format":"uri"}},"filtered":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["target","accepted","reason"],"properties":{"target":{"type":"string"},"accepted":{"type":"boolean"},"reason":{"type":"string"},"authorized_urls":{"type":"array","items":{"type":"string","format":"uri"}},"source_rule_ids":{"type":"array","items":{"type":"string"}}}}},"accepted_count":{"type":"integer","minimum":0},"filtered_count":{"type":"integer","minimum":0},"target_plan_digest":{"type":"string","minLength":1}}}`
 const compareAssetsInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["current","previous","coverage_complete","target_plan_digest"],"properties":{"current":{"type":"array","items":{"type":"string"}},"previous":{"type":"array","items":{"type":"string"}},"coverage_complete":{"type":"boolean"},"target_plan_digest":{"type":"string","minLength":1}}}`
-const compareAssetsOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["new_or_changed","crawl_targets","scan_targets","status_routes","removed","changes"],"properties":{"new_or_changed":{"type":"array","items":{"type":"string","format":"uri"}},"crawl_targets":{"type":"array","items":{"type":"string","format":"uri"}},"scan_targets":{"type":"array","items":{"type":"string","format":"uri"}},"status_routes":{"type":"object","additionalProperties":false,"required":["active","redirects","authentication","ignored"],"properties":{"active":{"type":"array","items":{"type":"string","format":"uri"}},"redirects":{"type":"array","items":{"type":"string","format":"uri"}},"authentication":{"type":"array","items":{"type":"string","format":"uri"}},"ignored":{"type":"array","items":{"type":"string","format":"uri"}}}},"removed":{"type":"array","items":{"type":"string","format":"uri"}},"changes":{"type":"array","items":{"$ref":"#/$defs/change"}}},"$defs":{"change":{"type":"object","additionalProperties":false,"required":["kind","value"],"properties":{"kind":{"enum":["new_or_changed","removed"]},"value":{"type":"string","format":"uri"}}}}}`
+const assetChangeSchema = `{"type":"object","additionalProperties":false,"required":["kind","value","reasons"],"properties":{"kind":{"enum":["new_or_changed","removed"]},"value":{"type":"string","minLength":1},"previous":{"type":"object"},"current":{"type":"object"},"reasons":{"type":"array","items":{"type":"string","minLength":1},"minItems":1}}}`
+const compareAssetsOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["new_or_changed","crawl_targets","scan_targets","status_routes","removed","changes"],"properties":{"new_or_changed":{"type":"array","items":{"type":"string","format":"uri"}},"crawl_targets":{"type":"array","items":{"type":"string","format":"uri"}},"scan_targets":{"type":"array","items":{"type":"string","format":"uri"}},"status_routes":{"type":"object","additionalProperties":false,"required":["active","redirects","authentication","ignored"],"properties":{"active":{"type":"array","items":{"type":"string","format":"uri"}},"redirects":{"type":"array","items":{"type":"string","format":"uri"}},"authentication":{"type":"array","items":{"type":"string","format":"uri"}},"ignored":{"type":"array","items":{"type":"string","format":"uri"}}}},"removed":{"type":"array","items":{"type":"string","format":"uri"}},"changes":{"type":"array","items":{"$ref":"#/$defs/change"}}},"$defs":{"change":` + assetChangeSchema + `}}`
 const providerURLRecordSchema = `{"type":"object","additionalProperties":false,"required":["provider","kind","target"],"properties":{"provider":{"type":"string","minLength":1},"kind":{"const":"url"},"target":{"type":"string","format":"uri"},"host":{"type":"string"},"port":{"type":"integer","minimum":0,"maximum":65535},"status_code":{"type":"integer","minimum":0,"maximum":599},"technologies":{"type":"array","items":{"type":"string"}},"fields":{"type":"object"}}}`
 const classifyEndpointInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["active","passive","http_observations","crawl_observations","passive_observations","historical_observations","api_schema_endpoints","target_plan_digest"],"properties":{"active":{"type":"array","items":{"type":"string"}},"passive":{"type":"array","items":{"type":"string"}},"http_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"crawl_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"passive_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"historical_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"api_schema_endpoints":{"type":"array","items":{"type":"string","format":"uri"}},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"record":` + providerURLRecordSchema + `}}`
 const endpointSchema = `{"type":"object","additionalProperties":false,"required":["exact_url","route_signature","method","content_type","query_parameters","digest"],"properties":{"exact_url":{"type":"string","format":"uri"},"route_signature":{"type":"string"},"method":{"type":"string"},"content_type":{"type":"string"},"query_parameters":{"type":"array","items":{"type":"string"}},"digest":{"type":"string","minLength":1}}}`
@@ -515,6 +558,6 @@ const relationshipSchema = `{"type":"object","additionalProperties":false,"requi
 const historicalBehaviorSchema = `{"type":"object","additionalProperties":false,"required":["seen_before","status_changed","technology_changed"],"properties":{"seen_before":{"type":"boolean"},"status_changed":{"type":"boolean"},"technology_changed":{"type":"boolean"}}}`
 const endpointClassificationSchema = `{"type":"object","additionalProperties":false,"required":["endpoint","labels","matched_keywords","signals","interest_score","confidence","sources","technologies","status_codes","redirect_destinations","relationships","historical"],"properties":{"endpoint":` + endpointSchema + `,"labels":{"type":"array","items":{"type":"string","minLength":1}},"matched_keywords":{"type":"array","items":{"type":"string","minLength":1}},"signals":{"type":"array","items":` + signalSchema + `},"interest_score":{"type":"integer","minimum":0},"confidence":{"type":"number","minimum":0,"maximum":1},"sources":{"type":"array","items":{"type":"string","minLength":1}},"technologies":{"type":"array","items":{"type":"string","minLength":1}},"status_codes":{"type":"array","items":{"type":"integer","minimum":100,"maximum":599}},"redirect_destinations":{"type":"array","items":{"type":"string","format":"uri"}},"relationships":{"type":"array","items":` + relationshipSchema + `},"historical":` + historicalBehaviorSchema + `}}`
 const classifyEndpointOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["endpoints","classifications","interesting_endpoints","relationships"],"properties":{"endpoints":{"type":"array","items":` + endpointSchema + `},"classifications":{"type":"array","items":` + endpointClassificationSchema + `},"interesting_endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"relationships":{"type":"array","items":` + relationshipSchema + `}}}`
-const reportChangesInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["changes","endpoints","candidate_matches","target_plan_digest"],"properties":{"changes":{"type":"array","items":{"$ref":"#/$defs/change"}},"endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"candidate_matches":{"type":"array","items":{"type":"string","minLength":1}},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"change":{"type":"object","additionalProperties":false,"required":["kind","value"],"properties":{"kind":{"enum":["new_or_changed","removed"]},"value":{"type":"string","minLength":1}}}}}`
+const reportChangesInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["changes","endpoints","candidate_matches","target_plan_digest"],"properties":{"changes":{"type":"array","items":{"$ref":"#/$defs/change"}},"endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"candidate_matches":{"type":"array","items":{"type":"string","minLength":1}},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"change":` + assetChangeSchema + `}}`
 const changeItemSchema = `{"type":"object","additionalProperties":false,"required":["kind","entity_type","entity_key","priority","title","summary","reasons","source_capabilities","observed_at"],"properties":{"kind":{"type":"string","minLength":1},"entity_type":{"type":"string","minLength":1},"entity_key":{"type":"string","minLength":1},"priority":{"enum":["high","medium","low"]},"title":{"type":"string","minLength":1},"summary":{"type":"string"},"reasons":{"type":"array","items":{"type":"string","minLength":1}},"previous":{"type":"object"},"current":{"type":"object"},"source_capabilities":{"type":"array","items":{"type":"string","minLength":1}},"evidence_artifact_ids":{"type":"array","items":{"type":"string"}},"observed_at":{"type":"string","format":"date-time"}}}`
-const reportChangesOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["changes","endpoints","candidate_matches","target_plan_digest","change_items"],"properties":{"changes":{"type":"array","items":{"$ref":"#/$defs/change"}},"endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"candidate_matches":{"type":"array","items":{"type":"string","minLength":1}},"target_plan_digest":{"type":"string","minLength":1},"change_items":{"type":"array","items":` + changeItemSchema + `}},"$defs":{"change":{"type":"object","additionalProperties":false,"required":["kind","value"],"properties":{"kind":{"enum":["new_or_changed","removed"]},"value":{"type":"string","minLength":1}}}}}`
+const reportChangesOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["changes","endpoints","candidate_matches","target_plan_digest","change_items"],"properties":{"changes":{"type":"array","items":{"$ref":"#/$defs/change"}},"endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"candidate_matches":{"type":"array","items":{"type":"string","minLength":1}},"target_plan_digest":{"type":"string","minLength":1},"change_items":{"type":"array","items":` + changeItemSchema + `}},"$defs":{"change":` + assetChangeSchema + `}}`

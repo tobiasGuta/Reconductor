@@ -53,7 +53,7 @@ function statusBadge(status) {
   const normalized = String(status || "unknown").toLowerCase();
   let tone = "neutral";
   if (["succeeded", "completed", "approved", "open", "confirmed"].includes(normalized)) tone = "";
-  if (["pending", "running", "queued", "paused", "awaiting_approval", "new", "needs_manual_review", "moderate", "medium"].includes(normalized)) tone = "warning";
+  if (["pending", "running", "queued", "paused", "paused_operator", "paused_for_approval", "awaiting_approval", "new", "needs_manual_review", "moderate", "medium"].includes(normalized)) tone = "warning";
   if (["failed", "retryable", "rejected", "cancelled", "critical", "high"].includes(normalized)) tone = "danger";
   return element("span", `status-badge ${tone}`.trim(), normalized.replaceAll("_", " "));
 }
@@ -367,13 +367,15 @@ function renderSchedules() {
       const copy = element("div");
       copy.append(element("h3", "", item.name), element("p", "", `${item.workflow_name} · ${item.cron_expression} · ${item.timezone}`));
       const meta = element("div", "run-meta");
-      meta.append(element("span", "", "Next run"), element("strong", "", relativeTime(item.next_run_at)));
+      meta.append(element("span", "", `Last ${item.last_run_at ? relativeTime(item.last_run_at) : "never"} · next`), element("strong", "", relativeTime(item.next_run_at)));
       const actions = element("div", "card-actions");
+      const edit = element("button", "secondary-button", "Edit");
+      edit.addEventListener("click", () => startScheduleEdit(item));
       const toggle = element("button", "secondary-button", item.enabled ? "Disable" : "Enable");
       toggle.addEventListener("click", () => postAction(`/api/v1/schedules/${encodeURIComponent(item.id)}/${item.enabled ? "disable" : "enable"}`, {}, `Schedule ${item.enabled ? "disabled" : "enabled"}.`));
       const runNow = element("button", "primary-button", "Run now");
       runNow.addEventListener("click", () => postAction(`/api/v1/schedules/${encodeURIComponent(item.id)}/run-now`, {}, "Run now queued."));
-      actions.append(toggle, runNow);
+      actions.append(edit, toggle, runNow);
       card.append(copy, statusBadge(item.enabled ? "enabled" : "disabled"), meta, actions);
       return card;
     }));
@@ -381,6 +383,7 @@ function renderSchedules() {
   const executionList = $("#scheduled-execution-list");
   if (!executions.length) {
     setChildren(executionList, empty("No scheduled executions have been recorded."));
+    renderPendingScopeExpansions();
     return;
   }
   setChildren(executionList, ...executions.slice(0, 25).map((item) => {
@@ -388,12 +391,75 @@ function renderSchedules() {
     const copy = element("div");
     copy.append(element("h3", "", `${item.trigger_source.replaceAll("_", " ")} · ${formatTime(item.planned_at, true)}`), element("p", "", item.error_summary || `task ${shortID(item.task_id)} · run ${shortID(item.workflow_run_id)}`));
     const actions = element("div", "card-actions");
-    if (item.status === "paused_for_approval") {
+    if (["paused_for_approval", "paused_operator"].includes(item.status)) {
       const resume = element("button", "primary-button", "Resume");
       resume.addEventListener("click", () => postAction(`/api/v1/scheduled-executions/${encodeURIComponent(item.id)}/resume`, {}, "Scheduled execution queued for resume."));
       actions.append(resume);
     }
     card.append(copy, statusBadge(item.status), actions);
+    return card;
+  }));
+  renderPendingScopeExpansions();
+}
+
+function startScheduleEdit(item) {
+  const form = $("#schedule-form");
+  form.elements.schedule_id.value = item.id;
+  form.elements.name.value = item.name;
+  form.elements.objective.value = item.objective;
+  form.elements.workflow.value = item.workflow_name;
+  form.elements.cron.value = item.cron_expression;
+  form.elements.timezone.value = item.timezone;
+  form.elements.headless.checked = Boolean(item.headless);
+  $("#schedule-form-eyebrow").textContent = "Edit";
+  $("#schedule-form-title").textContent = item.name;
+  $("#schedule-submit").textContent = "Save schedule";
+  $("#schedule-cancel").classList.remove("hidden");
+  form.elements.name.focus();
+}
+
+function resetScheduleForm() {
+  const form = $("#schedule-form");
+  form.reset();
+  form.elements.schedule_id.value = "";
+  $("#schedule-form-eyebrow").textContent = "Create";
+  $("#schedule-form-title").textContent = "New schedule";
+  $("#schedule-submit").textContent = "Create schedule";
+  $("#schedule-cancel").classList.add("hidden");
+}
+
+function renderPendingScopeExpansions() {
+  const items = state.data.pending_scope_expansions || [];
+  const target = $("#pending-scope-expansion-list");
+  if (!items.length) {
+    setChildren(target, empty("No scope expansion is waiting for acknowledgement."));
+    return;
+  }
+  setChildren(target, ...items.map((item) => {
+    const card = element("article", "list-card");
+    const copy = element("div");
+    copy.append(element("h3", "", `Scope ${shortID(item.id)}`), element("p", "", `Target plan ${item.target_plan_digest}`));
+    const changes = element("div", "warning-list");
+    const rows = [
+      ["Added includes", item.added_include_digests],
+      ["Removed includes", item.removed_include_digests],
+      ["Added exclusions", item.added_exclude_digests],
+      ["Removed exclusions", item.removed_exclude_digests],
+    ];
+    rows.forEach(([label, values]) => (values || []).forEach((value) => changes.append(element("div", "warning-row", `${label}: ${value}`))));
+    (Array.isArray(item.planning_warnings) ? item.planning_warnings : []).forEach((warning) => changes.append(element("div", "warning-row", `Planning warning: ${typeof warning === "string" ? warning : JSON.stringify(warning)}`)));
+    copy.append(changes);
+    const review = element("button", "primary-button", "Review and acknowledge");
+    review.addEventListener("click", () => openModal({
+      eyebrow: "Authorization boundary",
+      title: "Acknowledge this scope expansion?",
+      description: "This records a separate operator acknowledgement. It does not queue or start a workflow.",
+      details: [["Scope digest", item.scope_digest], ["Target plan digest", item.target_plan_digest], ["Created", formatTime(item.created_at, true)]],
+      confirmLabel: "Acknowledge expansion",
+      danger: false,
+      action: () => postAction(`/api/v1/scope-versions/${encodeURIComponent(item.id)}/acknowledge`, {}, "Scope expansion acknowledged."),
+    }));
+    card.append(copy, statusBadge("pending"), review);
     return card;
   }));
 }
@@ -675,25 +741,28 @@ function bindEvents() {
   $("#modal-cancel").addEventListener("click", closeModal);
   $("#action-modal").addEventListener("click", (event) => { if (event.target === $("#action-modal")) closeModal(); });
   $("#modal-confirm").addEventListener("click", () => { if (state.modalAction) state.modalAction(); });
+  $("#schedule-cancel").addEventListener("click", resetScheduleForm);
   $("#schedule-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const scheduleID = String(form.get("schedule_id") || "");
     const body = {
-      program_id: state.data?.selected_program_id || state.selectedProgram,
       name: String(form.get("name") || ""),
-      workflow_name: "continuous-web-recon",
+      workflow_name: String(form.get("workflow") || ""),
       objective: String(form.get("objective") || ""),
       cron_expression: String(form.get("cron") || ""),
-      timezone: String(form.get("timezone") || "UTC"),
-      headless: false,
+      timezone: String(form.get("timezone") || ""),
+      headless: form.get("headless") === "on",
       actor: "console-operator",
     };
+    if (!scheduleID) body.program_id = state.data?.selected_program_id || state.selectedProgram;
     try {
-      const response = await fetch("/api/v1/schedules", { method: "POST", headers: { "Content-Type": "application/json", "X-Reconductor-Request": "operator-console", Accept: "application/json" }, body: JSON.stringify(body) });
+      const path = scheduleID ? `/api/v1/schedules/${encodeURIComponent(scheduleID)}/update` : "/api/v1/schedules";
+      const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Reconductor-Request": "operator-console", Accept: "application/json" }, body: JSON.stringify(body) });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.error || "Schedule was not accepted.");
-      event.currentTarget.reset();
-      toast("Schedule created.");
+      resetScheduleForm();
+      toast(scheduleID ? "Schedule updated." : "Schedule created.");
       await loadData({ quiet: true });
     } catch (error) {
       toast(error.message, true);

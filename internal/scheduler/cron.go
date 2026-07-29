@@ -17,6 +17,9 @@ func ValidateCron(expression, timezone string) error {
 	if len(strings.Fields(expression)) != 5 {
 		return fmt.Errorf("cron expression must use five fields")
 	}
+	if strings.TrimSpace(timezone) == "" {
+		return fmt.Errorf("timezone is required")
+	}
 	if _, err := fiveFieldParser.Parse(expression); err != nil {
 		return fmt.Errorf("invalid cron expression: %w", err)
 	}

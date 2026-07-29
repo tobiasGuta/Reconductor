@@ -3,12 +3,18 @@ package database
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+)
+
+var (
+	ErrScheduleOverlap  = errors.New("schedule already has a queued or active execution")
+	ErrApprovalRejected = errors.New("scheduled execution was closed because approval was rejected")
 )
 
 func (s *Store) CreateSchedule(ctx context.Context, item domain.Schedule) error {
@@ -109,6 +115,17 @@ func (s *Store) EnqueueRunNow(ctx context.Context, scheduleID domain.ID, actor s
 	if err := tx.QueryRow(ctx, `SELECT program_id FROM schedules WHERE id=$1 FOR UPDATE`, scheduleID).Scan(&programID); err != nil {
 		return domain.ScheduledExecution{}, err
 	}
+	var overlap bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM scheduled_executions
+		WHERE schedule_id=$1
+		  AND status IN ('pending','claimed','running','paused_for_approval','paused_operator')
+	)`, scheduleID).Scan(&overlap); err != nil {
+		return domain.ScheduledExecution{}, err
+	}
+	if overlap {
+		return domain.ScheduledExecution{}, fmt.Errorf("%w: %s", ErrScheduleOverlap, scheduleID)
+	}
 	now := time.Now().UTC()
 	item := domain.ScheduledExecution{ID: domain.NewID(), ScheduleID: scheduleID, PlannedAt: now, TriggerSource: domain.ScheduleTriggerRunNow, Status: domain.ScheduledExecutionPending, CreatedAt: now, UpdatedAt: now}
 	if _, err := tx.Exec(ctx, `INSERT INTO scheduled_executions(id,schedule_id,planned_at,trigger_source,status,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, item.ID, item.ScheduleID, item.PlannedAt, item.TriggerSource, item.Status, item.CreatedAt, item.UpdatedAt); err != nil {
@@ -151,7 +168,7 @@ func (s *Store) MaterializeDueSchedule(ctx context.Context, scheduleID domain.ID
 	out := []domain.ScheduledExecution{}
 	for _, due := range dueItems {
 		var active bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM scheduled_executions WHERE schedule_id=$1 AND status IN ('claimed','running','paused_for_approval'))`, due.id).Scan(&active); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM scheduled_executions WHERE schedule_id=$1 AND status IN ('pending','claimed','running','paused_for_approval','paused_operator'))`, due.id).Scan(&active); err != nil {
 			return nil, err
 		}
 		status := domain.ScheduledExecutionPending
@@ -185,11 +202,27 @@ func (s *Store) ClaimPendingScheduledExecution(ctx context.Context, owner string
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
-	_, _ = tx.Exec(ctx, `UPDATE scheduled_executions SET status='pending',lease_owner='',lease_expires_at=NULL,updated_at=now() WHERE status='claimed' AND lease_expires_at<now() AND task_id IS NULL AND workflow_run_id IS NULL`)
-	_, _ = tx.Exec(ctx, `UPDATE scheduled_executions SET status='interrupted',error_classification='interrupted',error_summary='scheduler lease expired after workflow state was created',completed_at=now(),updated_at=now() WHERE status IN ('claimed','running') AND lease_expires_at<now() AND (task_id IS NOT NULL OR workflow_run_id IS NOT NULL)`)
+	if err := recoverStaleScheduledExecutions(ctx, tx); err != nil {
+		return domain.ScheduledExecution{}, domain.Schedule{}, false, err
+	}
+	if err := skipOverlappingPendingExecutions(ctx, tx); err != nil {
+		return domain.ScheduledExecution{}, domain.Schedule{}, false, err
+	}
 	var item domain.ScheduledExecution
 	var sched domain.Schedule
-	err = tx.QueryRow(ctx, `SELECT se.id,se.schedule_id,se.planned_at,se.trigger_source,se.status,se.task_id,se.workflow_run_id,se.scope_version_id,se.attempt_count,se.lease_owner,se.lease_expires_at,se.error_classification,se.error_summary,se.started_at,se.completed_at,se.created_at,se.updated_at,s.id,s.program_id,s.name,s.workflow_name,s.objective,s.cron_expression,s.timezone,s.enabled,s.headless,s.created_by,s.last_run_at,s.next_run_at,s.created_at,s.updated_at FROM scheduled_executions se JOIN schedules s ON s.id=se.schedule_id WHERE se.status='pending' ORDER BY se.planned_at,se.created_at LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&item.ID, &item.ScheduleID, &item.PlannedAt, &item.TriggerSource, &item.Status, &item.TaskID, &item.WorkflowRunID, &item.ScopeVersionID, &item.AttemptCount, &item.LeaseOwner, &item.LeaseExpiresAt, &item.ErrorClassification, &item.ErrorSummary, &item.StartedAt, &item.CompletedAt, &item.CreatedAt, &item.UpdatedAt, &sched.ID, &sched.ProgramID, &sched.Name, &sched.WorkflowName, &sched.Objective, &sched.CronExpression, &sched.Timezone, &sched.Enabled, &sched.Headless, &sched.CreatedBy, &sched.LastRunAt, &sched.NextRunAt, &sched.CreatedAt, &sched.UpdatedAt)
+	err = tx.QueryRow(ctx, `SELECT se.id,se.schedule_id,se.planned_at,se.trigger_source,se.status,se.task_id,se.workflow_run_id,se.scope_version_id,se.attempt_count,se.lease_owner,se.lease_expires_at,se.error_classification,se.error_summary,se.started_at,se.completed_at,se.created_at,se.updated_at,s.id,s.program_id,s.name,s.workflow_name,s.objective,s.cron_expression,s.timezone,s.enabled,s.headless,s.created_by,s.last_run_at,s.next_run_at,s.created_at,s.updated_at
+		FROM scheduled_executions se
+		JOIN schedules s ON s.id=se.schedule_id
+		WHERE se.status='pending'
+		  AND NOT EXISTS (
+			SELECT 1 FROM scheduled_executions active
+			WHERE active.schedule_id=se.schedule_id
+			  AND active.id<>se.id
+			  AND active.status IN ('claimed','running','paused_for_approval','paused_operator')
+		  )
+		ORDER BY se.planned_at,se.created_at
+		LIMIT 1
+		FOR UPDATE OF se,s SKIP LOCKED`).Scan(&item.ID, &item.ScheduleID, &item.PlannedAt, &item.TriggerSource, &item.Status, &item.TaskID, &item.WorkflowRunID, &item.ScopeVersionID, &item.AttemptCount, &item.LeaseOwner, &item.LeaseExpiresAt, &item.ErrorClassification, &item.ErrorSummary, &item.StartedAt, &item.CompletedAt, &item.CreatedAt, &item.UpdatedAt, &sched.ID, &sched.ProgramID, &sched.Name, &sched.WorkflowName, &sched.Objective, &sched.CronExpression, &sched.Timezone, &sched.Enabled, &sched.Headless, &sched.CreatedBy, &sched.LastRunAt, &sched.NextRunAt, &sched.CreatedAt, &sched.UpdatedAt)
 	if err == pgx.ErrNoRows {
 		return domain.ScheduledExecution{}, domain.Schedule{}, false, tx.Commit(ctx)
 	}
@@ -208,39 +241,289 @@ func (s *Store) ClaimPendingScheduledExecution(ctx context.Context, owner string
 }
 
 func (s *Store) HeartbeatScheduledExecution(ctx context.Context, id domain.ID, owner string, leaseTimeout time.Duration) error {
-	_, err := s.Pool.Exec(ctx, `UPDATE scheduled_executions SET lease_expires_at=$3,updated_at=now() WHERE id=$1 AND lease_owner=$2 AND status IN ('claimed','running')`, id, owner, time.Now().UTC().Add(leaseTimeout))
+	tag, err := s.Pool.Exec(ctx, `UPDATE scheduled_executions SET lease_expires_at=$3,updated_at=now() WHERE id=$1 AND lease_owner=$2 AND status IN ('claimed','running')`, id, owner, time.Now().UTC().Add(leaseTimeout))
+	if err == nil && tag.RowsAffected() != 1 {
+		return fmt.Errorf("scheduled execution %s cannot be heartbeated", id)
+	}
 	return err
 }
 
 func (s *Store) MarkScheduledExecutionRunning(ctx context.Context, id, taskID, workflowRunID domain.ID, scopeVersionID *domain.ID, owner string) error {
-	_, err := s.Pool.Exec(ctx, `UPDATE scheduled_executions SET status='running',task_id=$2,workflow_run_id=$3,scope_version_id=$4,started_at=COALESCE(started_at,now()),updated_at=now() WHERE id=$1 AND lease_owner=$5`, id, taskID, workflowRunID, scopeVersionID, owner)
-	return err
+	if tx, ok := transactionFromContext(ctx); ok {
+		return markScheduledExecutionRunning(ctx, tx, id, taskID, workflowRunID, scopeVersionID, owner)
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := markScheduledExecutionRunning(ctx, tx, id, taskID, workflowRunID, scopeVersionID, owner); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) MarkScheduledExecutionPaused(ctx context.Context, id domain.ID, owner string) error {
-	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionPausedForApproval, owner, "", "")
+	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionPausedOperator, owner, "", "", []domain.ScheduledExecutionStatus{domain.ScheduledExecutionRunning}, "scheduled_execution_paused", "scheduled execution paused by operator")
+}
+
+func (s *Store) MarkScheduledExecutionPausedForApproval(ctx context.Context, id domain.ID, owner string) error {
+	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionPausedForApproval, owner, "", "", []domain.ScheduledExecutionStatus{domain.ScheduledExecutionRunning}, "scheduled_execution_paused_for_approval", "scheduled execution paused for approval")
 }
 
 func (s *Store) MarkScheduledExecutionCompleted(ctx context.Context, id domain.ID, owner string) error {
-	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionCompleted, owner, "", "")
+	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionCompleted, owner, "", "", []domain.ScheduledExecutionStatus{domain.ScheduledExecutionRunning}, "scheduled_execution_completed", "scheduled execution completed")
 }
 
 func (s *Store) MarkScheduledExecutionFailed(ctx context.Context, id domain.ID, owner, class, summary string) error {
-	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionFailed, owner, class, safeSummary(summary))
+	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionFailed, owner, class, safeSummary(summary), []domain.ScheduledExecutionStatus{domain.ScheduledExecutionClaimed, domain.ScheduledExecutionRunning}, "scheduled_execution_failed", "scheduled execution failed")
 }
 
 func (s *Store) MarkScheduledExecutionCancelled(ctx context.Context, id domain.ID, owner string) error {
-	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionCancelled, owner, "cancelled", "scheduler shutdown cancelled execution")
+	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionCancelled, owner, "cancelled", "workflow execution was cancelled", []domain.ScheduledExecutionStatus{domain.ScheduledExecutionClaimed, domain.ScheduledExecutionRunning}, "scheduled_execution_cancelled", "scheduled execution cancelled")
 }
 
 func (s *Store) MarkScheduledExecutionBlocked(ctx context.Context, id domain.ID, scopeVersionID domain.ID, owner string) error {
-	_, err := s.Pool.Exec(ctx, `UPDATE scheduled_executions SET status='blocked_scope_change',scope_version_id=$2,error_classification='scope_change',error_summary='unacknowledged scope expansion blocked scheduled execution',completed_at=now(),lease_owner='',lease_expires_at=NULL,updated_at=now() WHERE id=$1 AND lease_owner=$3`, id, scopeVersionID, owner)
-	return err
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	item, programID, err := lockedScheduledExecution(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if item.Status != domain.ScheduledExecutionClaimed || item.LeaseOwner != owner {
+		return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionBlockedScopeChange)
+	}
+	now := time.Now().UTC()
+	tag, err := tx.Exec(ctx, `UPDATE scheduled_executions SET status='blocked_scope_change',scope_version_id=$2,error_classification='scope_change',error_summary='unacknowledged scope expansion blocked scheduled execution',completed_at=$3,lease_owner='',lease_expires_at=NULL,updated_at=$3 WHERE id=$1 AND status='claimed' AND lease_owner=$4`, id, scopeVersionID, now, owner)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionBlockedScopeChange)
+	}
+	item.Status, item.ScopeVersionID, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = domain.ScheduledExecutionBlockedScopeChange, &scopeVersionID, "scope_change", "unacknowledged scope expansion blocked scheduled execution", &now, now
+	item.LeaseOwner, item.LeaseExpiresAt = "", nil
+	if err := auditExecution(ctx, tx, "scheduled_execution_blocked_scope_change", owner, programID, item, "scheduled execution blocked by scope expansion", nil); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
-func (s *Store) markScheduledExecution(ctx context.Context, id domain.ID, status domain.ScheduledExecutionStatus, owner, class, summary string) error {
-	_, err := s.Pool.Exec(ctx, `UPDATE scheduled_executions SET status=$2,error_classification=$3,error_summary=$4,completed_at=CASE WHEN $2 IN ('completed','failed','cancelled','approval_rejected','interrupted') THEN now() ELSE completed_at END,lease_owner=CASE WHEN $2 IN ('completed','failed','cancelled','paused_for_approval','approval_rejected','interrupted') THEN '' ELSE lease_owner END,lease_expires_at=CASE WHEN $2 IN ('completed','failed','cancelled','paused_for_approval','approval_rejected','interrupted') THEN NULL ELSE lease_expires_at END,updated_at=now() WHERE id=$1 AND ($5='' OR lease_owner=$5)`, id, status, class, summary, owner)
-	return err
+func (s *Store) markScheduledExecution(ctx context.Context, id domain.ID, status domain.ScheduledExecutionStatus, owner, class, summary string, allowed []domain.ScheduledExecutionStatus, event, message string) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	item, programID, err := lockedScheduledExecution(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if !containsExecutionStatus(allowed, item.Status) || (owner != "" && item.LeaseOwner != owner) {
+		return invalidScheduledExecutionTransition(item, status)
+	}
+	now := time.Now().UTC()
+	completedAt := item.CompletedAt
+	if containsExecutionStatus([]domain.ScheduledExecutionStatus{domain.ScheduledExecutionCompleted, domain.ScheduledExecutionFailed, domain.ScheduledExecutionCancelled, domain.ScheduledExecutionApprovalRejected, domain.ScheduledExecutionInterrupted}, status) {
+		completedAt = &now
+	}
+	tag, err := tx.Exec(ctx, `UPDATE scheduled_executions SET status=$2,error_classification=$3,error_summary=$4,completed_at=$5,lease_owner='',lease_expires_at=NULL,updated_at=$6 WHERE id=$1 AND status=$7 AND ($8='' OR lease_owner=$8)`, id, status, class, summary, completedAt, now, item.Status, owner)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return invalidScheduledExecutionTransition(item, status)
+	}
+	item.Status, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = status, class, summary, completedAt, now
+	item.LeaseOwner, item.LeaseExpiresAt = "", nil
+	if err := auditExecution(ctx, tx, event, owner, programID, item, message, nil); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+type executionScanner interface {
+	Scan(...any) error
+}
+
+func scanScheduledExecution(scanner executionScanner) (domain.ScheduledExecution, domain.ID, error) {
+	var item domain.ScheduledExecution
+	var programID domain.ID
+	err := scanner.Scan(
+		&item.ID, &item.ScheduleID, &item.PlannedAt, &item.TriggerSource, &item.Status,
+		&item.TaskID, &item.WorkflowRunID, &item.ScopeVersionID, &item.AttemptCount,
+		&item.LeaseOwner, &item.LeaseExpiresAt, &item.ErrorClassification, &item.ErrorSummary,
+		&item.StartedAt, &item.CompletedAt, &item.CreatedAt, &item.UpdatedAt, &programID,
+	)
+	return item, programID, err
+}
+
+func lockedScheduledExecution(ctx context.Context, tx pgx.Tx, id domain.ID) (domain.ScheduledExecution, domain.ID, error) {
+	return scanScheduledExecution(tx.QueryRow(ctx, `SELECT se.id,se.schedule_id,se.planned_at,se.trigger_source,se.status,se.task_id,se.workflow_run_id,se.scope_version_id,se.attempt_count,se.lease_owner,se.lease_expires_at,se.error_classification,se.error_summary,se.started_at,se.completed_at,se.created_at,se.updated_at,s.program_id
+		FROM scheduled_executions se
+		JOIN schedules s ON s.id=se.schedule_id
+		WHERE se.id=$1
+		FOR UPDATE OF se`, id))
+}
+
+func markScheduledExecutionRunning(ctx context.Context, tx pgx.Tx, id, taskID, workflowRunID domain.ID, scopeVersionID *domain.ID, owner string) error {
+	item, programID, err := lockedScheduledExecution(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if item.Status == domain.ScheduledExecutionRunning {
+		if item.LeaseOwner == owner && item.TaskID != nil && item.WorkflowRunID != nil && *item.TaskID == taskID && *item.WorkflowRunID == workflowRunID {
+			return nil
+		}
+		return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionRunning)
+	}
+	if item.Status != domain.ScheduledExecutionClaimed || item.LeaseOwner != owner {
+		return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionRunning)
+	}
+	now := time.Now().UTC()
+	tag, err := tx.Exec(ctx, `UPDATE scheduled_executions
+		SET status='running',task_id=$2,workflow_run_id=$3,scope_version_id=$4,started_at=COALESCE(started_at,$5),updated_at=$5
+		WHERE id=$1 AND status='claimed' AND lease_owner=$6`, id, taskID, workflowRunID, scopeVersionID, now, owner)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionRunning)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE schedules SET last_run_at=$2,updated_at=$2 WHERE id=$1`, item.ScheduleID, now); err != nil {
+		return err
+	}
+	item.Status, item.TaskID, item.WorkflowRunID, item.ScopeVersionID, item.StartedAt, item.UpdatedAt = domain.ScheduledExecutionRunning, &taskID, &workflowRunID, scopeVersionID, &now, now
+	if err := auditExecution(ctx, tx, "scheduled_execution_started", owner, programID, item, "scheduled execution started", nil); err != nil {
+		return err
+	}
+	return nil
+}
+
+func recoverStaleScheduledExecutions(ctx context.Context, tx pgx.Tx) error {
+	rows, err := tx.Query(ctx, `SELECT se.id,se.schedule_id,se.planned_at,se.trigger_source,se.status,se.task_id,se.workflow_run_id,se.scope_version_id,se.attempt_count,se.lease_owner,se.lease_expires_at,se.error_classification,se.error_summary,se.started_at,se.completed_at,se.created_at,se.updated_at,s.program_id
+		FROM scheduled_executions se
+		JOIN schedules s ON s.id=se.schedule_id
+		WHERE se.status IN ('claimed','running') AND se.lease_expires_at<now()
+		ORDER BY se.lease_expires_at
+		FOR UPDATE OF se`)
+	if err != nil {
+		return err
+	}
+	type staleExecution struct {
+		item      domain.ScheduledExecution
+		programID domain.ID
+	}
+	var stale []staleExecution
+	for rows.Next() {
+		item, programID, scanErr := scanScheduledExecution(rows)
+		if scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		stale = append(stale, staleExecution{item: item, programID: programID})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, entry := range stale {
+		item := entry.item
+		now := time.Now().UTC()
+		if item.Status == domain.ScheduledExecutionClaimed && item.TaskID == nil && item.WorkflowRunID == nil {
+			tag, err := tx.Exec(ctx, `UPDATE scheduled_executions SET status='pending',lease_owner='',lease_expires_at=NULL,updated_at=$2 WHERE id=$1 AND status='claimed'`, item.ID, now)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() != 1 {
+				return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionPending)
+			}
+			item.Status, item.LeaseOwner, item.LeaseExpiresAt, item.UpdatedAt = domain.ScheduledExecutionPending, "", nil, now
+			if err := auditExecution(ctx, tx, "scheduled_execution_stale_claim_recovered", "scheduler", entry.programID, item, "stale claim returned to pending", nil); err != nil {
+				return err
+			}
+			continue
+		}
+		tag, err := tx.Exec(ctx, `UPDATE scheduled_executions SET status='interrupted',error_classification='interrupted',error_summary='scheduler lease expired after workflow state was created',completed_at=$2,lease_owner='',lease_expires_at=NULL,updated_at=$2 WHERE id=$1 AND status IN ('claimed','running')`, item.ID, now)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionInterrupted)
+		}
+		item.Status, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.LeaseOwner, item.LeaseExpiresAt, item.UpdatedAt = domain.ScheduledExecutionInterrupted, "interrupted", "scheduler lease expired after workflow state was created", &now, "", nil, now
+		if err := auditExecution(ctx, tx, "scheduled_execution_interrupted", "scheduler", entry.programID, item, "scheduled execution interrupted after lease expiry", nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func skipOverlappingPendingExecutions(ctx context.Context, tx pgx.Tx) error {
+	rows, err := tx.Query(ctx, `SELECT se.id,se.schedule_id,se.planned_at,se.trigger_source,se.status,se.task_id,se.workflow_run_id,se.scope_version_id,se.attempt_count,se.lease_owner,se.lease_expires_at,se.error_classification,se.error_summary,se.started_at,se.completed_at,se.created_at,se.updated_at,s.program_id
+		FROM scheduled_executions se
+		JOIN schedules s ON s.id=se.schedule_id
+		WHERE se.status='pending'
+		  AND EXISTS (
+			SELECT 1 FROM scheduled_executions active
+			WHERE active.schedule_id=se.schedule_id
+			  AND active.id<>se.id
+			  AND active.status IN ('claimed','running','paused_for_approval','paused_operator')
+		  )
+		ORDER BY se.planned_at,se.created_at
+		FOR UPDATE OF se`)
+	if err != nil {
+		return err
+	}
+	type overlapExecution struct {
+		item      domain.ScheduledExecution
+		programID domain.ID
+	}
+	var overlaps []overlapExecution
+	for rows.Next() {
+		item, programID, scanErr := scanScheduledExecution(rows)
+		if scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		overlaps = append(overlaps, overlapExecution{item: item, programID: programID})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, entry := range overlaps {
+		now := time.Now().UTC()
+		tag, err := tx.Exec(ctx, `UPDATE scheduled_executions SET status='skipped_overlap',error_classification='overlap',error_summary='same schedule already has an active execution',completed_at=$2,updated_at=$2 WHERE id=$1 AND status='pending'`, entry.item.ID, now)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return invalidScheduledExecutionTransition(entry.item, domain.ScheduledExecutionSkippedOverlap)
+		}
+		item := entry.item
+		item.Status, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = domain.ScheduledExecutionSkippedOverlap, "overlap", "same schedule already has an active execution", &now, now
+		if err := auditExecution(ctx, tx, "scheduled_execution_skipped_overlap", "scheduler", entry.programID, item, "scheduled execution skipped because another execution is active", nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func containsExecutionStatus(items []domain.ScheduledExecutionStatus, value domain.ScheduledExecutionStatus) bool {
+	for _, item := range items {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func invalidScheduledExecutionTransition(item domain.ScheduledExecution, next domain.ScheduledExecutionStatus) error {
+	return fmt.Errorf("scheduled execution %s cannot transition from %s to %s", item.ID, item.Status, next)
 }
 
 func (s *Store) RequestScheduledExecutionResume(ctx context.Context, id domain.ID, actor string) error {
@@ -249,27 +532,65 @@ func (s *Store) RequestScheduledExecutionResume(ctx context.Context, id domain.I
 		return err
 	}
 	defer tx.Rollback(ctx)
-	var item domain.ScheduledExecution
-	var programID domain.ID
-	err = tx.QueryRow(ctx, `SELECT se.id,se.schedule_id,se.workflow_run_id,s.program_id FROM scheduled_executions se JOIN schedules s ON s.id=se.schedule_id WHERE se.id=$1 AND se.status='paused_for_approval' FOR UPDATE`, id).Scan(&item.ID, &item.ScheduleID, &item.WorkflowRunID, &programID)
+	item, programID, err := lockedScheduledExecution(ctx, tx, id)
 	if err != nil {
 		return err
 	}
-	var decision string
-	err = tx.QueryRow(ctx, `SELECT a.decision FROM approvals a JOIN step_runs sr ON sr.id=a.request_id WHERE sr.workflow_run_id=$1 AND sr.status='awaiting_approval' ORDER BY a.requested_at DESC LIMIT 1`, item.WorkflowRunID).Scan(&decision)
+	if item.Status != domain.ScheduledExecutionPausedForApproval && item.Status != domain.ScheduledExecutionPausedOperator {
+		return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionPending)
+	}
+	if item.Status == domain.ScheduledExecutionPausedForApproval {
+		if item.WorkflowRunID == nil {
+			return fmt.Errorf("scheduled execution %s has no workflow lineage", id)
+		}
+		var decision string
+		err = tx.QueryRow(ctx, `SELECT a.decision FROM approvals a JOIN step_runs sr ON sr.id=a.request_id WHERE sr.workflow_run_id=$1 AND sr.status='awaiting_approval' ORDER BY a.requested_at DESC LIMIT 1`, item.WorkflowRunID).Scan(&decision)
+		if err != nil {
+			return err
+		}
+		if decision == "rejected" {
+			now := time.Now().UTC()
+			tag, updateErr := tx.Exec(ctx, `UPDATE scheduled_executions SET status='approval_rejected',error_classification='approval_rejected',error_summary='moderate step approval was rejected',completed_at=$2,updated_at=$2 WHERE id=$1 AND status='paused_for_approval'`, id, now)
+			if updateErr != nil {
+				return updateErr
+			}
+			if tag.RowsAffected() != 1 {
+				return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionApprovalRejected)
+			}
+			item.Status, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = domain.ScheduledExecutionApprovalRejected, "approval_rejected", "moderate step approval was rejected", &now, now
+			if err := auditExecution(ctx, tx, "scheduled_execution_approval_rejected", actor, programID, item, "scheduled execution approval rejected", nil); err != nil {
+				return err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: %s", ErrApprovalRejected, id)
+		}
+		if decision != "approved" {
+			return fmt.Errorf("scheduled execution %s does not have an approved pending step", id)
+		}
+	}
+	var overlap bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM scheduled_executions
+		WHERE schedule_id=$1
+		  AND id<>$2
+		  AND status IN ('claimed','running','paused_for_approval','paused_operator')
+	)`, item.ScheduleID, item.ID).Scan(&overlap); err != nil {
+		return err
+	}
+	if overlap {
+		return fmt.Errorf("%w: %s", ErrScheduleOverlap, item.ScheduleID)
+	}
+	now := time.Now().UTC()
+	tag, err := tx.Exec(ctx, `UPDATE scheduled_executions SET status='pending',trigger_source='resume',lease_owner='',lease_expires_at=NULL,error_classification='',error_summary='',completed_at=NULL,updated_at=$2 WHERE id=$1 AND status=$3`, id, now, item.Status)
 	if err != nil {
 		return err
 	}
-	if decision == "rejected" {
-		_, err = tx.Exec(ctx, `UPDATE scheduled_executions SET status='approval_rejected',error_classification='approval_rejected',error_summary='moderate step approval was rejected',completed_at=now(),updated_at=now() WHERE id=$1`, id)
-		return err
+	if tag.RowsAffected() != 1 {
+		return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionPending)
 	}
-	if decision != "approved" {
-		return fmt.Errorf("scheduled execution %s does not have an approved pending step", id)
-	}
-	if _, err := tx.Exec(ctx, `UPDATE scheduled_executions SET status='pending',trigger_source='resume',lease_owner='',lease_expires_at=NULL,updated_at=now() WHERE id=$1`, id); err != nil {
-		return err
-	}
+	item.Status, item.TriggerSource, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = domain.ScheduledExecutionPending, domain.ScheduleTriggerResume, "", "", nil, now
 	if err := auditExecution(ctx, tx, "scheduled_execution_resume_requested", actor, programID, item, "scheduled execution resume requested", nil); err != nil {
 		return err
 	}
@@ -303,8 +624,8 @@ func (s *Store) ListScheduledExecutions(ctx context.Context, scheduleID domain.I
 	return out, rows.Err()
 }
 
-func (s *Store) ListPendingScopeExpansions(ctx context.Context, programID domain.ID) ([]domain.ScopeSnapshot, error) {
-	query := `SELECT id,program_id,scope_reference,scope_digest,include_rule_digests,exclude_rule_digests,target_plan_digest,planning_warnings,target_plan,expands_scope,added_include_digests,removed_include_digests,added_exclude_digests,removed_exclude_digests,COALESCE(acknowledged_by,''),acknowledged_at,created_at FROM scope_versions WHERE expands_scope=true AND acknowledged_at IS NULL`
+func (s *Store) ListPendingScopeExpansions(ctx context.Context, programID domain.ID) ([]ConsolePendingScopeExpansion, error) {
+	query := `SELECT id,program_id,scope_digest,target_plan_digest,planning_warnings,added_include_digests,removed_include_digests,added_exclude_digests,removed_exclude_digests,created_at FROM scope_versions WHERE expands_scope=true AND acknowledged_at IS NULL`
 	args := []any{}
 	if programID != "" {
 		query += ` AND program_id=$1`
@@ -316,10 +637,10 @@ func (s *Store) ListPendingScopeExpansions(ctx context.Context, programID domain
 		return nil, err
 	}
 	defer rows.Close()
-	var out []domain.ScopeSnapshot
+	var out []ConsolePendingScopeExpansion
 	for rows.Next() {
-		var item domain.ScopeSnapshot
-		if err := rows.Scan(&item.ID, &item.ProgramID, &item.ScopeReference, &item.ScopeDigest, &item.IncludeRuleDigests, &item.ExcludeRuleDigests, &item.TargetPlanDigest, &item.PlanningWarnings, &item.TargetPlan, &item.ExpandsScope, &item.AddedIncludeDigests, &item.RemovedIncludeDigests, &item.AddedExcludeDigests, &item.RemovedExcludeDigests, &item.AcknowledgedBy, &item.AcknowledgedAt, &item.CreatedAt); err != nil {
+		var item ConsolePendingScopeExpansion
+		if err := rows.Scan(&item.ID, &item.ProgramID, &item.ScopeDigest, &item.TargetPlanDigest, &item.PlanningWarnings, &item.AddedIncludeDigests, &item.RemovedIncludeDigests, &item.AddedExcludeDigests, &item.RemovedExcludeDigests, &item.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
@@ -356,6 +677,12 @@ func (s *Store) PersistChangeItems(ctx context.Context, programID, workflowRunID
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if scheduledExecutionID == nil {
+		scheduledExecutionID, err = scheduledExecutionIDForWorkflow(ctx, tx, workflowRunID)
+		if err != nil {
+			return err
+		}
+	}
 	for _, item := range items {
 		_, err := tx.Exec(ctx, `INSERT INTO change_items(id,program_id,workflow_run_id,scheduled_execution_id,kind,entity_type,entity_key,priority,title,safe_summary,reasons,previous_value,current_value,source_capabilities,evidence_artifact_ids,observed_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(workflow_run_id,kind,entity_type,entity_key) DO NOTHING`, item.ID, programID, workflowRunID, scheduledExecutionID, item.Kind, item.EntityType, item.EntityKey, item.Priority, item.Title, item.Summary, item.Reasons, item.Previous, item.Current, item.SourceCapabilities, idStrings(item.EvidenceArtifactIDs), item.ObservedAt, item.CreatedAt)
 		if err != nil {

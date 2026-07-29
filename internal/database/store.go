@@ -640,6 +640,13 @@ func persistChangeItemsFromResult(ctx context.Context, tx pgx.Tx, programID, wor
 }
 
 func persistChangeItems(ctx context.Context, tx pgx.Tx, programID, workflowRunID domain.ID, scheduledExecutionID *domain.ID, items []changes.Item) error {
+	if scheduledExecutionID == nil {
+		var err error
+		scheduledExecutionID, err = scheduledExecutionIDForWorkflow(ctx, tx, workflowRunID)
+		if err != nil {
+			return err
+		}
+	}
 	for _, item := range items {
 		reasons, _ := json.Marshal(item.Reasons)
 		if len(item.Previous) == 0 {
@@ -657,6 +664,18 @@ func persistChangeItems(ctx context.Context, tx pgx.Tx, programID, workflowRunID
 		}
 	}
 	return nil
+}
+
+func scheduledExecutionIDForWorkflow(ctx context.Context, tx pgx.Tx, workflowRunID domain.ID) (*domain.ID, error) {
+	var id domain.ID
+	err := tx.QueryRow(ctx, `SELECT id FROM scheduled_executions WHERE workflow_run_id=$1`, workflowRunID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
 }
 func outputLines(raw json.RawMessage) []string {
 	var v struct {
@@ -863,7 +882,22 @@ func (s *Store) PreviousObservationValues(ctx context.Context, programID, curren
 	return out, rows.Err()
 }
 
+type transactionContextKey struct{}
+
+func contextWithTransaction(ctx context.Context, tx pgx.Tx) context.Context {
+	return context.WithValue(ctx, transactionContextKey{}, tx)
+}
+
+func transactionFromContext(ctx context.Context) (pgx.Tx, bool) {
+	tx, ok := ctx.Value(transactionContextKey{}).(pgx.Tx)
+	return tx, ok
+}
+
 func (s *Store) SaveWorkflowState(ctx context.Context, state *workflow.State) error {
+	return s.saveWorkflowState(ctx, state, nil)
+}
+
+func (s *Store) saveWorkflowState(ctx context.Context, state *workflow.State, lifecycle func(context.Context, *workflow.State) error) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -873,6 +907,11 @@ func (s *Store) SaveWorkflowState(ctx context.Context, state *workflow.State) er
 	_, err = tx.Exec(ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,previous_run_id,trigger_source,summary) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO UPDATE SET status=EXCLUDED.status,started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,summary=EXCLUDED.summary`, r.ID, r.TaskID, r.WorkflowDefinitionID, r.WorkflowVersion, r.Status, r.StartedAt, r.CompletedAt, r.PreviousRunID, r.TriggerSource, r.Summary)
 	if err != nil {
 		return err
+	}
+	if lifecycle != nil {
+		if err := lifecycle(contextWithTransaction(ctx, tx), state); err != nil {
+			return err
+		}
 	}
 	for _, ss := range state.Steps {
 		x := ss.Run
@@ -908,12 +947,13 @@ func (s *Store) SaveWorkflowState(ctx context.Context, state *workflow.State) er
 }
 
 type WorkflowPersister struct {
-	Store *Store
-	File  workflow.FileStore
+	Store     *Store
+	File      workflow.FileStore
+	Lifecycle func(context.Context, *workflow.State) error
 }
 
 func (p WorkflowPersister) Save(ctx context.Context, state *workflow.State) error {
-	if err := p.Store.SaveWorkflowState(ctx, state); err != nil {
+	if err := p.Store.saveWorkflowState(ctx, state, p.Lifecycle); err != nil {
 		return err
 	}
 	return p.File.Save(ctx, state)

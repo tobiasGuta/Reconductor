@@ -15,26 +15,26 @@ import (
 // It intentionally excludes artifact storage paths, raw provider output, step
 // input, and other fields that could disclose credentials or unredacted data.
 type ConsoleSnapshot struct {
-	GeneratedAt            time.Time                   `json:"generated_at"`
-	SelectedProgramID      domain.ID                   `json:"selected_program_id,omitempty"`
-	Programs               []domain.Program            `json:"programs"`
-	Scope                  *ConsoleScope               `json:"scope,omitempty"`
-	Stats                  ConsoleStats                `json:"stats"`
-	Runs                   []ConsoleRun                `json:"runs"`
-	Steps                  []ConsoleStep               `json:"steps"`
-	Tools                  []ConsoleToolRun            `json:"tool_runs"`
-	Assets                 []ConsoleAsset              `json:"assets"`
-	Candidates             []ConsoleCandidate          `json:"candidate_findings"`
-	Verifications          []ConsoleVerification       `json:"verification_results"`
-	VerifiedFindings       []ConsoleVerifiedFinding    `json:"verified_findings"`
-	Approvals              []ConsoleApproval           `json:"approvals"`
-	Schedules              []domain.Schedule           `json:"schedules"`
-	ScheduledExecutions    []domain.ScheduledExecution `json:"scheduled_executions"`
-	ChangeItems            []ConsoleChangeItem         `json:"change_items"`
-	PendingScopeExpansions []domain.ScopeSnapshot      `json:"pending_scope_expansions"`
-	AuditEvents            []ConsoleAuditEvent         `json:"audit_events"`
-	LatestChanges          json.RawMessage             `json:"latest_changes"`
-	WorkflowDefinition     json.RawMessage             `json:"workflow_definition,omitempty"`
+	GeneratedAt            time.Time                      `json:"generated_at"`
+	SelectedProgramID      domain.ID                      `json:"selected_program_id,omitempty"`
+	Programs               []domain.Program               `json:"programs"`
+	Scope                  *ConsoleScope                  `json:"scope,omitempty"`
+	Stats                  ConsoleStats                   `json:"stats"`
+	Runs                   []ConsoleRun                   `json:"runs"`
+	Steps                  []ConsoleStep                  `json:"steps"`
+	Tools                  []ConsoleToolRun               `json:"tool_runs"`
+	Assets                 []ConsoleAsset                 `json:"assets"`
+	Candidates             []ConsoleCandidate             `json:"candidate_findings"`
+	Verifications          []ConsoleVerification          `json:"verification_results"`
+	VerifiedFindings       []ConsoleVerifiedFinding       `json:"verified_findings"`
+	Approvals              []ConsoleApproval              `json:"approvals"`
+	Schedules              []domain.Schedule              `json:"schedules"`
+	ScheduledExecutions    []domain.ScheduledExecution    `json:"scheduled_executions"`
+	ChangeItems            []ConsoleChangeItem            `json:"change_items"`
+	PendingScopeExpansions []ConsolePendingScopeExpansion `json:"pending_scope_expansions"`
+	AuditEvents            []ConsoleAuditEvent            `json:"audit_events"`
+	LatestChanges          json.RawMessage                `json:"latest_changes"`
+	WorkflowDefinition     json.RawMessage                `json:"workflow_definition,omitempty"`
 }
 
 type ConsoleScope struct {
@@ -48,6 +48,19 @@ type ConsoleScope struct {
 	AcknowledgedBy   string          `json:"acknowledged_by,omitempty"`
 	AcknowledgedAt   *time.Time      `json:"acknowledged_at,omitempty"`
 	CreatedAt        time.Time       `json:"created_at"`
+}
+
+type ConsolePendingScopeExpansion struct {
+	ID                    domain.ID       `json:"id"`
+	ProgramID             domain.ID       `json:"program_id"`
+	ScopeDigest           string          `json:"scope_digest"`
+	TargetPlanDigest      string          `json:"target_plan_digest"`
+	PlanningWarnings      json.RawMessage `json:"planning_warnings"`
+	AddedIncludeDigests   []string        `json:"added_include_digests"`
+	RemovedIncludeDigests []string        `json:"removed_include_digests"`
+	AddedExcludeDigests   []string        `json:"added_exclude_digests"`
+	RemovedExcludeDigests []string        `json:"removed_exclude_digests"`
+	CreatedAt             time.Time       `json:"created_at"`
 }
 
 type ConsoleStats struct {
@@ -208,7 +221,7 @@ func (s *Store) ConsoleSnapshot(ctx context.Context, requestedProgramID domain.I
 		Schedules:              []domain.Schedule{},
 		ScheduledExecutions:    []domain.ScheduledExecution{},
 		ChangeItems:            []ConsoleChangeItem{},
-		PendingScopeExpansions: []domain.ScopeSnapshot{},
+		PendingScopeExpansions: []ConsolePendingScopeExpansion{},
 		AuditEvents:            []ConsoleAuditEvent{},
 		LatestChanges:          json.RawMessage(`{}`),
 	}

@@ -48,9 +48,10 @@ type Queue interface {
 }
 
 type Server struct {
-	store Store
-	queue Queue
-	mux   *http.ServeMux
+	store     Store
+	queue     Queue
+	validator *schedulecron.ScheduleValidator
+	mux       *http.ServeMux
 }
 
 type Snapshot struct {
@@ -74,8 +75,12 @@ type DeadLetter struct {
 	FailedAt   string    `json:"failed_at"`
 }
 
-func New(store Store, workQueue Queue) http.Handler {
-	s := &Server{store: store, queue: workQueue, mux: http.NewServeMux()}
+func New(store Store, workQueue Queue, validators ...*schedulecron.ScheduleValidator) http.Handler {
+	var validator *schedulecron.ScheduleValidator
+	if len(validators) > 0 {
+		validator = validators[0]
+	}
+	s := &Server{store: store, queue: workQueue, validator: validator, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /api/v1/snapshot", s.snapshot)
 	s.mux.HandleFunc("POST /api/v1/approvals/{id}/decision", s.decideApproval)
 	s.mux.HandleFunc("POST /api/v1/schedules", s.createSchedule)
@@ -138,17 +143,17 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request) {
 	if body.WorkflowName == "" {
 		body.WorkflowName = "continuous-web-recon"
 	}
-	next, err := schedulecron.NextRun(body.CronExpression, body.Timezone, time.Now())
+	if s.validator == nil {
+		writeError(w, http.StatusServiceUnavailable, "schedule validation unavailable")
+		return
+	}
+	now := time.Now().UTC()
+	item := domain.Schedule{ID: domain.NewID(), ProgramID: body.ProgramID, Name: body.Name, WorkflowName: body.WorkflowName, Objective: body.Objective, CronExpression: body.CronExpression, Timezone: body.Timezone, Enabled: true, Headless: body.Headless, CreatedBy: body.Actor, CreatedAt: now, UpdatedAt: now}
+	item, err := s.validator.Validate(r.Context(), item, now)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if strings.TrimSpace(body.Name) == "" || strings.TrimSpace(body.Objective) == "" || body.ProgramID == "" {
-		writeError(w, http.StatusBadRequest, "program_id, name, and objective are required")
-		return
-	}
-	now := time.Now().UTC()
-	item := domain.Schedule{ID: domain.NewID(), ProgramID: body.ProgramID, Name: body.Name, WorkflowName: body.WorkflowName, Objective: body.Objective, CronExpression: body.CronExpression, Timezone: body.Timezone, Enabled: true, Headless: body.Headless, CreatedBy: body.Actor, NextRunAt: next, CreatedAt: now, UpdatedAt: now}
 	if err := store.CreateSchedule(r.Context(), item); err != nil {
 		writeError(w, http.StatusConflict, "schedule could not be created")
 		return
@@ -172,33 +177,33 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name           string `json:"name"`
-		WorkflowName   string `json:"workflow_name"`
-		Objective      string `json:"objective"`
-		CronExpression string `json:"cron_expression"`
-		Timezone       string `json:"timezone"`
-		Enabled        *bool  `json:"enabled"`
-		Headless       *bool  `json:"headless"`
-		Actor          string `json:"actor"`
+		Name           *string `json:"name"`
+		WorkflowName   *string `json:"workflow_name"`
+		Objective      *string `json:"objective"`
+		CronExpression *string `json:"cron_expression"`
+		Timezone       *string `json:"timezone"`
+		Enabled        *bool   `json:"enabled"`
+		Headless       *bool   `json:"headless"`
+		Actor          string  `json:"actor"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.Name != "" {
-		current.Name = body.Name
+	if body.Name != nil {
+		current.Name = *body.Name
 	}
-	if body.WorkflowName != "" {
-		current.WorkflowName = body.WorkflowName
+	if body.WorkflowName != nil {
+		current.WorkflowName = *body.WorkflowName
 	}
-	if body.Objective != "" {
-		current.Objective = body.Objective
+	if body.Objective != nil {
+		current.Objective = *body.Objective
 	}
-	if body.CronExpression != "" {
-		current.CronExpression = body.CronExpression
+	if body.CronExpression != nil {
+		current.CronExpression = *body.CronExpression
 	}
-	if body.Timezone != "" {
-		current.Timezone = body.Timezone
+	if body.Timezone != nil {
+		current.Timezone = *body.Timezone
 	}
 	if body.Enabled != nil {
 		current.Enabled = *body.Enabled
@@ -206,12 +211,15 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
 	if body.Headless != nil {
 		current.Headless = *body.Headless
 	}
-	next, err := schedulecron.NextRun(current.CronExpression, current.Timezone, time.Now())
+	if s.validator == nil {
+		writeError(w, http.StatusServiceUnavailable, "schedule validation unavailable")
+		return
+	}
+	current, err = s.validator.Validate(r.Context(), current, time.Now())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	current.NextRunAt = next
 	if body.Actor == "" {
 		body.Actor = "console-operator"
 	}
@@ -267,6 +275,10 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 	}
 	item, err := store.EnqueueRunNow(r.Context(), domain.ID(r.PathValue("id")), "console-operator")
 	if err != nil {
+		if errors.Is(err, database.ErrScheduleOverlap) {
+			writeError(w, http.StatusConflict, "schedule already has a queued or active execution")
+			return
+		}
 		writeError(w, http.StatusConflict, "run now could not be queued")
 		return
 	}
@@ -288,6 +300,10 @@ func (s *Server) resumeScheduledExecution(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err := store.RequestScheduledExecutionResume(r.Context(), domain.ID(r.PathValue("id")), "console-operator"); err != nil {
+		if errors.Is(err, database.ErrApprovalRejected) {
+			writeError(w, http.StatusConflict, "scheduled execution was closed because approval was rejected")
+			return
+		}
 		writeError(w, http.StatusConflict, "scheduled execution is not ready to resume")
 		return
 	}

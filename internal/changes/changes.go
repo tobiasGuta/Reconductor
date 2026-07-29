@@ -27,15 +27,18 @@ type Item struct {
 }
 
 type reportPayload struct {
-	Changes          []assetChange            `json:"changes"`
+	Changes          []AssetChange            `json:"changes"`
 	Endpoints        []endpointClassification `json:"endpoints"`
 	CandidateMatches []string                 `json:"candidate_matches"`
 	TargetPlanDigest string                   `json:"target_plan_digest"`
 }
 
-type assetChange struct {
-	Kind  string `json:"kind"`
-	Value string `json:"value"`
+type AssetChange struct {
+	Kind     string          `json:"kind"`
+	Value    string          `json:"value"`
+	Previous json.RawMessage `json:"previous,omitempty"`
+	Current  json.RawMessage `json:"current,omitempty"`
+	Reasons  []string        `json:"reasons"`
 }
 
 type endpointClassification struct {
@@ -90,7 +93,9 @@ func FromReportRaw(raw json.RawMessage, observedAt time.Time) ([]Item, error) {
 	}
 	for _, endpoint := range payload.Endpoints {
 		if strings.TrimSpace(endpoint.Endpoint.ExactURL) != "" {
-			items = append(items, endpointItem(endpoint, observedAt))
+			if item, ok := endpointItem(endpoint, observedAt); ok {
+				items = append(items, item)
+			}
 		}
 	}
 	for _, line := range payload.CandidateMatches {
@@ -133,39 +138,49 @@ func CandidateFromLine(line string, evidence []domain.ID, observedAt time.Time) 
 	}, true
 }
 
-func assetItem(change assetChange, observedAt time.Time) Item {
+func assetItem(change AssetChange, observedAt time.Time) Item {
 	kind := strings.TrimSpace(change.Kind)
 	value := strings.TrimSpace(change.Value)
 	priority := "medium"
-	reasons := []string{"HTTP asset was new or changed"}
+	reasons := append([]string(nil), change.Reasons...)
+	if len(reasons) == 0 {
+		reasons = []string{"HTTP asset was new or changed"}
+	}
 	title := "HTTP asset changed"
 	if kind == "removed" {
 		priority = "low"
-		reasons = []string{"asset was absent from a complete current comparison"}
+		if len(change.Reasons) == 0 {
+			reasons = []string{"asset was absent from a complete current comparison"}
+		}
 		title = "HTTP asset removed"
 	}
 	if hostSignal(value) && kind != "removed" {
 		priority = "high"
 		reasons = append(reasons, "new authorized hostname or HTTP service")
 	}
-	current, _ := json.Marshal(change)
-	return Item{Kind: kind, EntityType: "http_asset", EntityKey: value, Priority: priority, Title: title, Summary: value, Reasons: reasons, Current: current, SourceCapabilities: []string{"compare.assets"}, ObservedAt: observedAt}
+	return Item{Kind: kind, EntityType: "http_asset", EntityKey: value, Priority: priority, Title: title, Summary: value, Reasons: unique(reasons), Previous: change.Previous, Current: change.Current, SourceCapabilities: []string{"compare.assets"}, ObservedAt: observedAt}
 }
 
-func endpointItem(value endpointClassification, observedAt time.Time) Item {
+func endpointItem(value endpointClassification, observedAt time.Time) (Item, bool) {
+	isNew := !value.Historical.SeenBefore
+	statusChanged := value.Historical.StatusChanged
+	technologyChanged := value.Historical.TechnologyChanged
+	if !isNew && !statusChanged && !technologyChanged {
+		return Item{}, false
+	}
 	method := strings.ToUpper(strings.TrimSpace(value.Endpoint.Method))
 	reasons := []string{"endpoint classifier marked route interesting"}
 	priority := "medium"
-	if !value.Historical.SeenBefore {
+	if isNew {
 		reasons = append(reasons, "endpoint is newly observed")
 	}
-	if method != "" && method != "GET" && method != "HEAD" && method != "OPTIONS" {
+	if isNew && method != "" && method != "GET" && method != "HEAD" && method != "OPTIONS" {
 		priority = "high"
 		reasons = append(reasons, "method is "+method)
 	}
 	for _, label := range append(append([]string{}, value.Labels...), value.MatchedKeywords...) {
 		normalized := strings.ToLower(label)
-		if strings.Contains(normalized, "admin") || strings.Contains(normalized, "auth") || strings.Contains(normalized, "internal") || strings.Contains(normalized, "debug") || strings.Contains(normalized, "schema") || strings.Contains(normalized, "api") {
+		if isNew && (strings.Contains(normalized, "admin") || strings.Contains(normalized, "auth") || strings.Contains(normalized, "internal")) {
 			priority = "high"
 			reasons = append(reasons, "classifier reported "+label+" signal")
 			break
@@ -187,7 +202,7 @@ func endpointItem(value endpointClassification, observedAt time.Time) Item {
 	if key == "" {
 		key = value.Endpoint.ExactURL
 	}
-	return Item{Kind: "endpoint", EntityType: "endpoint", EntityKey: key, Priority: priority, Title: title, Summary: value.Endpoint.ExactURL, Reasons: unique(reasons), Current: current, SourceCapabilities: value.Sources, ObservedAt: observedAt}
+	return Item{Kind: "endpoint", EntityType: "endpoint", EntityKey: key, Priority: priority, Title: title, Summary: value.Endpoint.ExactURL, Reasons: unique(reasons), Current: current, SourceCapabilities: value.Sources, ObservedAt: observedAt}, true
 }
 
 func hostSignal(raw string) bool {

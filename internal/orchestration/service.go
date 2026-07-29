@@ -25,6 +25,10 @@ import (
 
 var ErrScopeExpansion = errors.New("scope change expands authorization")
 
+type Lifecycle interface {
+	WorkflowCreated(context.Context, domain.Task, domain.WorkflowRun, domain.ID) error
+}
+
 type WorkflowRequest struct {
 	ProgramID                 domain.ID
 	WorkflowName              string
@@ -38,6 +42,7 @@ type WorkflowRequest struct {
 	AcknowledgeScopeExpansion bool
 	ManualDiscoveryRoots      []targeting.ManualDiscoveryRoot
 	ApproveModerate           bool
+	Lifecycle                 Lifecycle
 }
 
 type WorkflowResult struct {
@@ -114,7 +119,7 @@ func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, 
 	if task.ProgramID != req.ProgramID {
 		return WorkflowResult{Task: task, ScopeChange: change}, fmt.Errorf("task %s belongs to program %s, not %s", task.ID, task.ProgramID, req.ProgramID)
 	}
-	engine, err := s.engine(ctx, task, sc, req.Headless, fileStore)
+	engine, err := s.engine(ctx, task, sc, req.Headless, fileStore, req.Lifecycle, change.ScopeVersionID)
 	if err != nil {
 		return WorkflowResult{Task: task, ScopeChange: change}, err
 	}
@@ -173,7 +178,7 @@ func (s Service) resolveTask(ctx context.Context, req WorkflowRequest, def workf
 	return task, nil
 }
 
-func (s Service) engine(ctx context.Context, task domain.Task, sc platformscope.Scope, headless bool, fileStore workflow.FileStore) (workflow.Engine, error) {
+func (s Service) engine(ctx context.Context, task domain.Task, sc platformscope.Scope, headless bool, fileStore workflow.FileStore, lifecycle Lifecycle, scopeVersionID domain.ID) (workflow.Engine, error) {
 	redactor := redaction.New(s.Config.Logging.SecretNames...)
 	artifacts, err := artifact.NewLocal(s.Config.ArtifactStorage.Root, redactor)
 	if err != nil {
@@ -185,7 +190,13 @@ func (s Service) engine(ctx context.Context, task domain.Task, sc platformscope.
 	pol := policy.Policy{ID: "runtime", AllowedCapabilities: s.Registry.Names(), RateLimit: s.Config.Policy.DefaultRateLimit, Concurrency: s.Config.Policy.DefaultConcurrency, ProviderConcurrency: s.Config.Policy.DefaultProviderConcurrency, HostConcurrency: s.Config.Policy.DefaultHostConcurrency, ScanWindows: s.Config.Policy.ScanWindows, AllowedHTTPMethods: s.Config.Policy.AllowedMethods, AuthenticationUsage: s.Config.Policy.AuthenticationUsage, HeadlessBrowser: headless, DirectoryFuzzing: s.Config.Policy.DirectoryFuzzing, MaximumPayloadSize: s.Config.Policy.MaxPayloadBytes, FollowRedirects: s.Config.Policy.FollowRedirects, CrossOrigin: s.Config.Policy.CrossOrigin, IntrusiveChecks: s.Config.Policy.IntrusiveChecks, ArtifactRetention: s.Config.Policy.ArtifactRetention, ExcludedTemplateTags: s.Config.Nuclei.ExcludeTags}
 	maxParallel := policy.ProgramParallelism(pol)
 	limiter := budget.NewLocal(budget.Limits{Program: maxParallel, Provider: pol.ProviderConcurrency, Host: pol.HostConcurrency})
-	return workflow.Engine{Registry: s.Registry, Executor: execution.Service{Registry: s.Registry, Store: s.Store, Artifacts: artifacts, ProgramID: task.ProgramID}, Persister: database.WorkflowPersister{Store: s.Store, File: fileStore}, Policy: pol, Scope: sc, Budget: limiter, MaxParallel: maxParallel}, nil
+	persister := database.WorkflowPersister{Store: s.Store, File: fileStore}
+	if lifecycle != nil {
+		persister.Lifecycle = func(ctx context.Context, state *workflow.State) error {
+			return lifecycle.WorkflowCreated(ctx, task, state.Run, scopeVersionID)
+		}
+	}
+	return workflow.Engine{Registry: s.Registry, Executor: execution.Service{Registry: s.Registry, Store: s.Store, Artifacts: artifacts, ProgramID: task.ProgramID}, Persister: persister, Policy: pol, Scope: sc, Budget: limiter, MaxParallel: maxParallel}, nil
 }
 
 func (s Service) resumeApproval(ctx context.Context, state *workflow.State) (bool, error) {
