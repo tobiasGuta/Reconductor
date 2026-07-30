@@ -46,7 +46,11 @@ func run(ctx context.Context, args []string) error {
 	}
 	_ = config.LoadEnvFile(".env")
 	if args[0] == "scope" {
-		return scopeCommand(args[1:])
+		cfg, err := config.LoadPlanning()
+		if err != nil {
+			return err
+		}
+		return scopeCommand(ctx, cfg, args[1:])
 	}
 	if args[0] == "doctor" {
 		cfg, configErr := config.LoadDoctor()
@@ -118,7 +122,7 @@ func consoleCommand(ctx context.Context, cfg config.Config, args []string) error
 	if err := workQueue.EnsureGroup(ctx); err != nil {
 		return fmt.Errorf("initialize console queue view: %w", err)
 	}
-	validator := &schedulecron.ScheduleValidator{Programs: store, Registry: providers.Registry(cfg)}
+	validator := &schedulecron.ScheduleValidator{Programs: store, Registry: providers.Registry(cfg), ScopeRoot: cfg.Scope.Root}
 	server := console.HTTPServer(*listen, console.New(store, workQueue, validator))
 	slog.Info("Reconductor operator console ready", "url", "http://"+*listen)
 	err = server.ListenAndServe()
@@ -217,7 +221,11 @@ func programCommand(ctx context.Context, cfg config.Config, args []string) error
 		if *name == "" || *scopeRef == "" {
 			return fmt.Errorf("--name and --scope are required")
 		}
-		sc, err := platformscope.LoadBurp(*scopeRef)
+		reference, err := platformscope.CanonicalReference(*scopeRef)
+		if err != nil {
+			return err
+		}
+		sc, err := platformscope.LoadBurpReference(reference, cfg.Scope.Root)
 		if err != nil {
 			return fmt.Errorf("load scope: %w", err)
 		}
@@ -230,8 +238,8 @@ func programCommand(ctx context.Context, cfg config.Config, args []string) error
 		}
 		now := time.Now().UTC()
 		warnings, _ := json.Marshal(plan.Warnings)
-		p := domain.Program{ID: domain.NewID(), Name: *name, Platform: *platform, Description: *description, ScopeReference: *scopeRef, PolicyReference: *policyRef, ScopeDigest: sc.Digest(), IncludeRuleDigests: sc.IncludeDigests(), ExcludeRuleDigests: sc.ExcludeDigests(), TargetPlanDigest: plan.Digest, ScopePlanWarnings: warnings, CreatedAt: now, UpdatedAt: now}
-		if err := s.CreateProgram(ctx, p, scopeSnapshot(p.ID, *scopeRef, sc, plan)); err != nil {
+		p := domain.Program{ID: domain.NewID(), Name: *name, Platform: *platform, Description: *description, ScopeReference: reference, PolicyReference: *policyRef, ScopeDigest: sc.Digest(), IncludeRuleDigests: sc.IncludeDigests(), ExcludeRuleDigests: sc.ExcludeDigests(), TargetPlanDigest: plan.Digest, ScopePlanWarnings: warnings, CreatedAt: now, UpdatedAt: now}
+		if err := s.CreateProgram(ctx, p, scopeSnapshot(p.ID, reference, sc, plan)); err != nil {
 			return err
 		}
 		return printJSON(p)
@@ -314,16 +322,27 @@ type stringFlags []string
 func (s *stringFlags) String() string         { return strings.Join(*s, ",") }
 func (s *stringFlags) Set(value string) error { *s = append(*s, value); return nil }
 
-func scopeCommand(args []string) error {
-	if len(args) == 0 || args[0] != "plan" {
-		return fmt.Errorf("scope requires: scope plan --scope <burp-scope.json>")
+func scopeCommand(ctx context.Context, cfg config.Config, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("scope requires plan or update")
 	}
+	switch args[0] {
+	case "plan":
+		return scopePlanCommand(cfg, args[1:])
+	case "update":
+		return scopeUpdateCommand(ctx, cfg, args[1:])
+	default:
+		return fmt.Errorf("unknown scope command %q", args[0])
+	}
+}
+
+func scopePlanCommand(cfg config.Config, args []string) error {
 	fs := flag.NewFlagSet("scope plan", flag.ContinueOnError)
 	scopePath := fs.String("scope", "", "Burp-compatible scope JSON")
 	var roots stringFlags
 	fs.Var(&roots, "discovery-root", "manual passive discovery root (repeatable)")
 	reason := fs.String("discovery-root-reason", "", "auditable reason for manual discovery roots")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *scopePath == "" {
@@ -333,15 +352,58 @@ func scopeCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	plan, err := loadTargetPlan(*scopePath, manual)
+	plan, err := loadTargetPlan(*scopePath, cfg.Scope.Root, manual)
 	if err != nil {
 		return err
 	}
 	return printJSON(plan)
 }
 
-func loadTargetPlan(path string, manual []targeting.ManualDiscoveryRoot) (targeting.TargetPlan, error) {
-	sc, err := platformscope.LoadBurp(path)
+func scopeUpdateCommand(ctx context.Context, cfg config.Config, args []string) error {
+	fs := flag.NewFlagSet("scope update", flag.ContinueOnError)
+	programID := fs.String("program-id", "", "program UUID")
+	scopeReference := fs.String("scope", "", "replacement logical scope reference")
+	actor := fs.String("actor", "cli", "audited actor")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *programID == "" || *scopeReference == "" {
+		return fmt.Errorf("--program-id and --scope are required")
+	}
+	reference, err := platformscope.CanonicalReference(*scopeReference)
+	if err != nil {
+		return err
+	}
+	store, err := readyStore(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	program, err := store.GetProgram(ctx, domain.ID(*programID))
+	if err != nil {
+		return err
+	}
+	sc, err := platformscope.LoadBurpReference(reference, cfg.Scope.Root)
+	if err != nil {
+		return fmt.Errorf("load scope: %w", err)
+	}
+	plan, err := targeting.Plan(sc, nil)
+	if err != nil {
+		return err
+	}
+	if sc.Digest() != program.ScopeDigest || plan.Digest != program.TargetPlanDigest {
+		return fmt.Errorf("scope update changes authorization or its target plan; use the workflow scope-change review path instead")
+	}
+	if err := store.RepairProgramScopeReference(ctx, program.ID, reference, program.ScopeDigest, program.TargetPlanDigest, *actor); err != nil {
+		return err
+	}
+	program.ScopeReference = reference
+	program.UpdatedAt = time.Now().UTC()
+	return printJSON(program)
+}
+
+func loadTargetPlan(reference, scopeRoot string, manual []targeting.ManualDiscoveryRoot) (targeting.TargetPlan, error) {
+	sc, err := platformscope.LoadBurpReference(reference, scopeRoot)
 	if err != nil {
 		return targeting.TargetPlan{}, fmt.Errorf("load scope: %w", err)
 	}
@@ -395,7 +457,7 @@ func workflowPlan(cfg config.Config, registry *capability.Registry, args []strin
 	if *deprecatedDomain != "" {
 		fmt.Fprintln(os.Stderr, "warning: --domain is deprecated; it is treated only as a passive discovery root")
 	}
-	plan, err := loadTargetPlan(*scopePath, manual)
+	plan, err := loadTargetPlan(*scopePath, cfg.Scope.Root, manual)
 	if err != nil {
 		return err
 	}
@@ -448,7 +510,7 @@ func workflowCommand(ctx context.Context, cfg config.Config, args []string) erro
 		if *scopePath == "" {
 			return fmt.Errorf("--scope is required")
 		}
-		plan, err := loadTargetPlan(*scopePath, nil)
+		plan, err := loadTargetPlan(*scopePath, cfg.Scope.Root, nil)
 		if err != nil {
 			return err
 		}
@@ -684,7 +746,7 @@ func scheduleCommand(ctx context.Context, cfg config.Config, args []string) erro
 		}
 		now := time.Now().UTC()
 		item := domain.Schedule{ID: domain.NewID(), ProgramID: domain.ID(*programID), Name: *name, WorkflowName: *workflowName, Objective: *objective, CronExpression: *cronExpr, Timezone: *timezone, Enabled: true, Headless: *headless, CreatedBy: *actor, CreatedAt: now, UpdatedAt: now}
-		item, err = (schedulecron.ScheduleValidator{Programs: s, Registry: providers.Registry(cfg)}).Validate(ctx, item, now)
+		item, err = (schedulecron.ScheduleValidator{Programs: s, Registry: providers.Registry(cfg), ScopeRoot: cfg.Scope.Root}).Validate(ctx, item, now)
 		if err != nil {
 			return err
 		}
@@ -732,7 +794,7 @@ func scheduleCommand(ctx context.Context, cfg config.Config, args []string) erro
 			return err
 		}
 		item.Name, item.WorkflowName, item.Objective, item.CronExpression, item.Timezone, item.Headless = *name, *workflowName, *objective, *cronExpr, *timezone, *headless
-		item, err = (schedulecron.ScheduleValidator{Programs: s, Registry: providers.Registry(cfg)}).Validate(ctx, item, time.Now())
+		item, err = (schedulecron.ScheduleValidator{Programs: s, Registry: providers.Registry(cfg), ScopeRoot: cfg.Scope.Root}).Validate(ctx, item, time.Now())
 		if err != nil {
 			return err
 		}

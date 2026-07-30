@@ -39,10 +39,49 @@ type TargetingPrepareOutput struct {
 }
 
 type CompareAssetsInput struct {
-	Current          []string `json:"current"`
-	Previous         []string `json:"previous"`
-	CoverageComplete bool     `json:"coverage_complete"`
-	TargetPlanDigest string   `json:"target_plan_digest"`
+	Current          HTTPObservationValues `json:"current"`
+	Previous         []string              `json:"previous"`
+	CoverageComplete bool                  `json:"coverage_complete"`
+	TargetPlanDigest string                `json:"target_plan_digest"`
+}
+
+type HTTPObservationValues []string
+
+func (values *HTTPObservationValues) UnmarshalJSON(raw []byte) error {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return err
+	}
+	parsed := make(HTTPObservationValues, 0, len(items))
+	for index, item := range items {
+		var value string
+		if json.Unmarshal(item, &value) == nil {
+			parsed = append(parsed, value)
+			continue
+		}
+		var record provideroutput.Record
+		decoder := json.NewDecoder(bytes.NewReader(item))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&record); err != nil {
+			return fmt.Errorf("item %d must be a string or structured URL record: %w", index, err)
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			return fmt.Errorf("item %d must contain exactly one structured URL record", index)
+		}
+		if strings.TrimSpace(record.Provider) == "" || record.Kind != provideroutput.URLRecord || strings.TrimSpace(record.Target) == "" {
+			return fmt.Errorf("item %d structured URL record requires provider, kind url, and target", index)
+		}
+		if record.Port < 0 || record.Port > 65535 || record.StatusCode < 0 || record.StatusCode > 599 {
+			return fmt.Errorf("item %d structured URL record contains an invalid port or status code", index)
+		}
+		normalized, err := json.Marshal(record)
+		if err != nil {
+			return fmt.Errorf("item %d structured URL record: %w", index, err)
+		}
+		parsed = append(parsed, string(normalized))
+	}
+	*values = parsed
+	return nil
 }
 
 type StatusRoutes struct {
@@ -554,7 +593,7 @@ func comparisonReasons(previous, current string) []string {
 
 const targetingPrepareInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["exact_urls","discovered_urls","ports","target_plan_digest"],"properties":{"exact_urls":{"type":"array","items":{"type":"string"}},"discovered_urls":{"type":"array","items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer","minimum":1,"maximum":65535},"uniqueItems":true},"target_plan_digest":{"type":"string","minLength":1}}}`
 const targetingPrepareOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["urls","port_targets","filtered","accepted_count","filtered_count","target_plan_digest"],"properties":{"urls":{"type":"array","items":{"type":"string","format":"uri"}},"port_targets":{"type":"array","items":{"type":"string","format":"uri"}},"filtered":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["target","accepted","reason"],"properties":{"target":{"type":"string"},"accepted":{"type":"boolean"},"reason":{"type":"string"},"authorized_urls":{"type":"array","items":{"type":"string","format":"uri"}},"source_rule_ids":{"type":"array","items":{"type":"string"}}}}},"accepted_count":{"type":"integer","minimum":0},"filtered_count":{"type":"integer","minimum":0},"target_plan_digest":{"type":"string","minLength":1}}}`
-const compareAssetsInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["current","previous","coverage_complete","target_plan_digest"],"properties":{"current":{"type":"array","items":{"type":"string"}},"previous":{"type":"array","items":{"type":"string"}},"coverage_complete":{"type":"boolean"},"target_plan_digest":{"type":"string","minLength":1}}}`
+const compareAssetsInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["current","previous","coverage_complete","target_plan_digest"],"properties":{"current":{"type":"array","items":{"oneOf":[{"type":"string"},{"$ref":"#/$defs/record"}]}},"previous":{"type":"array","items":{"type":"string"}},"coverage_complete":{"type":"boolean"},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"record":` + providerURLRecordSchema + `}}`
 const assetChangeSchema = `{"type":"object","additionalProperties":false,"required":["kind","value","reasons"],"properties":{"kind":{"enum":["new_or_changed","removed"]},"value":{"type":"string","minLength":1},"previous":{"type":"object"},"current":{"type":"object"},"reasons":{"type":"array","items":{"type":"string","minLength":1},"minItems":1}}}`
 const compareAssetsOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["new_or_changed","crawl_targets","scan_targets","status_routes","removed","changes"],"properties":{"new_or_changed":{"type":"array","items":{"type":"string","format":"uri"}},"crawl_targets":{"type":"array","items":{"type":"string","format":"uri"}},"scan_targets":{"type":"array","items":{"type":"string","format":"uri"}},"status_routes":{"type":"object","additionalProperties":false,"required":["active","redirects","authentication","ignored"],"properties":{"active":{"type":"array","items":{"type":"string","format":"uri"}},"redirects":{"type":"array","items":{"type":"string","format":"uri"}},"authentication":{"type":"array","items":{"type":"string","format":"uri"}},"ignored":{"type":"array","items":{"type":"string","format":"uri"}}}},"removed":{"type":"array","items":{"type":"string","format":"uri"}},"changes":{"type":"array","items":{"$ref":"#/$defs/change"}}},"$defs":{"change":` + assetChangeSchema + `}}`
 const providerURLRecordSchema = `{"type":"object","additionalProperties":false,"required":["provider","kind","target"],"properties":{"provider":{"type":"string","minLength":1},"kind":{"const":"url"},"target":{"type":"string","format":"uri"},"host":{"type":"string"},"port":{"type":"integer","minimum":0,"maximum":65535},"status_code":{"type":"integer","minimum":0,"maximum":599},"technologies":{"type":"array","items":{"type":"string"}},"fields":{"type":"object"}}}`

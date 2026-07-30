@@ -6,7 +6,7 @@ Reconductor includes a persistent, PostgreSQL-backed scheduler for deterministic
 
 Cron due time is materialized into `scheduled_executions(status=pending)`. Scheduler workers claim pending rows with `FOR UPDATE SKIP LOCKED`, then call the shared `internal/orchestration` workflow service used by the CLI. Run Now inserts the same pending row shape and returns immediately.
 
-Each new execution reloads the program's current `scope_reference`, rebuilds the Burp scope and target plan, records the scope snapshot, validates the workflow definition, creates a distinct `Task`, and creates a distinct `WorkflowRun`. Resume reuses the existing task and workflow run.
+Each new execution reloads the program's current `scope_reference`, rebuilds the Burp scope and target plan, records the scope snapshot, validates the workflow definition, creates a distinct `Task`, and creates a distinct `WorkflowRun`. Resume reuses the existing task and workflow run. Queue jobs carry the compiled include/exclude rules, so capability workers do not reopen the scope file.
 
 ## Cron And Timezones
 
@@ -39,15 +39,39 @@ SCHEDULER_POLL_INTERVAL=15s
 SCHEDULER_MAX_CONCURRENT_RUNS=1
 SCHEDULER_LEASE_TIMEOUT=2m
 WORKFLOW_STATE_ROOT=state/runs
+SCOPE_ROOT=
 ```
 
-Run the daemon on a host that can read every program's `scope_reference` exactly as stored:
+Use portable logical references such as `scope/example.json`. When `SCOPE_ROOT`
+is set, relative references resolve beneath it. For backward compatibility, a
+legacy `/scope/example.json` reference maps to
+`$SCOPE_ROOT/scope/example.json` only when `SCOPE_ROOT` is explicitly set.
+Other absolute paths remain literal and missing files fail without fallback.
+Parent traversal in logical references is rejected.
+
+For a local scheduler started from the repository root:
 
 ```powershell
+$env:SCOPE_ROOT = (Get-Location).Path
 go run ./cmd/scheduler
 ```
 
-The worker image builds `/usr/local/bin/platform-scheduler`, but no scheduler container is enabled by default because container path mounts must be planned per deployment.
+The worker image builds `/usr/local/bin/platform-scheduler`, but no scheduler
+container is enabled by default. A future scheduler container must mount the
+same project/data tree beneath its configured `SCOPE_ROOT`. The worker service
+does not require a scope mount.
+
+Repair a legacy locator without network execution:
+
+```powershell
+$env:SCOPE_ROOT = (Get-Location).Path
+go run ./cmd/platform scope update --program-id <uuid> --scope scope/example.json
+```
+
+The repair is accepted only when both the scope digest and target-plan digest
+match the stored program. It updates the current program/snapshot locator and
+writes an audit event; authorization changes continue through the existing
+scope-change review path.
 
 ## CLI
 
@@ -67,4 +91,4 @@ The loopback-only console shows schedules, recent scheduled executions, change i
 
 ## Current Limitations
 
-The scheduler is a persistent local daemon, not high availability or distributed workflow coordination. It does not automatically recover an interrupted active network scan. It does not authenticate remote users or rewrite host filesystem scope paths for containers.
+The scheduler is a persistent local daemon, not high availability or distributed workflow coordination. It does not automatically recover an interrupted active network scan. It does not authenticate remote users or infer host/container path mappings that were not configured through `SCOPE_ROOT`.

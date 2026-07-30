@@ -62,7 +62,7 @@ func webReconDefinition(id domain.ID, name, version, description string, plan ta
 	}
 	steps = append(steps,
 		workflow.Step{ID: "probe-http", Capability: "probe.http", Provider: "httpx", DependsOn: probeDeps, Input: raw(map[string]any{"targets": []string{}, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"targets": prepare.ID + ".output.urls"}, Retry: retry(), Timeout: 15 * time.Minute},
-		workflow.Step{ID: "compare-assets", Capability: "compare.assets", DependsOn: []string{"probe-http"}, Input: raw(map[string]any{"current": []string{}, "previous": []string{}, "coverage_complete": true, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"current": "probe-http.output.lines"}, Retry: retry(), Timeout: time.Minute},
+		workflow.Step{ID: "compare-assets", Capability: "compare.assets", DependsOn: []string{"probe-http"}, Input: raw(map[string]any{"current": []string{}, "previous": []string{}, "coverage_complete": true, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"current": "probe-http.output.authorized_records"}, Retry: retry(), Timeout: time.Minute},
 		workflow.Step{ID: "crawl-new-or-changed-web-assets", Capability: "crawl.web", Provider: "katana", DependsOn: []string{"compare-assets"}, Condition: "nonempty:compare-assets.output.crawl_targets", Input: raw(map[string]any{"targets": []string{}, "headless": headless, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"targets": "compare-assets.output.crawl_targets"}, Retry: retry(), Timeout: 30 * time.Minute},
 	)
 	classifyDeps := []string{"crawl-new-or-changed-web-assets"}

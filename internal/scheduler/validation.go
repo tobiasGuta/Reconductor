@@ -19,8 +19,9 @@ type ProgramReader interface {
 }
 
 type ScheduleValidator struct {
-	Programs ProgramReader
-	Registry *capability.Registry
+	Programs  ProgramReader
+	Registry  *capability.Registry
+	ScopeRoot string
 }
 
 func (v ScheduleValidator) Validate(ctx context.Context, item domain.Schedule, after time.Time) (domain.Schedule, error) {
@@ -51,7 +52,7 @@ func (v ScheduleValidator) Validate(ctx context.Context, item domain.Schedule, a
 	if err != nil {
 		return domain.Schedule{}, fmt.Errorf("load program: %w", err)
 	}
-	scope, err := platformscope.LoadBurp(program.ScopeReference)
+	scope, err := platformscope.LoadBurpReference(program.ScopeReference, v.ScopeRoot)
 	if err != nil {
 		return domain.Schedule{}, fmt.Errorf("load current scope: %w", err)
 	}

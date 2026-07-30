@@ -226,6 +226,89 @@ func TestCompareAssetsExecutionLoadsPriorProbeValues(t *testing.T) {
 		t.Fatalf("loaded historical value did not match current asset: %s", result.Action.Output)
 	}
 }
+
+func TestCompareAssetsExecutionEstablishesFirstRunBaseline(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{}
+	const target = "http://127.0.0.1:33000/"
+	input := json.RawMessage(`{"current":[{"provider":"httpx","kind":"url","target":"http://127.0.0.1:33000/","host":"127.0.0.1","port":33000,"status_code":200}],"previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`)
+	req := capability.Request{
+		Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "compare.assets", Input: input},
+		Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}},
+		Scope:  allowedScope{},
+	}
+	result, err := (Service{Registry: providers.Registry(cfg), Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.loadedFor != "probe.http" {
+		t.Fatalf("historical probe values were not loaded: %q", store.loadedFor)
+	}
+	var output struct {
+		NewOrChanged []string `json:"new_or_changed"`
+		ScanTargets  []string `json:"scan_targets"`
+		Removed      []string `json:"removed"`
+	}
+	if err := json.Unmarshal(result.Action.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.NewOrChanged) != 1 || output.NewOrChanged[0] != target {
+		t.Fatalf("first-run asset was not new: %s", result.Action.Output)
+	}
+	if len(output.ScanTargets) != 1 || output.ScanTargets[0] != target {
+		t.Fatalf("first-run scan targets=%q want=%q", output.ScanTargets, target)
+	}
+	if len(output.Removed) != 0 {
+		t.Fatalf("first-run baseline fabricated removals: %s", result.Action.Output)
+	}
+}
+
+func TestCompareAssetsExecutionDoesNotReplaceInvalidPreviousInput(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"missing", `{"current":[],"coverage_complete":true,"target_plan_digest":"plan"}`, `field "previous" is required and cannot be null`},
+		{"null", `{"current":[],"previous":null,"coverage_complete":true,"target_plan_digest":"plan"}`, `field "previous" is required and cannot be null`},
+		{"malformed non-null", `{"current":[],"previous":[42],"coverage_complete":true,"target_plan_digest":"plan"}`, "cannot unmarshal number"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &capturedStore{previous: []string{"https://history.example.test/"}}
+			req := capability.Request{
+				Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "compare.assets", Input: json.RawMessage(test.raw)},
+				Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}},
+				Scope:  allowedScope{},
+			}
+			_, err := (Service{Registry: providers.Registry(cfg), Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err=%v want containing %q", err, test.want)
+			}
+			if store.loadedFor != "" {
+				t.Fatalf("invalid previous input was silently replaced from %q history", store.loadedFor)
+			}
+		})
+	}
+}
+
 func (s *capturedStore) PersistResult(_ context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult) error {
 	s.called, s.step, s.tool, s.artifacts, s.result = true, step, tool, append([]domain.Artifact(nil), artifacts...), result
 	return s.err

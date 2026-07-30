@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -103,6 +104,55 @@ func (s *Store) GetProgram(ctx context.Context, id domain.ID) (domain.Program, e
 	var p domain.Program
 	err := s.Pool.QueryRow(ctx, `SELECT id,name,platform,description,scope_reference,policy_reference,scope_digest,include_rule_digests,exclude_rule_digests,target_plan_digest,scope_plan_warnings,created_at,updated_at FROM programs WHERE id=$1`, id).Scan(&p.ID, &p.Name, &p.Platform, &p.Description, &p.ScopeReference, &p.PolicyReference, &p.ScopeDigest, &p.IncludeRuleDigests, &p.ExcludeRuleDigests, &p.TargetPlanDigest, &p.ScopePlanWarnings, &p.CreatedAt, &p.UpdatedAt)
 	return p, err
+}
+
+// RepairProgramScopeReference changes only the physical/logical locator for an
+// unchanged authorized scope and target plan. The digest predicates prevent a
+// stale repair from overwriting a concurrent scope change.
+func (s *Store) RepairProgramScopeReference(ctx context.Context, programID domain.ID, reference, expectedScopeDigest, expectedTargetPlanDigest, actor string) error {
+	if programID == "" || strings.TrimSpace(reference) == "" {
+		return fmt.Errorf("program id and scope reference are required")
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var scopeVersionID domain.ID
+	err = tx.QueryRow(ctx, `SELECT id FROM scope_versions WHERE program_id=$1 AND scope_digest=$2 AND target_plan_digest=$3 FOR UPDATE`, programID, expectedScopeDigest, expectedTargetPlanDigest).Scan(&scopeVersionID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("current scope version was not found for reference repair")
+		}
+		return err
+	}
+	var previousReference, scopeDigest, targetPlanDigest string
+	err = tx.QueryRow(ctx, `SELECT scope_reference,scope_digest,target_plan_digest FROM programs WHERE id=$1 FOR UPDATE`, programID).Scan(&previousReference, &scopeDigest, &targetPlanDigest)
+	if err != nil {
+		return err
+	}
+	if scopeDigest != expectedScopeDigest || targetPlanDigest != expectedTargetPlanDigest {
+		return fmt.Errorf("scope changed while repairing its reference")
+	}
+	if _, err = tx.Exec(ctx, `UPDATE programs SET scope_reference=$2,updated_at=now() WHERE id=$1`, programID, reference); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE scope_versions SET scope_reference=$2 WHERE id=$1`, scopeVersionID, reference); err != nil {
+		return err
+	}
+	if strings.TrimSpace(actor) == "" {
+		actor = "cli"
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,program_id,safe_message,details) VALUES($1,'scope_reference_repaired','targeting',$2,$3,'scope reference repaired without changing authorization',$4)`, domain.NewID(), actor, programID, mustJSON(map[string]string{
+		"previous_scope_reference": previousReference,
+		"scope_reference":          reference,
+		"scope_digest":             expectedScopeDigest,
+		"target_plan_digest":       expectedTargetPlanDigest,
+	})); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) CheckAndRecordScopeSnapshot(ctx context.Context, snapshot domain.ScopeSnapshot, acknowledgeExpansion bool, actor string) (domain.ScopeChange, error) {
@@ -354,27 +404,108 @@ func (s *Store) GetWorkflowRun(ctx context.Context, id domain.ID) (domain.Workfl
 	err := s.Pool.QueryRow(ctx, `SELECT id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,previous_run_id,trigger_source,summary FROM workflow_runs WHERE id=$1`, id).Scan(&r.ID, &r.TaskID, &r.WorkflowDefinitionID, &r.WorkflowVersion, &r.Status, &r.StartedAt, &r.CompletedAt, &r.PreviousRunID, &r.TriggerSource, &r.Summary)
 	return r, err
 }
-func (s *Store) ListApprovals(ctx context.Context) ([]map[string]any, error) {
+
+type ApprovalListItem struct {
+	ID              domain.ID  `json:"id"`
+	RequestID       domain.ID  `json:"request_id"`
+	TaskID          domain.ID  `json:"task_id"`
+	ActionRequestID domain.ID  `json:"action_request_id"`
+	Risk            string     `json:"risk"`
+	Reason          string     `json:"reason"`
+	RequestedAt     time.Time  `json:"requested_at"`
+	Decision        string     `json:"decision"`
+	DecidedBy       *string    `json:"decided_by"`
+	DecidedAt       *time.Time `json:"decided_at"`
+	ExpiresAt       *time.Time `json:"expires_at"`
+}
+
+func (s *Store) ListApprovals(ctx context.Context) ([]ApprovalListItem, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT id,request_id,task_id,action_request_id,requested_risk_level,reason,requested_at,decision,decided_by,decided_at,expires_at FROM approvals ORDER BY requested_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []map[string]any
+	var out []ApprovalListItem
 	for rows.Next() {
-		vals, err := rows.Values()
-		if err != nil {
+		var item ApprovalListItem
+		var rawID, rawRequestID, rawTaskID, rawActionRequestID any
+		if err := rows.Scan(&rawID, &rawRequestID, &rawTaskID, &rawActionRequestID, &item.Risk, &item.Reason, &item.RequestedAt, &item.Decision, &item.DecidedBy, &item.DecidedAt, &item.ExpiresAt); err != nil {
 			return nil, err
 		}
-		names := []string{"id", "request_id", "task_id", "action_request_id", "risk", "reason", "requested_at", "decision", "decided_by", "decided_at", "expires_at"}
-		m := map[string]any{}
-		for i, v := range vals {
-			m[names[i]] = v
+		if err := assignApprovalUUIDs(&item, rawID, rawRequestID, rawTaskID, rawActionRequestID); err != nil {
+			return nil, err
 		}
-		out = append(out, m)
+		out = append(out, item)
 	}
 	return out, rows.Err()
 }
+
+func assignApprovalUUIDs(item *ApprovalListItem, rawID, rawRequestID, rawTaskID, rawActionRequestID any) error {
+	for _, field := range []struct {
+		name   string
+		raw    any
+		target *domain.ID
+	}{
+		{name: "id", raw: rawID, target: &item.ID},
+		{name: "request_id", raw: rawRequestID, target: &item.RequestID},
+		{name: "task_id", raw: rawTaskID, target: &item.TaskID},
+		{name: "action_request_id", raw: rawActionRequestID, target: &item.ActionRequestID},
+	} {
+		value, err := approvalUUID(field.raw, field.name, false)
+		if err != nil {
+			return err
+		}
+		*field.target = *value
+	}
+	return nil
+}
+
+func approvalUUID(value any, field string, optional bool) (*domain.ID, error) {
+	if value == nil {
+		if optional {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("approval %s: UUID is required", field)
+	}
+	var raw []byte
+	switch value := value.(type) {
+	case [16]byte:
+		raw = value[:]
+	case []byte:
+		raw = value
+	case domain.ID:
+		decoded, err := decodeUUIDString(string(value))
+		if err != nil {
+			return nil, fmt.Errorf("approval %s: %w", field, err)
+		}
+		raw = decoded
+	case string:
+		decoded, err := decodeUUIDString(value)
+		if err != nil {
+			return nil, fmt.Errorf("approval %s: %w", field, err)
+		}
+		raw = decoded
+	default:
+		return nil, fmt.Errorf("approval %s: unsupported UUID value type %T", field, value)
+	}
+	if len(raw) != 16 {
+		return nil, fmt.Errorf("approval %s: UUID byte length is %d, want 16", field, len(raw))
+	}
+	id := domain.ID(hex.EncodeToString(raw[0:4]) + "-" + hex.EncodeToString(raw[4:6]) + "-" + hex.EncodeToString(raw[6:8]) + "-" + hex.EncodeToString(raw[8:10]) + "-" + hex.EncodeToString(raw[10:16]))
+	return &id, nil
+}
+
+func decodeUUIDString(value string) ([]byte, error) {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return nil, fmt.Errorf("UUID string must use 8-4-4-4-12 canonical form")
+	}
+	decoded, err := hex.DecodeString(value[0:8] + value[9:13] + value[14:18] + value[19:23] + value[24:36])
+	if err != nil {
+		return nil, fmt.Errorf("invalid UUID string: %w", err)
+	}
+	return decoded, nil
+}
+
 func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, actor string) error {
 	if decision != "approved" && decision != "rejected" {
 		return fmt.Errorf("invalid decision")
