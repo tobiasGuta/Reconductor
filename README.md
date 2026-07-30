@@ -170,9 +170,13 @@ go run ./cmd/platform migrate
 go run ./cmd/platform capabilities
 ```
 
-Start the persistent scheduler on a Reconductor host that can read each program's stored `scope_reference` path:
+Set an optional project/data root for portable logical scope references, then
+start the persistent scheduler. Relative references resolve beneath
+`SCOPE_ROOT`; when it is unset they remain relative to the process working
+directory.
 
 ```powershell
+$env:SCOPE_ROOT = (Get-Location).Path
 go run ./cmd/scheduler
 ```
 
@@ -181,6 +185,15 @@ Create a program using an explicit Burp-compatible scope file:
 ```powershell
 go run ./cmd/platform program create --name example --platform private --scope scope/example.json
 go run ./cmd/platform program list
+```
+
+New programs should store logical references such as `scope/example.json`.
+Absolute paths remain supported but are intentionally not remapped. To repair
+an existing locator without changing authorization, use `scope update`; it
+requires the loaded scope and target-plan digests to match the stored values:
+
+```powershell
+go run ./cmd/platform scope update --program-id <uuid> --scope scope/example.json
 ```
 
 Review the non-network plans, then run without a root-domain argument:
@@ -221,39 +234,41 @@ docker compose run --rm --entrypoint /usr/local/bin/platform worker doctor
 docker compose run --rm --entrypoint /usr/local/bin/platform worker capabilities
 ```
 
-Mount the local `scope` directory when running CLI commands inside Docker:
+Mount the local `scope` directory beneath an explicit container scope root when
+running CLI commands inside Docker. Persist the same logical reference used by
+the local scheduler:
 
 ```powershell
-$scopePath = "/scope/acme.json"
-$program = docker compose run --rm -v "${PWD}\scope:/scope:ro" --entrypoint /usr/local/bin/platform worker program create --name acme --platform private --scope $scopePath | ConvertFrom-Json
+$scopePath = "scope/acme.json"
+$program = docker compose run --rm -e SCOPE_ROOT=/workspace -v "${PWD}\scope:/workspace/scope:ro" --entrypoint /usr/local/bin/platform worker program create --name acme --platform private --scope $scopePath | ConvertFrom-Json
 $program.id
 ```
 
 Review scope and workflow plans before running network steps:
 
 ```powershell
-docker compose run --rm -v "${PWD}\scope:/scope:ro" --entrypoint /usr/local/bin/platform worker scope plan --scope $scopePath
-docker compose run --rm -v "${PWD}\scope:/scope:ro" --entrypoint /usr/local/bin/platform worker workflow plan --program-id $program.id --scope $scopePath
-docker compose run --rm -v "${PWD}\scope:/scope:ro" --entrypoint /usr/local/bin/platform worker workflow validate --scope $scopePath
+docker compose run --rm -e SCOPE_ROOT=/workspace -v "${PWD}\scope:/workspace/scope:ro" --entrypoint /usr/local/bin/platform worker scope plan --scope $scopePath
+docker compose run --rm -e SCOPE_ROOT=/workspace -v "${PWD}\scope:/workspace/scope:ro" --entrypoint /usr/local/bin/platform worker workflow plan --program-id $program.id --scope $scopePath
+docker compose run --rm -e SCOPE_ROOT=/workspace -v "${PWD}\scope:/workspace/scope:ro" --entrypoint /usr/local/bin/platform worker workflow validate --scope $scopePath
 ```
 
 Start a low-rate workflow run:
 
 ```powershell
-docker compose run --rm -v "${PWD}\scope:/scope:ro" -v "${PWD}\state:/state" --entrypoint /usr/local/bin/platform worker workflow run --program-id $program.id --scope $scopePath --objective "Authorized low-rate baseline reconnaissance"
+docker compose run --rm -e SCOPE_ROOT=/workspace -v "${PWD}\scope:/workspace/scope:ro" -v "${PWD}\state:/state" --entrypoint /usr/local/bin/platform worker workflow run --program-id $program.id --scope $scopePath --objective "Authorized low-rate baseline reconnaissance"
 ```
 
 The default run pauses before the moderate Nuclei step. To approve that step for a run, add `--approve-moderate`:
 
 ```powershell
-docker compose run --rm -v "${PWD}\scope:/scope:ro" -v "${PWD}\state:/state" --entrypoint /usr/local/bin/platform worker workflow run --program-id $program.id --scope $scopePath --objective "Authorized low-rate baseline reconnaissance" --approve-moderate
+docker compose run --rm -e SCOPE_ROOT=/workspace -v "${PWD}\scope:/workspace/scope:ro" -v "${PWD}\state:/state" --entrypoint /usr/local/bin/platform worker workflow run --program-id $program.id --scope $scopePath --objective "Authorized low-rate baseline reconnaissance" --approve-moderate
 ```
 
 Show a saved run or retry/resume it:
 
 ```powershell
 docker compose run --rm --entrypoint /usr/local/bin/platform worker run show <workflow-run-id>
-docker compose run --rm -v "${PWD}\scope:/scope:ro" -v "${PWD}\state:/state" --entrypoint /usr/local/bin/platform worker run retry <workflow-run-id> --program-id $program.id --scope $scopePath --approve-moderate
+docker compose run --rm -e SCOPE_ROOT=/workspace -v "${PWD}\scope:/workspace/scope:ro" -v "${PWD}\state:/state" --entrypoint /usr/local/bin/platform worker run retry <workflow-run-id> --program-id $program.id --scope $scopePath --approve-moderate
 ```
 
 Inspect queue state and generated change reports:
@@ -333,7 +348,7 @@ Approval and retry controls use explicit same-origin POST requests. The console 
 ```text
 platform program create|list
 platform task create|list|show|pause|resume|cancel
-platform scope plan
+platform scope plan|update
 platform workflow validate|plan|run
 platform run show|retry
 platform approvals list|approve|reject

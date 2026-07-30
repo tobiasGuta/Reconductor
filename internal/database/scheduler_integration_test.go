@@ -322,6 +322,64 @@ func TestWorkflowLifecycleRollbackIsAtomic(t *testing.T) {
 	}
 }
 
+func TestRepairProgramScopeReferencePreservesDigestsAndCurrentSnapshot(t *testing.T) {
+	store, ctx := schedulerIntegrationStore(t)
+	now := time.Now().UTC()
+	programID := domain.NewID()
+	program := domain.Program{
+		ID: programID, Name: "scope-reference-" + string(programID), Platform: "integration",
+		ScopeReference: "/scope/example.json", PolicyReference: "integration",
+		ScopeDigest: "scope-digest", IncludeRuleDigests: []string{"include"}, ExcludeRuleDigests: []string{},
+		TargetPlanDigest: "plan-digest", ScopePlanWarnings: json.RawMessage(`[]`), CreatedAt: now, UpdatedAt: now,
+	}
+	snapshot := domain.ScopeSnapshot{
+		ScopeReference: program.ScopeReference, ScopeDigest: program.ScopeDigest,
+		IncludeRuleDigests: program.IncludeRuleDigests, ExcludeRuleDigests: program.ExcludeRuleDigests,
+		TargetPlanDigest: program.TargetPlanDigest, PlanningWarnings: json.RawMessage(`[]`),
+		TargetPlan: json.RawMessage(`{}`), CreatedAt: now,
+	}
+	if err := store.CreateProgram(ctx, program, snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	const repaired = "scope/example.json"
+	if err := store.RepairProgramScopeReference(ctx, programID, repaired, program.ScopeDigest, program.TargetPlanDigest, "integration"); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.GetProgram(ctx, programID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ScopeReference != repaired || current.ScopeDigest != program.ScopeDigest || current.TargetPlanDigest != program.TargetPlanDigest {
+		t.Fatalf("repaired program = %#v", current)
+	}
+	var snapshotReference, snapshotScopeDigest, snapshotPlanDigest string
+	if err := store.Pool.QueryRow(ctx, `SELECT scope_reference,scope_digest,target_plan_digest FROM scope_versions WHERE program_id=$1`, programID).Scan(&snapshotReference, &snapshotScopeDigest, &snapshotPlanDigest); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotReference != repaired || snapshotScopeDigest != program.ScopeDigest || snapshotPlanDigest != program.TargetPlanDigest {
+		t.Fatalf("repaired snapshot reference=%q scope=%q plan=%q", snapshotReference, snapshotScopeDigest, snapshotPlanDigest)
+	}
+	var auditCount int
+	if err := store.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE program_id=$1 AND event_type='scope_reference_repaired'`, programID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("scope reference repair audit count = %d", auditCount)
+	}
+
+	if err := store.RepairProgramScopeReference(ctx, programID, "scope/other.json", "stale-scope-digest", program.TargetPlanDigest, "integration"); err == nil {
+		t.Fatal("stale scope repair was accepted")
+	}
+	current, err = store.GetProgram(ctx, programID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ScopeReference != repaired {
+		t.Fatalf("stale repair changed reference to %q", current.ScopeReference)
+	}
+}
+
 func schedulerIntegrationStore(t *testing.T) (*Store, context.Context) {
 	t.Helper()
 	databaseURL := os.Getenv("TEST_DATABASE_URL")

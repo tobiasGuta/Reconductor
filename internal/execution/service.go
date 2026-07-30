@@ -41,14 +41,21 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 			return capability.Result{}, fmt.Errorf("result store is required")
 		}
 		var input map[string]any
-		if json.Unmarshal(req.Action.Input, &input) == nil {
-			if previous, ok := input["previous"].([]any); !ok || len(previous) == 0 {
+		if err := json.Unmarshal(req.Action.Input, &input); err == nil {
+			if previous, ok := input["previous"].([]any); ok && len(previous) == 0 {
 				values, loadErr := s.Store.PreviousObservationValues(ctx, s.ProgramID, req.Action.WorkflowRunID, "probe.http")
 				if loadErr != nil {
 					return capability.Result{}, loadErr
 				}
+				if values == nil {
+					values = []string{}
+				}
 				input["previous"] = values
-				req.Action.Input, _ = json.Marshal(input)
+				enriched, marshalErr := json.Marshal(input)
+				if marshalErr != nil {
+					return capability.Result{}, fmt.Errorf("marshal compare.assets history: %w", marshalErr)
+				}
+				req.Action.Input = enriched
 			}
 		}
 	}

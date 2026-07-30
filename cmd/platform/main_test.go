@@ -11,14 +11,20 @@ import (
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/config"
+	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/providers"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
 func TestScopePlanCLIProducesJSONWithoutRuntimeConfiguration(t *testing.T) {
-	path := filepath.Join("..", "..", "internal", "targeting", "testdata", "mixed_real_world_scope.json")
-	out, err := captureStdout(func() error { return scopeCommand([]string{"plan", "--scope", path}) })
+	path := filepath.ToSlash(filepath.Join("internal", "targeting", "testdata", "mixed_real_world_scope.json"))
+	cfg, err := config.LoadPlanning()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Scope.Root = filepath.Join("..", "..")
+	out, err := captureStdout(func() error { return scopeCommand(context.Background(), cfg, []string{"plan", "--scope", path}) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,11 +42,12 @@ func TestScopePlanCLIProducesJSONWithoutRuntimeConfiguration(t *testing.T) {
 }
 
 func TestWorkflowPlanCLIAndRepeatedManualRoots(t *testing.T) {
-	path := filepath.Join("..", "..", "internal", "targeting", "testdata", "mixed_real_world_scope.json")
+	path := filepath.ToSlash(filepath.Join("internal", "targeting", "testdata", "mixed_real_world_scope.json"))
 	cfg, err := config.LoadPlanning()
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Scope.Root = filepath.Join("..", "..")
 	out, err := captureStdout(func() error {
 		return workflowPlan(cfg, providers.Registry(cfg), []string{"--program-id", "00000000-0000-0000-0000-000000000001", "--scope", path, "--discovery-root", "one.example", "--discovery-root", "two.example", "--discovery-root-reason", "passive operator request"})
 	})
@@ -127,6 +134,53 @@ func TestTaskCancellationReachesWorkflowControls(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("task watcher did not stop after cancellation")
+	}
+}
+
+func TestApprovalListJSONUsesCanonicalUUIDStrings(t *testing.T) {
+	requestedAt := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	items := []database.ApprovalListItem{{
+		ID:              "11111111-2222-4333-8444-555555555555",
+		RequestID:       "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		TaskID:          "cc8e2cc2-c879-4157-aa41-e099a1611dbb",
+		ActionRequestID: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		Risk:            "moderate",
+		Reason:          "workflow step run-safe-nuclei-profile",
+		RequestedAt:     requestedAt,
+		Decision:        "pending",
+	}}
+	out, err := captureStdout(func() error { return printJSON(items) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) != 1 {
+		t.Fatalf("approvals=%d want=1", len(payload))
+	}
+	item := payload[0]
+	for field, want := range map[string]string{
+		"id":                "11111111-2222-4333-8444-555555555555",
+		"request_id":        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		"action_request_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		"task_id":           "cc8e2cc2-c879-4157-aa41-e099a1611dbb",
+	} {
+		if got, ok := item[field].(string); !ok || got != want {
+			t.Fatalf("%s=%#v want UUID string %q", field, item[field], want)
+		}
+	}
+	if item["risk"] != "moderate" || item["reason"] != "workflow step run-safe-nuclei-profile" || item["decision"] != "pending" || item["requested_at"] != requestedAt.Format(time.RFC3339) {
+		t.Fatalf("existing approval fields changed: %#v", item)
+	}
+	for _, field := range []string{"decided_by", "decided_at", "expires_at"} {
+		if value, ok := item[field]; !ok || value != nil {
+			t.Fatalf("%s=%#v want explicit null", field, value)
+		}
+	}
+	if len(item) != 11 {
+		t.Fatalf("approval fields=%d want=11: %#v", len(item), item)
 	}
 }
 

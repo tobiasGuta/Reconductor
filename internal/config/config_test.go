@@ -7,7 +7,7 @@ import (
 )
 
 func TestLoadAndSecretSafeString(t *testing.T) {
-	env := map[string]string{"DATABASE_URL": "postgres://user:secret@localhost/db", "REDIS_ADDR": "localhost:6379", "REDIS_PASSWORD": "redis-secret", "NUCLEI_RATE_LIMIT": "17", "HTTPX_EXECUTABLE": `C:\tools\projectdiscovery\httpx.exe`}
+	env := map[string]string{"DATABASE_URL": "postgres://user:secret@localhost/db", "REDIS_ADDR": "localhost:6379", "REDIS_PASSWORD": "redis-secret", "SCOPE_ROOT": `D:\Reconductor`, "NUCLEI_RATE_LIMIT": "17", "HTTPX_EXECUTABLE": `C:\tools\projectdiscovery\httpx.exe`}
 	c, err := LoadWith(func(k string) string { return env[k] })
 	if err != nil {
 		t.Fatal(err)
@@ -23,6 +23,9 @@ func TestLoadAndSecretSafeString(t *testing.T) {
 	}
 	if c.Tools.HTTPX != `C:\tools\projectdiscovery\httpx.exe` || c.Tools.DNSx != "dnsx" {
 		t.Fatalf("unexpected tool executables: %#v", c.Tools)
+	}
+	if c.Scope.Root != `D:\Reconductor` {
+		t.Fatalf("scope root = %q", c.Scope.Root)
 	}
 	safe := c.String()
 	if strings.Contains(safe, "secret") {

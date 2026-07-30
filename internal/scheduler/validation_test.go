@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,15 +23,20 @@ func (r validationProgramReader) GetProgram(context.Context, domain.ID) (domain.
 }
 
 func TestScheduleValidatorUsesProgramScopeAndWorkflowRegistry(t *testing.T) {
-	scopePath := filepath.Join(t.TempDir(), "scope.json")
+	scopeRoot := t.TempDir()
+	scopePath := filepath.Join(scopeRoot, "scope", "scope.json")
 	scopeJSON := `{"target":{"scope":{"advanced_mode":true,"exclude":[],"include":[{"enabled":true,"file":"^/.*","host":"^app\\.example\\.test$","port":"^443$","protocol":"https"}]}}}`
+	if err := os.Mkdir(filepath.Dir(scopePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(scopePath, []byte(scopeJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	programID := domain.NewID()
 	validator := ScheduleValidator{
-		Programs: validationProgramReader{program: domain.Program{ID: programID, ScopeReference: scopePath}},
-		Registry: providers.Registry(config.Config{}),
+		Programs:  validationProgramReader{program: domain.Program{ID: programID, ScopeReference: "scope/scope.json"}},
+		Registry:  providers.Registry(config.Config{}),
+		ScopeRoot: scopeRoot,
 	}
 	item := domain.Schedule{
 		ProgramID: programID, Name: " daily ", WorkflowName: workflows.ContinuousName,
@@ -56,5 +62,35 @@ func TestScheduleValidatorUsesProgramScopeAndWorkflowRegistry(t *testing.T) {
 	item.Name = " "
 	if _, err := validator.Validate(context.Background(), item, time.Now()); err == nil {
 		t.Fatal("empty name was accepted")
+	}
+}
+
+func TestScheduleValidatorMapsLegacyContainerScopeOnlyThroughConfiguredRoot(t *testing.T) {
+	scopeRoot := t.TempDir()
+	scopePath := filepath.Join(scopeRoot, "scope", "legacy.json")
+	if err := os.Mkdir(filepath.Dir(scopePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	scopeJSON := `{"target":{"scope":{"exclude":[],"include":[{"enabled":true,"file":"^/.*","host":"^legacy\\.example\\.test$","port":"^443$","protocol":"https"}]}}}`
+	if err := os.WriteFile(scopePath, []byte(scopeJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	programID := domain.NewID()
+	item := domain.Schedule{
+		ProgramID: programID, Name: "legacy", WorkflowName: workflows.ContinuousName,
+		Objective: "authorized reconnaissance", CronExpression: "0 9 * * *", Timezone: "UTC",
+	}
+	validator := ScheduleValidator{
+		Programs:  validationProgramReader{program: domain.Program{ID: programID, ScopeReference: "/scope/legacy.json"}},
+		Registry:  providers.Registry(config.Config{}),
+		ScopeRoot: scopeRoot,
+	}
+	if _, err := validator.Validate(context.Background(), item, time.Now()); err != nil {
+		t.Fatalf("configured legacy reference was rejected: %v", err)
+	}
+
+	validator.ScopeRoot = ""
+	if _, err := validator.Validate(context.Background(), item, time.Now()); err == nil || !strings.Contains(err.Error(), "/scope/legacy.json") {
+		t.Fatalf("unconfigured legacy reference error = %v", err)
 	}
 }

@@ -29,7 +29,17 @@ func TestCompareAssetsStatusRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := Registry(cfg)
-	input := json.RawMessage(`{"current":["{\"url\":\"https://x.test/ok\",\"status_code\":200}","{\"url\":\"https://x.test/login\",\"status_code\":403}","{\"url\":\"https://x.test/missing\",\"status_code\":404}"],"previous":[],"coverage_complete":true,"target_plan_digest":"test-plan"}`)
+	input := json.RawMessage(`{
+		"current":[
+			{"provider":"httpx","kind":"url","target":"http://127.0.0.1:33000/","host":"127.0.0.1","port":33000,"status_code":200},
+			{"provider":"httpx","kind":"url","target":"https://x.test/moved","status_code":302},
+			{"provider":"httpx","kind":"url","target":"https://x.test/login","status_code":401},
+			{"provider":"httpx","kind":"url","target":"https://x.test/missing","status_code":404}
+		],
+		"previous":[],
+		"coverage_complete":true,
+		"target_plan_digest":"test-plan"
+	}`)
 	result, err := r.Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "compare.assets", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}}, Scope: testScope{}})
 	if err != nil {
 		t.Fatal(err)
@@ -42,8 +52,49 @@ func TestCompareAssetsStatusRouting(t *testing.T) {
 	if err := json.Unmarshal(result.Action.Output, &output); err != nil {
 		t.Fatal(err)
 	}
-	if len(output.Crawl) != 1 || len(output.Scan) != 2 || len(output.Routes["ignored"]) != 1 {
-		t.Fatalf("unexpected routes: %s", result.Action.Output)
+	if got, want := strings.Join(output.Routes["active"], ","), "http://127.0.0.1:33000/"; got != want {
+		t.Fatalf("active=%q want=%q", got, want)
+	}
+	if got, want := strings.Join(output.Routes["redirects"], ","), "https://x.test/moved"; got != want {
+		t.Fatalf("redirects=%q want=%q", got, want)
+	}
+	if got, want := strings.Join(output.Routes["authentication"], ","), "https://x.test/login"; got != want {
+		t.Fatalf("authentication=%q want=%q", got, want)
+	}
+	if got, want := strings.Join(output.Routes["ignored"], ","), "https://x.test/missing"; got != want {
+		t.Fatalf("ignored=%q want=%q", got, want)
+	}
+	if got, want := strings.Join(output.Crawl, ","), "http://127.0.0.1:33000/"; got != want {
+		t.Fatalf("crawl_targets=%q want=%q", got, want)
+	}
+	if got, want := strings.Join(output.Scan, ","), "http://127.0.0.1:33000/,https://x.test/moved,https://x.test/login"; got != want {
+		t.Fatalf("scan_targets=%q want=%q", got, want)
+	}
+}
+
+func TestCompareAssetsRejectsMalformedStructuredCurrentObservations(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := Registry(cfg)
+	tests := []string{
+		`{"current":[{"provider":"httpx","kind":"url","target":"not a URL","status_code":200}],"previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`,
+		`{"current":[{"provider":"httpx","kind":"host","target":"https://x.test/","status_code":200}],"previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`,
+		`{"current":[{"provider":"httpx","kind":"url","target":"https://x.test/","status_code":"200"}],"previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`,
+		`{"current":[{"provider":"httpx","kind":"url","target":"https://x.test/","status_code":200,"unexpected":true}],"previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`,
+	}
+	for _, raw := range tests {
+		t.Run(raw, func(t *testing.T) {
+			if err := registry.ValidateDefinitionInput("compare.assets", json.RawMessage(raw)); err == nil {
+				t.Fatal("malformed structured observation was accepted")
+			}
+		})
 	}
 }
 
@@ -69,6 +120,22 @@ func TestCompareAssetsPreservesHistoricalPlainWrappedAndStructuredObservations(t
 				t.Fatalf("unchanged observations were reported as changed: %#v", result)
 			}
 		})
+	}
+}
+
+func TestCompareAssetsStructuredCurrentMatchesPersistedHistory(t *testing.T) {
+	input := json.RawMessage(`{
+		"current":[{"provider":"httpx","kind":"url","target":"http://127.0.0.1:33000/","host":"127.0.0.1","port":33000,"status_code":200}],
+		"previous":["{\"provider\":\"httpx\",\"kind\":\"url\",\"target\":\"http://127.0.0.1:33000/\",\"host\":\"127.0.0.1\",\"port\":33000,\"status_code\":200}"],
+		"coverage_complete":true,
+		"target_plan_digest":"plan"
+	}`)
+	result, _, err := executeCompareAssets(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.NewOrChanged) != 0 || len(result.ScanTargets) != 0 || len(result.Changes) != 0 {
+		t.Fatalf("unchanged persisted observation was reported as changed: %#v", result)
 	}
 }
 
@@ -144,6 +211,9 @@ func TestInternalCapabilitiesRejectMalformedMissingAndUnexpectedInput(t *testing
 		{"targeting.prepare", `{"exact_urls":[],"discovered_urls":[],"ports":[70000],"target_plan_digest":"plan"}`},
 		{"compare.assets", `{"current":"https://x.test","previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`},
 		{"compare.assets", `{"current":[],"previous":[],"coverage_complete":true}`},
+		{"compare.assets", `{"current":[],"coverage_complete":true,"target_plan_digest":"plan"}`},
+		{"compare.assets", `{"current":[],"previous":null,"coverage_complete":true,"target_plan_digest":"plan"}`},
+		{"compare.assets", `{"current":[],"previous":[42],"coverage_complete":true,"target_plan_digest":"plan"}`},
 		{"classify.endpoint", `{"active":[],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan","command":"whoami"}`},
 		{"classify.endpoint", `{"active":["not a url"],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan"}`},
 		{"report.changes", `{"changes":[{"kind":"new_or_changed"}],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`},

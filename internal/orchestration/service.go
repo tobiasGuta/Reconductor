@@ -74,7 +74,7 @@ func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, 
 	if req.RequestedBy == "" {
 		req.RequestedBy = "cli"
 	}
-	sc, err := platformscope.LoadBurp(req.ScopeReference)
+	sc, err := s.loadScope(req.ScopeReference)
 	if err != nil {
 		return WorkflowResult{}, fmt.Errorf("load scope: %w", err)
 	}
@@ -147,6 +147,10 @@ func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, 
 		}
 	}
 	return WorkflowResult{Task: task, State: state, ScopeChange: change}, runErr
+}
+
+func (s Service) loadScope(reference string) (platformscope.Scope, error) {
+	return platformscope.LoadBurpReference(reference, s.Config.Scope.Root)
 }
 
 func (s Service) resolveTask(ctx context.Context, req WorkflowRequest, def workflow.Definition, state *workflow.State) (domain.Task, error) {

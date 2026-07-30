@@ -15,6 +15,7 @@ import (
 type Config struct {
 	Database        Database
 	Redis           Redis
+	Scope           Scope
 	Tools           Tools
 	Recon           Recon
 	Worker          Worker
@@ -26,6 +27,7 @@ type Config struct {
 }
 
 type Database struct{ URL string }
+type Scope struct{ Root string }
 type Tools struct {
 	Subfinder string
 	Chaos     string
@@ -117,6 +119,7 @@ func loadWith(get Lookup, requireDatabase bool) (Config, error) {
 	c := Config{
 		Database:        Database{URL: get("DATABASE_URL")},
 		Redis:           Redis{Address: value(get, "REDIS_ADDR", "localhost:6379"), Username: get("REDIS_USERNAME"), Password: get("REDIS_PASSWORD"), DB: integer(get, "REDIS_DB", 0), TLS: boolean(get, "REDIS_TLS", false)},
+		Scope:           Scope{Root: strings.TrimSpace(get("SCOPE_ROOT"))},
 		Tools:           Tools{Subfinder: value(get, "SUBFINDER_EXECUTABLE", "subfinder"), Chaos: value(get, "CHAOS_EXECUTABLE", "chaos"), DNSx: value(get, "DNSX_EXECUTABLE", "dnsx"), Naabu: value(get, "NAABU_EXECUTABLE", "naabu"), HTTPX: value(get, "HTTPX_EXECUTABLE", "httpx"), Katana: value(get, "KATANA_EXECUTABLE", "katana"), GAU: value(get, "GAU_EXECUTABLE", "gau"), Nuclei: value(get, "NUCLEI_EXECUTABLE", "nuclei")},
 		Recon:           Recon{Pipeline: value(get, "RECON_PIPELINE", "sdnhkga"), Headless: boolean(get, "RECON_HEADLESS", false), ChaosKey: get("CHAOS_KEY"), Timeout: duration(get, "RECON_TIMEOUT", 15*time.Minute), RateLimit: integer(get, "RECON_RATE_LIMIT", 75), Concurrency: integer(get, "RECON_CONCURRENCY", 20), ProviderUpdate: boolean(get, "RECON_PROVIDER_UPDATE", false)},
 		Worker:          Worker{ConsumerGroup: value(get, "WORKER_CONSUMER_GROUP", "capability-workers"), ConsumerName: value(get, "WORKER_CONSUMER_NAME", hostname()), PoolSize: integer(get, "WORKER_POOL_SIZE", 4), LeaseTimeout: duration(get, "WORKER_LEASE_TIMEOUT", 2*time.Minute), ReadBlock: duration(get, "WORKER_READ_BLOCK", 5*time.Second), MaxRetries: integer(get, "WORKER_MAX_RETRIES", 3), RetryBase: duration(get, "WORKER_RETRY_BASE", 2*time.Second)},
