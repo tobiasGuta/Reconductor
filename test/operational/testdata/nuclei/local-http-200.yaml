@@ -1,0 +1,19 @@
+id: reconductor-local-approval
+
+info:
+  name: Reconductor local approval lifecycle check
+  author: reconductor
+  severity: info
+  tags: reconductor-e2e
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    redirects: false
+    headers:
+      X-Reconductor-E2E-Nuclei: "__RECONDUCTOR_E2E_RUN_ID__"
+    matchers:
+      - type: status
+        status:
+          - 200
