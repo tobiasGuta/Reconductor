@@ -17,6 +17,8 @@ var (
 	ErrApprovalRejected = errors.New("scheduled execution was closed because approval was rejected")
 )
 
+const staleReconciliationBatchLimit = 32
+
 func (s *Store) CreateSchedule(ctx context.Context, item domain.Schedule) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -196,14 +198,14 @@ func (s *Store) MaterializeDueSchedule(ctx context.Context, scheduleID domain.ID
 }
 
 func (s *Store) ClaimPendingScheduledExecution(ctx context.Context, owner string, leaseTimeout time.Duration) (domain.ScheduledExecution, domain.Schedule, bool, error) {
+	if err := s.reconcileStaleScheduledExecutions(ctx, staleReconciliationBatchLimit); err != nil {
+		return domain.ScheduledExecution{}, domain.Schedule{}, false, err
+	}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return domain.ScheduledExecution{}, domain.Schedule{}, false, err
 	}
 	defer tx.Rollback(ctx)
-	if err := recoverStaleScheduledExecutions(ctx, tx); err != nil {
-		return domain.ScheduledExecution{}, domain.Schedule{}, false, err
-	}
 	if err := skipOverlappingPendingExecutions(ctx, tx); err != nil {
 		return domain.ScheduledExecution{}, domain.Schedule{}, false, err
 	}
@@ -570,68 +572,6 @@ func markScheduledExecutionRunning(ctx context.Context, tx pgx.Tx, id, taskID, w
 	item.Status, item.TaskID, item.WorkflowRunID, item.ScopeVersionID, item.StartedAt, item.UpdatedAt = domain.ScheduledExecutionRunning, &taskID, &workflowRunID, scopeVersionID, &now, now
 	if err := auditExecution(ctx, tx, "scheduled_execution_started", owner, programID, item, "scheduled execution started", nil); err != nil {
 		return err
-	}
-	return nil
-}
-
-func recoverStaleScheduledExecutions(ctx context.Context, tx pgx.Tx) error {
-	rows, err := tx.Query(ctx, `SELECT se.id,se.schedule_id,se.planned_at,se.trigger_source,se.status,se.task_id,se.workflow_run_id,se.scope_version_id,se.attempt_count,se.lease_owner,se.lease_expires_at,se.error_classification,se.error_summary,se.started_at,se.completed_at,se.created_at,se.updated_at,s.program_id
-		FROM scheduled_executions se
-		JOIN schedules s ON s.id=se.schedule_id
-		WHERE se.status IN ('claimed','running') AND se.lease_expires_at<clock_timestamp()
-		ORDER BY se.lease_expires_at
-		FOR UPDATE OF se`)
-	if err != nil {
-		return err
-	}
-	type staleExecution struct {
-		item      domain.ScheduledExecution
-		programID domain.ID
-	}
-	var stale []staleExecution
-	for rows.Next() {
-		item, programID, scanErr := scanScheduledExecution(rows)
-		if scanErr != nil {
-			rows.Close()
-			return scanErr
-		}
-		stale = append(stale, staleExecution{item: item, programID: programID})
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, entry := range stale {
-		item := entry.item
-		now := time.Now().UTC()
-		if item.Status == domain.ScheduledExecutionClaimed && item.TaskID == nil && item.WorkflowRunID == nil {
-			tag, err := tx.Exec(ctx, `UPDATE scheduled_executions SET status='pending',lease_owner='',lease_expires_at=NULL,updated_at=$2 WHERE id=$1 AND status='claimed' AND recovery_protocol_version=1`, item.ID, now)
-			if err != nil {
-				return err
-			}
-			if tag.RowsAffected() == 1 {
-				item.Status, item.LeaseOwner, item.LeaseExpiresAt, item.UpdatedAt = domain.ScheduledExecutionPending, "", nil, now
-				if err := auditExecution(ctx, tx, "scheduled_execution_stale_claim_recovered", "scheduler", entry.programID, item, "stale claim returned to pending", nil); err != nil {
-					return err
-				}
-				continue
-			}
-		}
-		summary := "scheduler lease expired after workflow state was created"
-		if item.Status == domain.ScheduledExecutionClaimed && item.TaskID == nil && item.WorkflowRunID == nil {
-			summary = "scheduler lease expired with ambiguous pre-upgrade lineage"
-		}
-		tag, err := tx.Exec(ctx, `UPDATE scheduled_executions SET status='interrupted',error_classification='interrupted',error_summary=$3,completed_at=$2,lease_owner='',lease_expires_at=NULL,updated_at=$2 WHERE id=$1 AND status IN ('claimed','running')`, item.ID, now, summary)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
-			return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionInterrupted)
-		}
-		item.Status, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.LeaseOwner, item.LeaseExpiresAt, item.UpdatedAt = domain.ScheduledExecutionInterrupted, "interrupted", summary, &now, "", nil, now
-		if err := auditExecution(ctx, tx, "scheduled_execution_interrupted", "scheduler", entry.programID, item, "scheduled execution interrupted after lease expiry", nil); err != nil {
-			return err
-		}
 	}
 	return nil
 }

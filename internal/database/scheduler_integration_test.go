@@ -520,7 +520,7 @@ func TestScheduledExecutionLeaseFencingUsesLiveDatabaseTime(t *testing.T) {
 		}
 	})
 
-	t.Run("claim expiry starts after recovery lock wait", func(t *testing.T) {
+	t.Run("claim skips a locked stale recovery row", func(t *testing.T) {
 		store, ctx := schedulerIntegrationStore(t)
 		programID, _ := createSchedulerIntegrationProgram(t, ctx, store, "claim-lock-barrier")
 		staleSchedule := createIntegrationSchedule(t, ctx, store, programID, "claim-lock-stale")
@@ -547,7 +547,7 @@ func TestScheduledExecutionLeaseFencingUsesLiveDatabaseTime(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		claimCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		claimCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		type claimResult struct {
 			execution domain.ScheduledExecution
@@ -559,21 +559,11 @@ func TestScheduledExecutionLeaseFencingUsesLiveDatabaseTime(t *testing.T) {
 			execution, _, ok, err := store.ClaimPendingScheduledExecution(claimCtx, "live-claim-owner", 2*time.Second)
 			claimedResult <- claimResult{execution: execution, ok: ok, err: err}
 		}()
-		waitForPostgresLock(t, claimCtx, store, `%FOR UPDATE OF se%`)
-		select {
-		case <-time.After(1300 * time.Millisecond):
-		case <-claimCtx.Done():
-			t.Fatalf("claim lock wait timed out: %v", claimCtx.Err())
-		}
-		if err := lockTx.Commit(ctx); err != nil {
-			t.Fatal(err)
-		}
-		locked = false
 		var result claimResult
 		select {
 		case result = <-claimedResult:
 		case <-claimCtx.Done():
-			t.Fatalf("claim did not finish after lock release: %v", claimCtx.Err())
+			t.Fatalf("claim was blocked by an unrelated stale execution: %v", claimCtx.Err())
 		}
 		if result.err != nil || !result.ok {
 			t.Fatalf("claim after lock wait execution=%#v ok=%v err=%v", result.execution, result.ok, result.err)
@@ -583,8 +573,12 @@ func TestScheduledExecutionLeaseFencingUsesLiveDatabaseTime(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !hasFreshLease {
-			t.Fatal("claim expiry was based on transaction-start time instead of live database time")
+			t.Fatal("claim did not receive a fresh live-database-time lease")
 		}
+		if err := lockTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		locked = false
 	})
 }
 
@@ -635,7 +629,7 @@ func TestPreUpgradeNoLineageClaimIsNotRequeued(t *testing.T) {
 	if err := store.Pool.QueryRow(ctx, `SELECT status,recovery_protocol_version,error_summary FROM scheduled_executions WHERE id=$1`, execution.ID).Scan(&status, &protocol, &summary); err != nil {
 		t.Fatal(err)
 	}
-	if status != domain.ScheduledExecutionInterrupted || protocol != 0 || summary != "scheduler lease expired with ambiguous pre-upgrade lineage" {
+	if status != domain.ScheduledExecutionInterrupted || protocol != 0 || summary != "persisted scheduler lineage is incomplete or contradictory and requires manual review" {
 		t.Fatalf("legacy execution status=%s protocol=%d summary=%q", status, protocol, summary)
 	}
 }
