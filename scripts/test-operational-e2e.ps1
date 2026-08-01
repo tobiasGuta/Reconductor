@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [TimeSpan]$Timeout = [TimeSpan]::FromMinutes(8)
+    [TimeSpan]$Timeout = [TimeSpan]::FromMinutes(8),
+    [ValidateSet('Approval', 'Recovery', 'All')]
+    [string]$Suite = 'Approval'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +21,12 @@ if ($moduleLine -ne 'module github.com/tobiasGuta/Reconductor') {
 }
 if ($Timeout -le [TimeSpan]::Zero) {
     throw 'Timeout must be positive.'
+}
+$runPattern = switch ($Suite) {
+    'Approval' { '^TestApprovalLifecycle$' }
+    'Recovery' { '^TestRecoveryLifecycle$' }
+    'All' { '^(TestApprovalLifecycle|TestRecoveryLifecycle)$' }
+    default { throw "Unsupported operational suite: $Suite" }
 }
 
 $runId = [Guid]::NewGuid().ToString('N').Substring(0, 16).ToLowerInvariant()
@@ -45,7 +53,7 @@ try {
     Set-Location -LiteralPath $repositoryRoot
 
     $timeoutText = '{0}s' -f [Math]::Ceiling($Timeout.TotalSeconds)
-    & go test -tags=operational -count=1 -timeout $timeoutText -run '^TestApprovalLifecycle$' -v ./test/operational
+    & go test -tags=operational -count=1 -timeout $timeoutText -run $runPattern -v ./test/operational
     $exitCode = $LASTEXITCODE
 
     $preserveValue = [Environment]::GetEnvironmentVariable('RECONDUCTOR_E2E_PRESERVE_FAILURE', 'Process')
@@ -93,7 +101,15 @@ finally {
     }
 
     if (Get-Command docker -ErrorAction SilentlyContinue) {
-        foreach ($containerName in @($postgresName, $redisName)) {
+        $containerCleanupIntents = @(
+            [PSCustomObject]@{ Name = $postgresName; Path = (Join-Path $runRoot 'postgres.container.intent') },
+            [PSCustomObject]@{ Name = $redisName; Path = (Join-Path $runRoot 'redis.container.intent') }
+        )
+        foreach ($containerIntent in $containerCleanupIntents) {
+            if (-not (Test-Path -LiteralPath $containerIntent.Path -PathType Leaf)) {
+                continue
+            }
+            $containerName = $containerIntent.Name
             $ownershipOutput = & docker inspect $containerName 2>$null
             $inspectExit = $LASTEXITCODE
             if ($inspectExit -eq 0) {

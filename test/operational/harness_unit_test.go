@@ -3,10 +3,17 @@
 package operational
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/tobiasGuta/Reconductor/internal/domain"
 )
 
 func TestValidateTemporaryRootRequiresImmediateOwnedPrefix(t *testing.T) {
@@ -98,5 +105,150 @@ func TestOwnedContainerLabelsRequireExactRunIdentity(t *testing.T) {
 		if ownedContainerLabels(value, "run123") {
 			t.Fatalf("non-owned labels %q were accepted", value)
 		}
+	}
+}
+
+func TestSchedulerGenerationReadinessIsLogIsolated(t *testing.T) {
+	var log lockedBuffer
+	_, _ = log.Write([]byte("Reconductor scheduler ready\n"))
+	offset := log.Len()
+	if schedulerReadyFrom(&log, offset) {
+		t.Fatal("stale readiness output satisfied a later generation")
+	}
+	_, _ = log.Write([]byte("generation 2 starting\n"))
+	if schedulerReadyFrom(&log, offset) {
+		t.Fatal("non-readiness output satisfied generation readiness")
+	}
+	_, _ = log.Write([]byte("Reconductor scheduler ready\n"))
+	if !schedulerReadyFrom(&log, offset) {
+		t.Fatal("current generation readiness output was not detected")
+	}
+}
+
+type countingWaiter struct {
+	count   atomic.Int32
+	release <-chan struct{}
+	err     error
+}
+
+func (w *countingWaiter) Wait() error {
+	w.count.Add(1)
+	<-w.release
+	return w.err
+}
+
+func TestSchedulerGenerationWaitRunsExactlyOnce(t *testing.T) {
+	release := make(chan struct{})
+	waiter := &countingWaiter{release: release}
+	generation := newSchedulerGeneration(1, nil, "scheduler", 123, 0, time.Now())
+	generation.beginWait(waiter, nil)
+	generation.beginWait(waiter, nil)
+	close(release)
+	select {
+	case <-generation.Done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler generation wait did not finish")
+	}
+	if got := waiter.count.Load(); got != 1 {
+		t.Fatalf("Wait calls=%d want=1", got)
+	}
+}
+
+func TestSchedulerGenerationStopIsSafeWhenRepeated(t *testing.T) {
+	release := make(chan struct{})
+	waiter := &countingWaiter{release: release}
+	generation := newSchedulerGeneration(1, nil, "scheduler", 123, 0, time.Now())
+	generation.beginWait(waiter, nil)
+	var terminateCalls atomic.Int32
+	terminate := func(context.Context, int) error {
+		terminateCalls.Add(1)
+		close(release)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := generation.stop(ctx, terminate); err != nil {
+		t.Fatal(err)
+	}
+	if err := generation.stop(ctx, terminate); err != nil {
+		t.Fatal(err)
+	}
+	if got := terminateCalls.Load(); got != 1 {
+		t.Fatalf("terminate calls=%d want=1", got)
+	}
+	if got := waiter.count.Load(); got != 1 {
+		t.Fatalf("Wait calls=%d want=1", got)
+	}
+}
+
+func TestSchedulerGenerationOwnershipRequiresExactProcessAndExecutable(t *testing.T) {
+	expected := filepath.Join(t.TempDir(), "scheduler")
+	cmd := &exec.Cmd{Path: expected, Process: &os.Process{Pid: 123}}
+	generation := newSchedulerGeneration(1, cmd, expected, 123, 0, time.Now())
+	if !generation.ownsExecutable(expected) {
+		t.Fatal("exact owned scheduler process was rejected")
+	}
+	generation.Executable = filepath.Join(filepath.Dir(expected), "other")
+	if generation.ownsExecutable(expected) {
+		t.Fatal("mismatched scheduler executable was accepted")
+	}
+}
+
+func TestLineageSnapshotComparisonReportsIdentityAndIdempotencyChanges(t *testing.T) {
+	before := lineageSnapshot{
+		ScheduleID:              "schedule",
+		ExecutionID:             "execution",
+		TaskID:                  "task",
+		WorkflowRunID:           "run",
+		NucleiStepRunID:         "nuclei-step",
+		ApprovalID:              "approval",
+		ApprovalRequestID:       "nuclei-step",
+		ApprovalActionRequestID: "action",
+		ApprovalTaskID:          "task",
+		Steps: map[string]lineageStepSnapshot{
+			"probe-http": {ID: "probe", Status: domain.StepSucceeded, AttemptCount: 1, IdempotencyKey: "stable-key"},
+		},
+	}
+	after := before
+	after.Steps = map[string]lineageStepSnapshot{
+		"probe-http": {ID: "probe", Status: domain.StepSucceeded, AttemptCount: 1, IdempotencyKey: "stable-key"},
+	}
+	if diffs := before.stableDiff(after); len(diffs) != 0 {
+		t.Fatalf("equal lineage diff=%v", diffs)
+	}
+	after.ExecutionID = "different-execution"
+	step := after.Steps["probe-http"]
+	step.IdempotencyKey = "different-key"
+	after.Steps["probe-http"] = step
+	diffs := strings.Join(before.stableDiff(after), "\n")
+	for _, required := range []string{"execution ID changed", "idempotency key changed"} {
+		if !strings.Contains(diffs, required) {
+			t.Fatalf("lineage diff %q does not contain %q", diffs, required)
+		}
+	}
+}
+
+func TestPowerShellSuiteSelectorRejectsArbitraryValues(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PowerShell wrapper is Windows-only")
+	}
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		powershell, err = exec.LookPath("pwsh.exe")
+	}
+	if err != nil {
+		t.Skip("PowerShell is unavailable")
+	}
+	root, err := findRepositoryRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "test-operational-e2e.ps1")
+	output, err := exec.Command(powershell, "-NoProfile", "-File", script, "-Suite", "ArbitraryGoTestExpression").CombinedOutput()
+	if err == nil {
+		t.Fatalf("arbitrary suite selector was accepted:\n%s", output)
+	}
+	if !strings.Contains(string(output), "ValidateSet") && !strings.Contains(string(output), "valid values") {
+		t.Fatalf("unexpected suite validation failure:\n%s", output)
 	}
 }
