@@ -20,14 +20,15 @@ type Store interface {
 	ListSchedules(context.Context, domain.ID) ([]domain.Schedule, error)
 	MaterializeDueSchedule(context.Context, domain.ID, time.Time, time.Time) ([]domain.ScheduledExecution, error)
 	ClaimPendingScheduledExecution(context.Context, string, time.Duration) (domain.ScheduledExecution, domain.Schedule, bool, error)
-	HeartbeatScheduledExecution(context.Context, domain.ID, string, time.Duration) error
-	MarkScheduledExecutionRunning(context.Context, domain.ID, domain.ID, domain.ID, *domain.ID, string) error
-	MarkScheduledExecutionPaused(context.Context, domain.ID, string) error
-	MarkScheduledExecutionPausedForApproval(context.Context, domain.ID, string) error
-	MarkScheduledExecutionCompleted(context.Context, domain.ID, string) error
-	MarkScheduledExecutionFailed(context.Context, domain.ID, string, string, string) error
-	MarkScheduledExecutionCancelled(context.Context, domain.ID, string) error
-	MarkScheduledExecutionBlocked(context.Context, domain.ID, domain.ID, string) error
+	HeartbeatScheduledExecution(context.Context, domain.ID, string, int, time.Duration) error
+	MarkScheduledExecutionTaskCreated(context.Context, domain.ID, domain.ID, string, int) error
+	MarkScheduledExecutionRunning(context.Context, domain.ID, domain.ID, domain.ID, *domain.ID, string, int) error
+	MarkScheduledExecutionPaused(context.Context, domain.ID, string, int) error
+	MarkScheduledExecutionPausedForApproval(context.Context, domain.ID, string, int) error
+	MarkScheduledExecutionCompleted(context.Context, domain.ID, string, int) error
+	MarkScheduledExecutionFailed(context.Context, domain.ID, string, int, string, string) error
+	MarkScheduledExecutionCancelled(context.Context, domain.ID, string, int) error
+	MarkScheduledExecutionBlocked(context.Context, domain.ID, domain.ID, string, int) error
 }
 
 type Service struct {
@@ -121,7 +122,7 @@ func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, s
 		for {
 			select {
 			case <-ticker.C:
-				_ = s.Store.HeartbeatScheduledExecution(context.WithoutCancel(ctx), exec.ID, s.Owner, s.Config.LeaseTimeout)
+				_ = s.Store.HeartbeatScheduledExecution(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount, s.Config.LeaseTimeout)
 			case <-stopHeartbeat:
 				return
 			case <-ctx.Done():
@@ -138,7 +139,7 @@ func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, s
 		RequestedBy:       exec.TriggerSource,
 		ScheduleReference: stringPtr(string(schedule.ID)),
 		Headless:          schedule.Headless,
-		Lifecycle:         scheduledExecutionLifecycle{Store: s.Store, ExecutionID: exec.ID, Owner: s.Owner},
+		Lifecycle:         scheduledExecutionLifecycle{Store: s.Store, ExecutionID: exec.ID, Owner: s.Owner, Attempt: exec.AttemptCount},
 	}
 	if exec.TaskID != nil {
 		request.ExistingTaskID = *exec.TaskID
@@ -148,32 +149,32 @@ func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, s
 	}
 	result, err := s.Orchestrator.Run(runCtx, request)
 	if errors.Is(err, orchestration.ErrScopeExpansion) {
-		return s.Store.MarkScheduledExecutionBlocked(context.WithoutCancel(ctx), exec.ID, result.ScopeChange.ScopeVersionID, s.Owner)
+		return s.Store.MarkScheduledExecutionBlocked(context.WithoutCancel(ctx), exec.ID, result.ScopeChange.ScopeVersionID, s.Owner, exec.AttemptCount)
 	}
 	if result.State != nil && result.State.Run.Status == domain.RunCancelled {
-		return s.Store.MarkScheduledExecutionCancelled(context.WithoutCancel(ctx), exec.ID, s.Owner)
+		return s.Store.MarkScheduledExecutionCancelled(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount)
 	}
 	if errors.Is(err, context.Canceled) {
-		return s.Store.MarkScheduledExecutionCancelled(context.WithoutCancel(ctx), exec.ID, s.Owner)
+		return s.Store.MarkScheduledExecutionCancelled(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount)
 	}
 	if err != nil {
-		return s.Store.MarkScheduledExecutionFailed(context.WithoutCancel(ctx), exec.ID, s.Owner, "execution", err.Error())
+		return s.Store.MarkScheduledExecutionFailed(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount, "execution", err.Error())
 	}
 	if result.State == nil {
-		return s.Store.MarkScheduledExecutionFailed(context.WithoutCancel(ctx), exec.ID, s.Owner, "execution", "workflow did not return state")
+		return s.Store.MarkScheduledExecutionFailed(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount, "execution", "workflow did not return state")
 	}
 	switch result.State.Run.Status {
 	case domain.RunCompleted:
-		return s.Store.MarkScheduledExecutionCompleted(context.WithoutCancel(ctx), exec.ID, s.Owner)
+		return s.Store.MarkScheduledExecutionCompleted(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount)
 	case domain.RunPaused:
 		if runAwaitingApproval(result.State) {
-			return s.Store.MarkScheduledExecutionPausedForApproval(context.WithoutCancel(ctx), exec.ID, s.Owner)
+			return s.Store.MarkScheduledExecutionPausedForApproval(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount)
 		}
-		return s.Store.MarkScheduledExecutionPaused(context.WithoutCancel(ctx), exec.ID, s.Owner)
+		return s.Store.MarkScheduledExecutionPaused(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount)
 	case domain.RunCancelled:
-		return s.Store.MarkScheduledExecutionCancelled(context.WithoutCancel(ctx), exec.ID, s.Owner)
+		return s.Store.MarkScheduledExecutionCancelled(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount)
 	default:
-		return s.Store.MarkScheduledExecutionFailed(context.WithoutCancel(ctx), exec.ID, s.Owner, "execution", fmt.Sprintf("workflow ended as %s", result.State.Run.Status))
+		return s.Store.MarkScheduledExecutionFailed(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount, "execution", fmt.Sprintf("workflow ended as %s", result.State.Run.Status))
 	}
 }
 
@@ -181,6 +182,11 @@ type scheduledExecutionLifecycle struct {
 	Store       Store
 	ExecutionID domain.ID
 	Owner       string
+	Attempt     int
+}
+
+func (l scheduledExecutionLifecycle) TaskCreated(ctx context.Context, task domain.Task) error {
+	return l.Store.MarkScheduledExecutionTaskCreated(ctx, l.ExecutionID, task.ID, l.Owner, l.Attempt)
 }
 
 func (l scheduledExecutionLifecycle) WorkflowCreated(ctx context.Context, task domain.Task, run domain.WorkflowRun, scopeVersionID domain.ID) error {
@@ -188,7 +194,7 @@ func (l scheduledExecutionLifecycle) WorkflowCreated(ctx context.Context, task d
 	if scopeVersionID != "" {
 		scopeVersion = &scopeVersionID
 	}
-	return l.Store.MarkScheduledExecutionRunning(ctx, l.ExecutionID, task.ID, run.ID, scopeVersion, l.Owner)
+	return l.Store.MarkScheduledExecutionRunning(ctx, l.ExecutionID, task.ID, run.ID, scopeVersion, l.Owner, l.Attempt)
 }
 
 func runAwaitingApproval(state *workflow.State) bool {

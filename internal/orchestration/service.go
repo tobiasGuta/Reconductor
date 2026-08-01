@@ -26,6 +26,7 @@ import (
 var ErrScopeExpansion = errors.New("scope change expands authorization")
 
 type Lifecycle interface {
+	TaskCreated(context.Context, domain.Task) error
 	WorkflowCreated(context.Context, domain.Task, domain.WorkflowRun, domain.ID) error
 }
 
@@ -176,7 +177,13 @@ func (s Service) resolveTask(ctx context.Context, req WorkflowRequest, def workf
 		objective = "continuous authorized web reconnaissance"
 	}
 	task = domain.Task{ID: domain.NewID(), ProgramID: req.ProgramID, Objective: objective, WorkflowDefinitionID: def.ID, Status: domain.TaskRunning, RequestedBy: req.RequestedBy, ScheduleReference: req.ScheduleReference, CreatedAt: now, UpdatedAt: now}
-	if err := s.Store.CreateTask(ctx, task); err != nil {
+	if req.Lifecycle == nil {
+		if err := s.Store.CreateTask(ctx, task); err != nil {
+			return domain.Task{}, err
+		}
+		return task, nil
+	}
+	if err := s.Store.CreateTaskWithLifecycle(ctx, task, req.Lifecycle.TaskCreated); err != nil {
 		return domain.Task{}, err
 	}
 	return task, nil

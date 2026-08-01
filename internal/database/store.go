@@ -303,6 +303,14 @@ func (s *Store) WorkflowDefinitionID(ctx context.Context, name, version string) 
 	return id, err
 }
 func (s *Store) CreateTask(ctx context.Context, t domain.Task) error {
+	return s.createTask(ctx, t, nil)
+}
+
+func (s *Store) CreateTaskWithLifecycle(ctx context.Context, t domain.Task, lifecycle func(context.Context, domain.Task) error) error {
+	return s.createTask(ctx, t, lifecycle)
+}
+
+func (s *Store) createTask(ctx context.Context, t domain.Task, lifecycle func(context.Context, domain.Task) error) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -313,6 +321,11 @@ func (s *Store) CreateTask(ctx context.Context, t domain.Task) error {
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,safe_message,details) VALUES($1,'task_created','platform',$2,$3,'task created',$4)`, domain.NewID(), t.RequestedBy, t.ID, mustJSON(t)); err != nil {
 		return err
+	}
+	if lifecycle != nil {
+		if err := lifecycle(contextWithTransaction(ctx, tx), t); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }
