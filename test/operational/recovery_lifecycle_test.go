@@ -4,8 +4,11 @@ package operational
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,7 +102,7 @@ func TestRecoveryLifecycle(t *testing.T) {
 	recovery.execution = h.waitExecution(recovery.schedule.ID, recovery.execution.ID, domain.ScheduledExecutionCompleted)
 	recovery.state = h.waitWorkflowState(*recovery.execution.WorkflowRunID, domain.RunCompleted)
 	completed := h.captureLineage(recovery)
-	h.assertStableLineage("completed resumed execution", pending, completed)
+	h.assertStableLineage("completed resumed execution", pending, completed, "enrich-recon-brief")
 	h.assertPriorSucceededStepsUnchanged("completed resumed execution", pending, completed)
 	h.assertCompletedRecoverySnapshot(pending, completed)
 	h.assertApprovedCompletion(recovery)
@@ -118,6 +121,12 @@ func (h *harness) assertPausedRecoverySnapshot(name string, snapshot lineageSnap
 	}
 	if snapshot.ApprovalDecision != approvalDecision {
 		h.t.Fatalf("%s approval=%s want=%s", name, snapshot.ApprovalDecision, approvalDecision)
+	}
+	if snapshot.ApprovalCount != 1 {
+		h.t.Fatalf("%s approval records=%d want=1", name, snapshot.ApprovalCount)
+	}
+	if snapshot.ExecutionAttemptCount != 1 || snapshot.ClaimAuditCount != 1 || snapshot.ResumeAuditCount != 0 {
+		h.t.Fatalf("%s execution attempts=%d claim audits=%d resume audits=%d, want 1/1/0", name, snapshot.ExecutionAttemptCount, snapshot.ClaimAuditCount, snapshot.ResumeAuditCount)
 	}
 	nuclei := snapshot.Steps["run-safe-nuclei-profile"]
 	if nuclei.ID == "" || nuclei.ID != snapshot.NucleiStepRunID || nuclei.Status != domain.StepAwaitingApproval || nuclei.IdempotencyKey == "" {
@@ -172,6 +181,9 @@ func (h *harness) assertCompletedRecoverySnapshot(before, completed lineageSnaps
 	if completed.ToolRunCounts["run-safe-nuclei-profile"] != before.ToolRunCounts["run-safe-nuclei-profile"]+1 {
 		h.t.Fatalf("completed recovery Nuclei tool runs=%d want=%d", completed.ToolRunCounts["run-safe-nuclei-profile"], before.ToolRunCounts["run-safe-nuclei-profile"]+1)
 	}
+	if diffs := recoveryToolRunDiff(before.ToolRunCounts, completed.ToolRunCounts); len(diffs) != 0 {
+		h.t.Fatalf("completed recovery tool-run counts changed unexpectedly:\n%s", strings.Join(diffs, "\n"))
+	}
 	if completed.Fixture.Total != before.Fixture.Total+1 || completed.Fixture.Nuclei != before.Fixture.Nuclei+1 {
 		h.t.Fatalf("completed recovery fixture before=%#v after=%#v, want exactly one Nuclei request", before.Fixture, completed.Fixture)
 	}
@@ -184,10 +196,12 @@ func (h *harness) assertCompletedRecoverySnapshot(before, completed lineageSnaps
 	if completed.ApprovalDecision != "approved" {
 		h.t.Fatalf("completed recovery approval=%s want=approved", completed.ApprovalDecision)
 	}
-	for id, step := range completed.Steps {
-		if step.Status == domain.StepRunning {
-			h.t.Fatalf("completed recovery left step %s running: %#v", id, step)
-		}
+	enrich := completed.Steps["enrich-recon-brief"]
+	if enrich.ID == "" || enrich.Capability != "report.changes" || enrich.Status != domain.StepSucceeded || enrich.AttemptCount != 1 || enrich.IdempotencyKey == "" {
+		h.t.Fatalf("completed recovery enrich step=%#v", enrich)
+	}
+	if diffs := terminalStepDiff(completed.Steps); len(diffs) != 0 {
+		h.t.Fatalf("completed recovery retained nonterminal steps:\n%s", strings.Join(diffs, "\n"))
 	}
 	if completed.LeaseOwner != "" || completed.LeaseExpiresAt != nil {
 		h.t.Fatalf("completed recovery retained lease owner=%q expiry=%v", completed.LeaseOwner, completed.LeaseExpiresAt)
@@ -195,4 +209,32 @@ func (h *harness) assertCompletedRecoverySnapshot(before, completed lineageSnaps
 	if violation := h.fixture.Violation(); violation != "" {
 		h.t.Fatalf("completed recovery observed non-loopback traffic: %s", violation)
 	}
+}
+
+func recoveryToolRunDiff(before, completed map[string]int) []string {
+	expected := make(map[string]int, len(before)+2)
+	for id, count := range before {
+		expected[id] = count
+	}
+	expected["run-safe-nuclei-profile"]++
+	expected["enrich-recon-brief"]++
+	var diffs []string
+	appendValueDiff(&diffs, "tool-run counts", expected, completed)
+	return diffs
+}
+
+func terminalStepDiff(steps map[string]lineageStepSnapshot) []string {
+	ids := make([]string, 0, len(steps))
+	for id := range steps {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var diffs []string
+	for _, id := range ids {
+		status := steps[id].Status
+		if status != domain.StepSucceeded && status != domain.StepSkipped {
+			diffs = append(diffs, fmt.Sprintf("step %s status=%s", id, status))
+		}
+	}
+	return diffs
 }

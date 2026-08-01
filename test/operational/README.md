@@ -20,6 +20,10 @@ build tag.
   executables on `PATH`, or configured with their normal `*_EXECUTABLE`
   variables.
 
+The tagged process-lifecycle harness supports Windows and Linux. Other
+operating systems fail closed with a preflight skip before infrastructure or
+provider work begins.
+
 The harness never pulls images. Provision them explicitly, outside the test,
 if required:
 
@@ -73,9 +77,10 @@ execution to verify:
    invokes the approved isolated Nuclei action exactly once.
 
 The scheduler log is append-only. Each process generation has an independent
-readiness offset, owned PID, completion channel, start time, and exit result.
-Restart termination targets that PID and its descendants, never an executable
-name.
+readiness offset, completion channel, exit result, and atomic JSON PID record.
+Restart termination requires the recorded PID, executable path, and process
+creation identity to match the live process before targeting that process and
+its descendants; it never terminates by executable name alone.
 
 Active-provider crashes are intentionally excluded. Under the current
 production contract, a stale claimed or running execution with workflow
@@ -138,9 +143,11 @@ $env:RECONDUCTOR_E2E_PRESERVE_FAILURE = 'true'
 Remove-Item Env:RECONDUCTOR_E2E_PRESERVE_FAILURE
 ```
 
-Containers and scheduler processes are still stopped when diagnostics are
-preserved. Successful runs and failures without this explicit flag remove the
-temporary root.
+Scheduler and container cleanup is still attempted when diagnostics are
+preserved. Any cleanup failure fails the wrapper, is reported, and leaves the
+temporary root available for investigation. Unless preservation is requested
+for a failed run, the wrapper attempts to remove the temporary root after
+owned-resource cleanup.
 
 Cleanup releases test resources in dependency order: the current scheduler
 generation and its owned descendants are stopped and awaited, the store and
