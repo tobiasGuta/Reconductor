@@ -26,6 +26,7 @@ import (
 var ErrScopeExpansion = errors.New("scope change expands authorization")
 
 type Lifecycle interface {
+	TaskCreated(context.Context, domain.Task) error
 	WorkflowCreated(context.Context, domain.Task, domain.WorkflowRun, domain.ID) error
 }
 
@@ -140,7 +141,7 @@ func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, 
 	defer stopWatching()
 	go WatchTaskControls(watchCtx, s.Store, task.ID, controls)
 	state, runErr := engine.Run(ctx, def, state, task, controls)
-	if state != nil {
+	if state != nil && !database.IsScheduledExecutionFenceError(runErr) {
 		status := map[domain.RunStatus]domain.TaskStatus{domain.RunCompleted: domain.TaskCompleted, domain.RunPaused: domain.TaskPaused, domain.RunFailed: domain.TaskFailed, domain.RunCancelled: domain.TaskCancelled}[state.Run.Status]
 		if status != "" {
 			_ = s.Store.SetTaskStatusFromWorkflow(context.WithoutCancel(ctx), task.ID, status)
@@ -176,7 +177,13 @@ func (s Service) resolveTask(ctx context.Context, req WorkflowRequest, def workf
 		objective = "continuous authorized web reconnaissance"
 	}
 	task = domain.Task{ID: domain.NewID(), ProgramID: req.ProgramID, Objective: objective, WorkflowDefinitionID: def.ID, Status: domain.TaskRunning, RequestedBy: req.RequestedBy, ScheduleReference: req.ScheduleReference, CreatedAt: now, UpdatedAt: now}
-	if err := s.Store.CreateTask(ctx, task); err != nil {
+	if req.Lifecycle == nil {
+		if err := s.Store.CreateTask(ctx, task); err != nil {
+			return domain.Task{}, err
+		}
+		return task, nil
+	}
+	if err := s.Store.CreateTaskWithLifecycle(ctx, task, req.Lifecycle.TaskCreated); err != nil {
 		return domain.Task{}, err
 	}
 	return task, nil
