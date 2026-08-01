@@ -114,6 +114,7 @@ func (s *Service) Dispatch(ctx context.Context) error {
 
 func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, schedule domain.Schedule) error {
 	runCtx, cancel := context.WithCancel(ctx)
+	runCtx = database.WithScheduledExecutionFence(runCtx, database.ScheduledExecutionFence{ExecutionID: exec.ID, LeaseOwner: s.Owner, Attempt: exec.AttemptCount})
 	defer cancel()
 	stopHeartbeat := make(chan struct{})
 	go func() {
@@ -148,6 +149,9 @@ func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, s
 		request.ResumeRunID = *exec.WorkflowRunID
 	}
 	result, err := s.Orchestrator.Run(runCtx, request)
+	if database.IsScheduledExecutionFenceError(err) {
+		return err
+	}
 	if errors.Is(err, orchestration.ErrScopeExpansion) {
 		return s.Store.MarkScheduledExecutionBlocked(context.WithoutCancel(ctx), exec.ID, result.ScopeChange.ScopeVersionID, s.Owner, exec.AttemptCount)
 	}

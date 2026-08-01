@@ -819,7 +819,8 @@ func createRecoveryFixture(t *testing.T, env recoveryTestEnvironment, name strin
 			}
 			state.Steps[spec.name] = &workflow.StepState{Run: domain.StepRun{ID: stepID, WorkflowRunID: fixture.runID, StepDefinitionID: spec.name, Capability: "test." + spec.name, Status: spec.status, AttemptCount: spec.attemptCount, Input: json.RawMessage(`{"input":"preserved"}`), Output: spec.output, StartedAt: startedAt, CompletedAt: stepCompletedAt, IdempotencyKey: name + "-" + spec.name, ApprovalState: approvalState}}
 		}
-		if err := env.store.saveWorkflowState(env.ctx, state, func(lifecycleCtx context.Context, state *workflow.State) error {
+		fencedCtx := WithScheduledExecutionFence(env.ctx, ScheduledExecutionFence{ExecutionID: execution.ID, LeaseOwner: name + "-owner", Attempt: execution.AttemptCount})
+		if err := env.store.saveWorkflowState(fencedCtx, state, func(lifecycleCtx context.Context, state *workflow.State) error {
 			return env.store.MarkScheduledExecutionRunning(lifecycleCtx, execution.ID, task.ID, state.Run.ID, nil, name+"-owner", execution.AttemptCount)
 		}); err != nil {
 			t.Fatal(err)

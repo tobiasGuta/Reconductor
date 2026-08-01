@@ -47,6 +47,9 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 		t.Fatalf("claim = %#v ok=%v err=%v", claimed, ok, err)
 	}
 	task := createIntegrationTask(t, ctx, store, programID, definitionID, "primary")
+	if err := store.MarkScheduledExecutionTaskCreated(ctx, execution.ID, task.ID, "owner-a", claimed.AttemptCount); err != nil {
+		t.Fatal(err)
+	}
 	runID := domain.NewID()
 	state := &workflow.State{
 		Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)},
@@ -59,7 +62,7 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 			return store.MarkScheduledExecutionRunning(lifecycleCtx, execution.ID, task.ID, state.Run.ID, nil, "owner-a", claimed.AttemptCount)
 		},
 	}
-	if err := persister.Save(ctx, state); err != nil {
+	if err := persister.Save(WithScheduledExecutionFence(ctx, ScheduledExecutionFence{ExecutionID: execution.ID, LeaseOwner: "owner-a", Attempt: claimed.AttemptCount}), state); err != nil {
 		t.Fatal(err)
 	}
 	var status domain.ScheduledExecutionStatus
@@ -100,6 +103,9 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 	rejectedSchedule := createIntegrationSchedule(t, ctx, store, programID, "rejected")
 	rejectedExecution := enqueueAndClaim(t, ctx, store, rejectedSchedule.ID, "owner-b", time.Minute)
 	rejectedTask := createIntegrationTask(t, ctx, store, programID, definitionID, "rejected")
+	if err := store.MarkScheduledExecutionTaskCreated(ctx, rejectedExecution.ID, rejectedTask.ID, "owner-b", rejectedExecution.AttemptCount); err != nil {
+		t.Fatal(err)
+	}
 	rejectedRunID, rejectedStepID := domain.NewID(), domain.NewID()
 	rejectedState := &workflow.State{
 		Run:   domain.WorkflowRun{ID: rejectedRunID, TaskID: rejectedTask.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunPaused, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)},
@@ -108,7 +114,7 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 	rejectedPersister := WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		return store.MarkScheduledExecutionRunning(lifecycleCtx, rejectedExecution.ID, rejectedTask.ID, state.Run.ID, nil, "owner-b", rejectedExecution.AttemptCount)
 	}}
-	if err := rejectedPersister.Save(ctx, rejectedState); err != nil {
+	if err := rejectedPersister.Save(WithScheduledExecutionFence(ctx, ScheduledExecutionFence{ExecutionID: rejectedExecution.ID, LeaseOwner: "owner-b", Attempt: rejectedExecution.AttemptCount}), rejectedState); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MarkScheduledExecutionPausedForApproval(ctx, rejectedExecution.ID, "owner-b", rejectedExecution.AttemptCount); err != nil {
@@ -297,6 +303,9 @@ func TestWorkflowLifecycleRollbackIsAtomic(t *testing.T) {
 	schedule := createIntegrationSchedule(t, ctx, store, programID, "atomic")
 	execution := enqueueAndClaim(t, ctx, store, schedule.ID, "atomic-owner", time.Minute)
 	task := createIntegrationTask(t, ctx, store, programID, definitionID, "atomic")
+	if err := store.MarkScheduledExecutionTaskCreated(ctx, execution.ID, task.ID, "atomic-owner", execution.AttemptCount); err != nil {
+		t.Fatal(err)
+	}
 	runID := domain.NewID()
 	state := &workflow.State{Run: domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{}}
 	persister := WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
@@ -305,7 +314,7 @@ func TestWorkflowLifecycleRollbackIsAtomic(t *testing.T) {
 		}
 		return errors.New("synthetic lifecycle failure")
 	}}
-	if err := persister.Save(ctx, state); err == nil {
+	if err := persister.Save(WithScheduledExecutionFence(ctx, ScheduledExecutionFence{ExecutionID: execution.ID, LeaseOwner: "atomic-owner", Attempt: execution.AttemptCount}), state); err == nil {
 		t.Fatal("expected lifecycle failure")
 	}
 	var taskID, workflowRunID *domain.ID
@@ -313,7 +322,7 @@ func TestWorkflowLifecycleRollbackIsAtomic(t *testing.T) {
 	if err := store.Pool.QueryRow(ctx, `SELECT status,task_id,workflow_run_id FROM scheduled_executions WHERE id=$1`, execution.ID).Scan(&status, &taskID, &workflowRunID); err != nil {
 		t.Fatal(err)
 	}
-	if status != domain.ScheduledExecutionClaimed || taskID != nil || workflowRunID != nil {
+	if status != domain.ScheduledExecutionClaimed || taskID == nil || *taskID != task.ID || workflowRunID != nil {
 		t.Fatalf("lineage transaction partially committed: status=%s task=%v run=%v", status, taskID, workflowRunID)
 	}
 	var runCount int
@@ -879,7 +888,7 @@ func TestApprovalAcceptanceStillRequiresExplicitResume(t *testing.T) {
 	persister := WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		return store.MarkScheduledExecutionRunning(lifecycleCtx, execution.ID, task.ID, state.Run.ID, nil, "approval-owner", execution.AttemptCount)
 	}}
-	if err := persister.Save(ctx, state); err != nil {
+	if err := persister.Save(WithScheduledExecutionFence(ctx, ScheduledExecutionFence{ExecutionID: execution.ID, LeaseOwner: "approval-owner", Attempt: execution.AttemptCount}), state); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MarkScheduledExecutionPausedForApproval(ctx, execution.ID, "approval-owner", execution.AttemptCount); err != nil {
@@ -936,7 +945,7 @@ func TestApprovalAcceptanceStillRequiresExplicitResume(t *testing.T) {
 	resumedPersister := WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		return store.MarkScheduledExecutionRunning(lifecycleCtx, resumed.ID, task.ID, state.Run.ID, nil, "approval-resume-owner", resumed.AttemptCount)
 	}}
-	if err := resumedPersister.Save(ctx, state); err != nil {
+	if err := resumedPersister.Save(WithScheduledExecutionFence(ctx, ScheduledExecutionFence{ExecutionID: resumed.ID, LeaseOwner: "approval-resume-owner", Attempt: resumed.AttemptCount}), state); err != nil {
 		t.Fatalf("save resumed workflow lineage: %v", err)
 	}
 	if err := store.Pool.QueryRow(ctx, `SELECT status,task_id,workflow_run_id FROM scheduled_executions WHERE id=$1`, resumed.ID).Scan(&status, &persistedTaskID, &persistedRunID); err != nil {
@@ -1094,8 +1103,12 @@ func enqueueAndClaim(t *testing.T, ctx context.Context, store *Store, scheduleID
 }
 
 func saveIntegrationRun(ctx context.Context, store *Store, root string, executionID domain.ID, task domain.Task, definitionID, runID domain.ID, owner string, attempt int, now time.Time) error {
+	if err := store.MarkScheduledExecutionTaskCreated(ctx, executionID, task.ID, owner, attempt); err != nil {
+		return err
+	}
 	state := &workflow.State{Run: domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{}}
+	fencedCtx := WithScheduledExecutionFence(ctx, ScheduledExecutionFence{ExecutionID: executionID, LeaseOwner: owner, Attempt: attempt})
 	return (WorkflowPersister{Store: store, File: workflow.FileStore{Root: root}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		return store.MarkScheduledExecutionRunning(lifecycleCtx, executionID, task.ID, state.Run.ID, nil, owner, attempt)
-	}}).Save(ctx, state)
+	}}).Save(fencedCtx, state)
 }

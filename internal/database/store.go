@@ -720,21 +720,43 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 		return err
 	}
 	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx, `UPDATE step_runs SET status=$2,output=$3,error_classification=$4,error_details=$5,completed_at=$6 WHERE id=$1`, step.ID, step.Status, step.Output, step.ErrorClassification, step.ErrorDetails, step.CompletedAt)
+	lineage, err := lockResultLineage(ctx, tx, programID, step)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("step run %s does not exist", step.ID)
+	switch step.Status {
+	case domain.StepSucceeded, domain.StepFailed, domain.StepRetryable:
+	default:
+		return resultConflict(lineage.scheduled, "result status is not persistable")
 	}
 	if tool != nil {
-		_, err = tx.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,completed_at,exit_code,timed_out,stdout_artifact_id,stderr_artifact_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(id) DO NOTHING`, tool.ID, tool.StepRunID, tool.Capability, tool.Provider, tool.ToolVersion, tool.SanitizedArguments, tool.ExecutionEnvironment, tool.StartedAt, tool.CompletedAt, tool.ExitCode, tool.TimedOut, tool.StdoutArtifactID, tool.StderrArtifactID)
+		if tool.ID == "" || tool.StepRunID != step.ID || tool.Capability != step.Capability {
+			return resultConflict(lineage.scheduled, "tool lineage does not match result step")
+		}
+	}
+	if err := lockConflictingResultTools(ctx, tx, step.ID, tool, lineage.scheduled); err != nil {
+		return err
+	}
+	if err := lockAndValidateResultArtifacts(ctx, tx, lineage, step, tool, artifacts); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE step_runs
+		SET status=$2,output=$3,error_classification=$4,error_details=$5,completed_at=$6
+		WHERE id=$1 AND workflow_run_id=$7 AND idempotency_key=$8 AND status='running'`, step.ID, step.Status, step.Output, step.ErrorClassification, step.ErrorDetails, step.CompletedAt, step.WorkflowRunID, step.IdempotencyKey)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return resultConflict(lineage.scheduled, "step changed before result persistence")
+	}
+	if tool != nil {
+		_, err = tx.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,completed_at,exit_code,timed_out,stdout_artifact_id,stderr_artifact_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, tool.ID, tool.StepRunID, tool.Capability, tool.Provider, tool.ToolVersion, tool.SanitizedArguments, tool.ExecutionEnvironment, tool.StartedAt, tool.CompletedAt, tool.ExitCode, tool.TimedOut, tool.StdoutArtifactID, tool.StderrArtifactID)
 		if err != nil {
 			return err
 		}
 	}
 	for _, a := range artifacts {
-		_, err = tx.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`, a.ID, a.TaskID, a.WorkflowRunID, a.StepRunID, a.ToolRunID, a.Type, a.ContentType, a.Size, a.SHA256, a.StorageLocation, a.CreatedAt, a.ExpiresAt, a.RedactionState, a.Sensitive)
+		_, err = tx.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, a.ID, a.TaskID, a.WorkflowRunID, a.StepRunID, a.ToolRunID, a.Type, a.ContentType, a.Size, a.SHA256, a.StorageLocation, a.CreatedAt, a.ExpiresAt, a.RedactionState, a.Sensitive)
 		if err != nil {
 			return err
 		}
@@ -1154,6 +1176,9 @@ func (s *Store) saveWorkflowState(ctx context.Context, state *workflow.State, li
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockAndValidateWorkflowSave(ctx, tx, state, lifecycle != nil); err != nil {
+		return err
+	}
 	r := state.Run
 	_, err = tx.Exec(ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,previous_run_id,trigger_source,summary) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO UPDATE SET status=EXCLUDED.status,started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,summary=EXCLUDED.summary`, r.ID, r.TaskID, r.WorkflowDefinitionID, r.WorkflowVersion, r.Status, r.StartedAt, r.CompletedAt, r.PreviousRunID, r.TriggerSource, r.Summary)
 	if err != nil {

@@ -141,7 +141,7 @@ func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, 
 	defer stopWatching()
 	go WatchTaskControls(watchCtx, s.Store, task.ID, controls)
 	state, runErr := engine.Run(ctx, def, state, task, controls)
-	if state != nil {
+	if state != nil && !database.IsScheduledExecutionFenceError(runErr) {
 		status := map[domain.RunStatus]domain.TaskStatus{domain.RunCompleted: domain.TaskCompleted, domain.RunPaused: domain.TaskPaused, domain.RunFailed: domain.TaskFailed, domain.RunCancelled: domain.TaskCancelled}[state.Run.Status]
 		if status != "" {
 			_ = s.Store.SetTaskStatusFromWorkflow(context.WithoutCancel(ctx), task.ID, status)
