@@ -16,7 +16,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,9 +69,11 @@ type harness struct {
 	guard     string
 	env       []string
 
-	schedulerCmd *exec.Cmd
-	schedulerLog *lockedBuffer
-	store        *database.Store
+	schedulerLog         *lockedBuffer
+	schedulerGeneration  int
+	currentScheduler     *schedulerGeneration
+	schedulerCleanupOnce sync.Once
+	store                *database.Store
 }
 
 type scenario struct {
@@ -81,6 +85,44 @@ type scenario struct {
 	approval  database.ApprovalListItem
 }
 
+type schedulerProcessWaiter interface {
+	Wait() error
+}
+
+var errSchedulerProcessExited = errors.New("scheduler process exited before termination")
+
+type schedulerProcessIdentity struct {
+	PID        int
+	Executable string
+	Token      string
+	StartedAt  time.Time
+}
+
+type schedulerPIDRecord struct {
+	PID        int       `json:"pid"`
+	Generation int       `json:"generation"`
+	Executable string    `json:"executable"`
+	Identity   string    `json:"identity"`
+	StartedAt  time.Time `json:"started_at"`
+}
+
+type schedulerGeneration struct {
+	Number     int
+	Command    *exec.Cmd
+	PID        int
+	Executable string
+	Identity   string
+	LogOffset  int
+	StartedAt  time.Time
+	Done       chan struct{}
+
+	waitOnce             sync.Once
+	stopMu               sync.Mutex
+	mu                   sync.RWMutex
+	exitErr              error
+	terminationSucceeded bool
+}
+
 type guardLogEntry struct {
 	Kind          string   `json:"kind"`
 	Accepted      bool     `json:"accepted"`
@@ -88,6 +130,54 @@ type guardLogEntry struct {
 	DelegatedArgs []string `json:"delegated_args"`
 	Targets       []string `json:"targets"`
 	TemplatePaths []string `json:"template_paths"`
+}
+
+type guardInvocationCounts struct {
+	Version    int
+	Validation int
+	Scan       int
+	Rejected   int
+}
+
+type fixtureRequestCounts struct {
+	Total  int64
+	Nuclei int64
+}
+
+type lineageStepSnapshot struct {
+	ID             domain.ID
+	Capability     string
+	Status         domain.StepStatus
+	AttemptCount   int
+	IdempotencyKey string
+	ApprovalState  string
+}
+
+type lineageSnapshot struct {
+	ScheduleID              domain.ID
+	ExecutionID             domain.ID
+	TaskID                  domain.ID
+	WorkflowRunID           domain.ID
+	NucleiStepRunID         domain.ID
+	ApprovalID              domain.ID
+	ApprovalRequestID       domain.ID
+	ApprovalActionRequestID domain.ID
+	ApprovalTaskID          domain.ID
+	ApprovalDecision        string
+	ExecutionStatus         domain.ScheduledExecutionStatus
+	ExecutionAttemptCount   int
+	TriggerSource           string
+	LeaseOwner              string
+	LeaseExpiresAt          *time.Time
+	TaskStatus              domain.TaskStatus
+	WorkflowStatus          domain.RunStatus
+	Steps                   map[string]lineageStepSnapshot
+	ToolRunCounts           map[string]int
+	Fixture                 fixtureRequestCounts
+	Guard                   guardInvocationCounts
+	ApprovalCount           int
+	ClaimAuditCount         int
+	ResumeAuditCount        int
 }
 
 func newHarness(t *testing.T, ctx context.Context) *harness {
@@ -123,6 +213,9 @@ func newHarness(t *testing.T, ctx context.Context) *harness {
 
 func (h *harness) preflight() {
 	h.t.Helper()
+	if err := ownedSchedulerPlatformSupported(); err != nil {
+		h.t.Skipf("operational E2E skipped: %v", err)
+	}
 	if _, err := exec.LookPath("go"); err != nil {
 		h.t.Skip("operational E2E skipped: Go executable is unavailable")
 	}
@@ -228,6 +321,7 @@ func (h *harness) startInfrastructure() {
 
 func (h *harness) startPostgres() {
 	h.t.Helper()
+	h.writeContainerIntent("postgres", h.postgresName)
 	args := []string{
 		"run", "-d", "--rm", "--pull=never",
 		"--name", h.postgresName,
@@ -262,6 +356,7 @@ func (h *harness) startPostgres() {
 
 func (h *harness) startRedis() {
 	h.t.Helper()
+	h.writeContainerIntent("redis", h.redisName)
 	args := []string{
 		"run", "-d", "--rm", "--pull=never",
 		"--name", h.redisName,
@@ -285,6 +380,16 @@ func (h *harness) startRedis() {
 	})
 	h.waitContainerReady(h.redisName, "PONG", "redis-cli", "-a", h.redisPass, "ping")
 	h.redisAddr = h.containerPort(h.redisName, "6379/tcp")
+}
+
+func (h *harness) writeContainerIntent(kind, name string) {
+	h.t.Helper()
+	if kind != "postgres" && kind != "redis" {
+		h.t.Fatalf("unsupported container intent kind %q", kind)
+	}
+	if err := os.WriteFile(filepath.Join(h.root, kind+".container.intent"), []byte(name), 0o600); err != nil {
+		h.t.Fatalf("write %s container intent: %v", kind, err)
+	}
 }
 
 func (h *harness) waitContainerReady(name, expected string, command ...string) {
@@ -510,64 +615,328 @@ func (h *harness) migrate() {
 	h.t.Cleanup(store.Close)
 }
 
+func newSchedulerGeneration(number int, cmd *exec.Cmd, executable, identity string, pid, logOffset int, startedAt time.Time) *schedulerGeneration {
+	return &schedulerGeneration{
+		Number:     number,
+		Command:    cmd,
+		PID:        pid,
+		Executable: executable,
+		Identity:   identity,
+		LogOffset:  logOffset,
+		StartedAt:  startedAt,
+		Done:       make(chan struct{}),
+	}
+}
+
+func (g *schedulerGeneration) beginWait(waiter schedulerProcessWaiter, closeAfter io.Closer) {
+	g.waitOnce.Do(func() {
+		go func() {
+			waitErr := waiter.Wait()
+			var closeErr error
+			if closeAfter != nil {
+				closeErr = closeAfter.Close()
+			}
+			g.mu.Lock()
+			g.exitErr = errors.Join(waitErr, closeErr)
+			g.mu.Unlock()
+			close(g.Done)
+		}()
+	})
+}
+
+func (g *schedulerGeneration) exited() bool {
+	select {
+	case <-g.Done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (g *schedulerGeneration) exitResult() error {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.exitErr
+}
+
+func (g *schedulerGeneration) stop(ctx context.Context, terminate func(context.Context, *schedulerGeneration) error) error {
+	g.stopMu.Lock()
+	defer g.stopMu.Unlock()
+
+	if g.exited() {
+		if g.terminationSucceeded {
+			return nil
+		}
+		return g.unexpectedExitError()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	terminateErr := terminate(ctx, g)
+	if terminateErr != nil {
+		if errors.Is(terminateErr, errSchedulerProcessExited) {
+			select {
+			case <-g.Done:
+				return g.unexpectedExitError()
+			case <-ctx.Done():
+				return errors.Join(terminateErr, ctx.Err())
+			}
+		}
+		if ctx.Err() != nil {
+			return errors.Join(terminateErr, ctx.Err())
+		}
+		return terminateErr
+	}
+	g.terminationSucceeded = true
+	select {
+	case <-g.Done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (g *schedulerGeneration) unexpectedExitError() error {
+	if exitErr := g.exitResult(); exitErr != nil {
+		return fmt.Errorf("scheduler generation %d PID %d exited before owned termination: %w", g.Number, g.PID, exitErr)
+	}
+	return fmt.Errorf("scheduler generation %d PID %d exited before owned termination", g.Number, g.PID)
+}
+
+func (g *schedulerGeneration) ownsExecutable(expected string, live schedulerProcessIdentity) bool {
+	return g != nil &&
+		g.PID > 0 &&
+		g.Identity != "" &&
+		g.Command != nil &&
+		g.Command.Process != nil &&
+		g.Command.Process.Pid == g.PID &&
+		samePath(g.Command.Path, expected) &&
+		samePath(g.Executable, expected) &&
+		live.PID == g.PID &&
+		live.Token == g.Identity &&
+		samePath(live.Executable, g.Executable)
+}
+
 func (h *harness) startScheduler() {
 	h.t.Helper()
-	logFile, err := os.OpenFile(filepath.Join(h.root, "logs", "scheduler.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	generation := h.startSchedulerGeneration()
+	h.waitSchedulerReady(generation)
+}
+
+func (h *harness) startSchedulerGeneration() *schedulerGeneration {
+	h.t.Helper()
+	if h.currentScheduler != nil {
+		if h.currentScheduler.exited() {
+			h.t.Fatalf("scheduler generation %d PID %d is still current after exiting: %v", h.currentScheduler.Number, h.currentScheduler.PID, h.currentScheduler.exitResult())
+		}
+		h.t.Fatalf("scheduler generation %d PID %d is still running", h.currentScheduler.Number, h.currentScheduler.PID)
+	}
+	logFile, err := os.OpenFile(filepath.Join(h.root, "logs", "scheduler.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	h.t.Cleanup(func() { _ = logFile.Close() })
-	cmd := exec.CommandContext(h.ctx, h.scheduler)
+	logOffset := h.schedulerLog.Len()
+	// Keep scheduler lifetime under the generation controller. If the test
+	// context expires, cleanup must still be able to terminate the owned
+	// scheduler PID and all descendants as one tree.
+	cmd := exec.Command(h.scheduler)
+	if err := configureOwnedSchedulerProcess(cmd); err != nil {
+		h.t.Fatalf("configure scheduler generation %d ownership: %v", h.schedulerGeneration+1, err)
+	}
 	cmd.Dir = h.root
 	cmd.Env = h.env
 	writer := io.MultiWriter(logFile, h.schedulerLog)
 	cmd.Stdout = writer
 	cmd.Stderr = writer
+	startedAt := time.Now().UTC()
 	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
 		h.t.Fatalf("start scheduler: %v", err)
 	}
-	h.schedulerCmd = cmd
-	if err := os.WriteFile(filepath.Join(h.root, "scheduler.pid"), []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+	identity, err := inspectSchedulerProcess(cmd.Process.Pid)
+	if err != nil || identity.Token == "" || !samePath(identity.Executable, h.scheduler) {
+		killErr := cmd.Process.Kill()
+		waitErr := cmd.Wait()
+		closeErr := logFile.Close()
+		h.t.Fatalf("capture live scheduler process identity for PID %d: identity=%#v error=%v cleanup=%v", cmd.Process.Pid, identity, err, errors.Join(killErr, waitErr, closeErr))
+	}
+	if !identity.StartedAt.IsZero() {
+		startedAt = identity.StartedAt
+	}
+	h.schedulerGeneration++
+	generation := newSchedulerGeneration(h.schedulerGeneration, cmd, identity.Executable, identity.Token, cmd.Process.Pid, logOffset, startedAt)
+	generation.beginWait(cmd, logFile)
+	h.currentScheduler = generation
+	h.schedulerCleanupOnce.Do(func() {
+		h.t.Cleanup(func() { h.stopScheduler() })
+	})
+	if err := h.writeSchedulerPID(generation); err != nil {
 		h.t.Fatal(err)
 	}
-	h.t.Cleanup(func() { h.stopScheduler() })
-	err = poll(h.ctx, 20*time.Second, 50*time.Millisecond, func() (bool, error) {
-		if strings.Contains(h.schedulerLog.String(), "Reconductor scheduler ready") {
-			return true, nil
+	return generation
+}
+
+func (h *harness) waitSchedulerReady(generation *schedulerGeneration) {
+	h.t.Helper()
+	err := poll(h.ctx, 20*time.Second, 50*time.Millisecond, func() (bool, error) {
+		if generation.exited() {
+			return false, fmt.Errorf("scheduler generation %d PID %d exited before readiness: %v", generation.Number, generation.PID, generation.exitResult())
 		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			return false, fmt.Errorf("scheduler exited before readiness")
+		if schedulerReadyFrom(h.schedulerLog, generation.LogOffset) {
+			if generation.exited() {
+				return false, fmt.Errorf("scheduler generation %d PID %d exited at readiness: %v", generation.Number, generation.PID, generation.exitResult())
+			}
+			return true, nil
 		}
 		return false, nil
 	})
 	if err != nil {
-		h.t.Fatalf("wait for exact scheduler readiness log: %v\n%s", err, h.schedulerLog.String())
+		h.t.Fatalf("wait for scheduler generation %d readiness: %v\nscheduler log:\n%s", generation.Number, err, h.schedulerLogs(generation))
 	}
 }
 
+func schedulerReadyFrom(log *lockedBuffer, offset int) bool {
+	value := log.StringFrom(offset)
+	lastNewline := strings.LastIndexByte(value, '\n')
+	if lastNewline < 0 {
+		return false
+	}
+	for _, line := range strings.Split(value[:lastNewline], "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 8 &&
+			fields[2] == "INFO" &&
+			fields[3] == "Reconductor" &&
+			fields[4] == "scheduler" &&
+			fields[5] == "ready" &&
+			fields[6] == "poll_interval=100ms" &&
+			fields[7] == "max_concurrent_runs=1" {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *harness) crashSchedulerTree() {
+	h.t.Helper()
+	generation := h.currentScheduler
+	if generation == nil {
+		h.t.Fatal("scheduler is not running")
+	}
+	if err := h.stopSchedulerGeneration(generation); err != nil {
+		h.t.Fatalf("terminate scheduler generation %d: %v\nscheduler log:\n%s", generation.Number, err, h.schedulerLogs(generation))
+	}
+}
+
+func (h *harness) restartScheduler() *schedulerGeneration {
+	h.t.Helper()
+	if h.currentScheduler != nil {
+		h.t.Fatalf("cannot restart while scheduler generation %d is still current", h.currentScheduler.Number)
+	}
+	generation := h.startSchedulerGeneration()
+	h.waitSchedulerReady(generation)
+	return generation
+}
+
+func (h *harness) stopSchedulerGeneration(generation *schedulerGeneration) error {
+	if generation == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stopErr := generation.stop(ctx, terminateOwnedSchedulerTree)
+	if generation.exited() {
+		if h.currentScheduler == generation {
+			h.currentScheduler = nil
+		}
+		h.removeSchedulerPID(generation)
+	}
+	if stopErr != nil {
+		return stopErr
+	}
+	if !generation.exited() {
+		return fmt.Errorf("scheduler generation %d PID %d did not exit", generation.Number, generation.PID)
+	}
+	return nil
+}
+
 func (h *harness) stopScheduler() {
-	if h.schedulerCmd == nil || h.schedulerCmd.Process == nil {
+	if h.currentScheduler == nil {
 		return
 	}
-	process := h.schedulerCmd.Process
-	if runtime.GOOS == "windows" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, _ = h.runExternal(ctx, "taskkill.exe", nil, "/PID", strconv.Itoa(process.Pid), "/T", "/F")
-	} else {
-		_ = process.Kill()
+	generation := h.currentScheduler
+	if err := h.stopSchedulerGeneration(generation); err != nil {
+		h.t.Errorf("stop scheduler generation %d: %v\nscheduler log:\n%s", generation.Number, err, h.schedulerLogs(generation))
 	}
-	done := make(chan struct{})
-	go func() {
-		_ = h.schedulerCmd.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		h.t.Errorf("scheduler process %d did not exit", process.Pid)
+}
+
+func (h *harness) removeSchedulerPID(generation *schedulerGeneration) {
+	path := filepath.Join(h.root, "scheduler.pid")
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return
 	}
-	_ = os.Remove(filepath.Join(h.root, "scheduler.pid"))
+	if err != nil {
+		h.t.Errorf("read scheduler PID file: %v", err)
+		return
+	}
+	var record schedulerPIDRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		h.t.Errorf("decode scheduler PID file: %v", err)
+		return
+	}
+	if generation == nil || record.PID != generation.PID || record.Generation != generation.Number || record.Identity != generation.Identity {
+		return
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		h.t.Errorf("remove scheduler PID file: %v", err)
+	}
+}
+
+func (h *harness) writeSchedulerPID(generation *schedulerGeneration) error {
+	if generation == nil || generation.PID <= 0 || generation.Number <= 0 || generation.Identity == "" {
+		return errors.New("refusing to write an incomplete scheduler PID identity")
+	}
+	record, err := json.Marshal(schedulerPIDRecord{
+		PID:        generation.PID,
+		Generation: generation.Number,
+		Executable: generation.Executable,
+		Identity:   generation.Identity,
+		StartedAt:  generation.StartedAt,
+	})
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(h.root, "scheduler.pid")
+	temporary := path + ".tmp"
+	if err := os.WriteFile(temporary, record, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	return nil
+}
+
+func (h *harness) schedulerLogs(generation *schedulerGeneration) string {
+	offset := 0
+	if generation != nil {
+		offset = generation.LogOffset
+	}
+	value := h.schedulerLog.StringFrom(offset)
+	for _, secret := range []string{h.databaseURL, h.redisPass} {
+		if secret != "" {
+			value = strings.ReplaceAll(value, secret, "[REDACTED]")
+		}
+	}
+	const limit = 8192
+	if len(value) > limit {
+		value = value[len(value)-limit:]
+	}
+	return value
 }
 
 func (h *harness) runToApproval(name string) scenario {
@@ -802,7 +1171,7 @@ func (h *harness) waitExecution(scheduleID, executionID domain.ID, desired domai
 		return last.Status == desired, nil
 	})
 	if err != nil {
-		h.t.Fatalf("wait for execution %s status %s (last=%s): %v\nscheduler log:\n%s", executionID, desired, last.Status, err, h.schedulerLog.String())
+		h.t.Fatalf("wait for execution %s status %s (last=%s): %v\nscheduler log:\n%s", executionID, desired, last.Status, err, h.schedulerLogs(h.currentScheduler))
 	}
 	return last
 }
@@ -942,6 +1311,357 @@ func (h *harness) guardEntries() []guardLogEntry {
 	return entries
 }
 
+func (h *harness) guardCounts() guardInvocationCounts {
+	h.t.Helper()
+	var counts guardInvocationCounts
+	for _, entry := range h.guardEntries() {
+		if !entry.Accepted {
+			counts.Rejected++
+			continue
+		}
+		switch entry.Kind {
+		case "version":
+			counts.Version++
+		case "validation":
+			counts.Validation++
+		case "scan":
+			counts.Scan++
+		}
+	}
+	return counts
+}
+
+func (h *harness) getApproval(id domain.ID) database.ApprovalListItem {
+	h.t.Helper()
+	var approvals []database.ApprovalListItem
+	h.runCLIJSON(&approvals, "approvals", "list")
+	for _, approval := range approvals {
+		if approval.ID == id {
+			return approval
+		}
+	}
+	h.t.Fatalf("approval %s not found", id)
+	return database.ApprovalListItem{}
+}
+
+func (h *harness) captureLineage(s scenario) lineageSnapshot {
+	h.t.Helper()
+	execution := h.getExecution(s.schedule.ID, s.execution.ID)
+	if execution.TaskID == nil || execution.WorkflowRunID == nil {
+		h.t.Fatalf("%s execution has incomplete lineage: %#v", s.name, execution)
+	}
+	state, err := (workflow.FileStore{Root: filepath.Join(h.root, "state", "runs")}).Load(string(*execution.WorkflowRunID))
+	if err != nil {
+		h.t.Fatalf("load %s workflow state: %v", s.name, err)
+	}
+	nuclei := requiredStep(h.t, state, "run-safe-nuclei-profile")
+	approval := h.getApproval(s.approval.ID)
+	if approval.RequestID != nuclei.Run.ID || approval.TaskID != *execution.TaskID {
+		h.t.Fatalf("%s approval linkage request=%s task=%s, want step=%s task=%s", s.name, approval.RequestID, approval.TaskID, nuclei.Run.ID, *execution.TaskID)
+	}
+	task, err := h.store.GetTask(h.ctx, *execution.TaskID)
+	if err != nil {
+		h.t.Fatalf("get %s task: %v", s.name, err)
+	}
+	run, err := h.store.GetWorkflowRun(h.ctx, *execution.WorkflowRunID)
+	if err != nil {
+		h.t.Fatalf("get %s workflow run: %v", s.name, err)
+	}
+	console, err := h.store.ConsoleSnapshot(h.ctx, s.program.ID)
+	if err != nil {
+		h.t.Fatalf("get %s console snapshot: %v", s.name, err)
+	}
+	if diffs := stepStoreDiff(*execution.WorkflowRunID, state.Steps, console.Steps); len(diffs) != 0 {
+		h.t.Fatalf("%s PostgreSQL/file step state diverged:\n%s", s.name, strings.Join(diffs, "\n"))
+	}
+	steps := make(map[string]lineageStepSnapshot, len(state.Steps))
+	for id, step := range state.Steps {
+		steps[id] = lineageStepSnapshot{
+			ID:             step.Run.ID,
+			Capability:     step.Run.Capability,
+			Status:         step.Run.Status,
+			AttemptCount:   step.Run.AttemptCount,
+			IdempotencyKey: step.Run.IdempotencyKey,
+			ApprovalState:  step.Run.ApprovalState,
+		}
+	}
+	toolCounts := map[string]int{}
+	for _, tool := range console.Tools {
+		if tool.WorkflowRunID == *execution.WorkflowRunID {
+			toolCounts[tool.StepDefinitionID]++
+		}
+	}
+	claimAudits, resumeAudits, err := scheduledExecutionAuditCounts(execution.ID, console.AuditEvents)
+	if err != nil {
+		h.t.Fatalf("count %s scheduled-execution audits: %v", s.name, err)
+	}
+	approvalCount := 0
+	for _, item := range console.Approvals {
+		if item.TaskID == *execution.TaskID {
+			approvalCount++
+		}
+	}
+	return lineageSnapshot{
+		ScheduleID:              execution.ScheduleID,
+		ExecutionID:             execution.ID,
+		TaskID:                  *execution.TaskID,
+		WorkflowRunID:           *execution.WorkflowRunID,
+		NucleiStepRunID:         nuclei.Run.ID,
+		ApprovalID:              approval.ID,
+		ApprovalRequestID:       approval.RequestID,
+		ApprovalActionRequestID: approval.ActionRequestID,
+		ApprovalTaskID:          approval.TaskID,
+		ApprovalDecision:        approval.Decision,
+		ExecutionStatus:         execution.Status,
+		ExecutionAttemptCount:   execution.AttemptCount,
+		TriggerSource:           execution.TriggerSource,
+		LeaseOwner:              execution.LeaseOwner,
+		LeaseExpiresAt:          execution.LeaseExpiresAt,
+		TaskStatus:              task.Status,
+		WorkflowStatus:          run.Status,
+		Steps:                   steps,
+		ToolRunCounts:           toolCounts,
+		Fixture:                 h.fixture.Counts(),
+		Guard:                   h.guardCounts(),
+		ApprovalCount:           approvalCount,
+		ClaimAuditCount:         claimAudits,
+		ResumeAuditCount:        resumeAudits,
+	}
+}
+
+func scheduledExecutionAuditCounts(executionID domain.ID, events []database.ConsoleAuditEvent) (int, int, error) {
+	claimAudits, resumeAudits := 0, 0
+	for _, event := range events {
+		if event.EventType != "scheduled_execution_claimed" && event.EventType != "scheduled_execution_resume_requested" {
+			continue
+		}
+		var details struct {
+			ScheduledExecutionID domain.ID `json:"scheduled_execution_id"`
+		}
+		if err := json.Unmarshal(event.Details, &details); err != nil {
+			return 0, 0, fmt.Errorf("decode %s event %s details: %w", event.EventType, event.ID, err)
+		}
+		if details.ScheduledExecutionID == "" {
+			return 0, 0, fmt.Errorf("%s event %s has no scheduled_execution_id", event.EventType, event.ID)
+		}
+		if details.ScheduledExecutionID != executionID {
+			continue
+		}
+		if event.EventType == "scheduled_execution_claimed" {
+			claimAudits++
+		} else {
+			resumeAudits++
+		}
+	}
+	return claimAudits, resumeAudits, nil
+}
+
+func stepStoreDiff(runID domain.ID, fileSteps map[string]*workflow.StepState, databaseSteps []database.ConsoleStep) []string {
+	rowsByDefinition := make(map[string][]database.ConsoleStep)
+	for _, step := range databaseSteps {
+		if step.WorkflowRunID == runID {
+			rowsByDefinition[step.StepDefinitionID] = append(rowsByDefinition[step.StepDefinitionID], step)
+		}
+	}
+	definitions := make(map[string]bool, len(fileSteps)+len(rowsByDefinition))
+	for id := range fileSteps {
+		definitions[id] = true
+	}
+	for id := range rowsByDefinition {
+		definitions[id] = true
+	}
+	ids := make([]string, 0, len(definitions))
+	for id := range definitions {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	var diffs []string
+	for _, id := range ids {
+		fileStep, fileExists := fileSteps[id]
+		rows := rowsByDefinition[id]
+		if !fileExists {
+			diffs = append(diffs, fmt.Sprintf("PostgreSQL has unexpected step %s", id))
+			continue
+		}
+		if fileStep == nil {
+			diffs = append(diffs, fmt.Sprintf("file step %s is nil", id))
+			continue
+		}
+		appendValueDiff(&diffs, "file step "+id+" definition ID", id, fileStep.Run.StepDefinitionID)
+		appendValueDiff(&diffs, "file step "+id+" workflow-run ID", runID, fileStep.Run.WorkflowRunID)
+		if len(rows) == 0 {
+			diffs = append(diffs, fmt.Sprintf("PostgreSQL step %s is missing", id))
+			continue
+		}
+		if len(rows) != 1 {
+			diffs = append(diffs, fmt.Sprintf("PostgreSQL step %s has %d rows", id, len(rows)))
+			continue
+		}
+		row := rows[0]
+		appendValueDiff(&diffs, "step "+id+" run ID", fileStep.Run.ID, row.ID)
+		appendValueDiff(&diffs, "step "+id+" workflow-run ID", fileStep.Run.WorkflowRunID, row.WorkflowRunID)
+		appendValueDiff(&diffs, "step "+id+" capability", fileStep.Run.Capability, row.Capability)
+		appendValueDiff(&diffs, "step "+id+" status", fileStep.Run.Status, row.Status)
+		appendValueDiff(&diffs, "step "+id+" attempt count", fileStep.Run.AttemptCount, row.AttemptCount)
+		appendValueDiff(&diffs, "step "+id+" approval state", fileStep.Run.ApprovalState, row.ApprovalState)
+	}
+	return diffs
+}
+
+func (before lineageSnapshot) stableDiff(after lineageSnapshot, allowedNewSteps ...string) []string {
+	var diffs []string
+	appendValueDiff(&diffs, "schedule ID", before.ScheduleID, after.ScheduleID)
+	appendValueDiff(&diffs, "execution ID", before.ExecutionID, after.ExecutionID)
+	appendValueDiff(&diffs, "task ID", before.TaskID, after.TaskID)
+	appendValueDiff(&diffs, "workflow-run ID", before.WorkflowRunID, after.WorkflowRunID)
+	appendValueDiff(&diffs, "Nuclei step-run ID", before.NucleiStepRunID, after.NucleiStepRunID)
+	appendValueDiff(&diffs, "approval ID", before.ApprovalID, after.ApprovalID)
+	appendValueDiff(&diffs, "approval request ID", before.ApprovalRequestID, after.ApprovalRequestID)
+	appendValueDiff(&diffs, "approval action-request ID", before.ApprovalActionRequestID, after.ApprovalActionRequestID)
+	appendValueDiff(&diffs, "approval task ID", before.ApprovalTaskID, after.ApprovalTaskID)
+	appendValueDiff(&diffs, "approval record count", before.ApprovalCount, after.ApprovalCount)
+	allowed := make(map[string]bool, len(allowedNewSteps))
+	for _, id := range allowedNewSteps {
+		allowed[id] = true
+	}
+	stepIDs := make([]string, 0, len(before.Steps))
+	for id := range before.Steps {
+		stepIDs = append(stepIDs, id)
+	}
+	sort.Strings(stepIDs)
+	for _, id := range stepIDs {
+		left := before.Steps[id]
+		right, ok := after.Steps[id]
+		if !ok {
+			diffs = append(diffs, fmt.Sprintf("step %s disappeared", id))
+			continue
+		}
+		appendValueDiff(&diffs, "step "+id+" run ID", left.ID, right.ID)
+		appendValueDiff(&diffs, "step "+id+" capability", left.Capability, right.Capability)
+		appendValueDiff(&diffs, "step "+id+" idempotency key", left.IdempotencyKey, right.IdempotencyKey)
+	}
+	newStepIDs := make([]string, 0)
+	for id := range after.Steps {
+		if _, existed := before.Steps[id]; !existed {
+			newStepIDs = append(newStepIDs, id)
+		}
+	}
+	sort.Strings(newStepIDs)
+	for _, id := range newStepIDs {
+		if !allowed[id] {
+			diffs = append(diffs, fmt.Sprintf("step %s appeared unexpectedly", id))
+			continue
+		}
+		delete(allowed, id)
+	}
+	missingAllowed := make([]string, 0, len(allowed))
+	for id := range allowed {
+		missingAllowed = append(missingAllowed, id)
+	}
+	sort.Strings(missingAllowed)
+	for _, id := range missingAllowed {
+		diffs = append(diffs, fmt.Sprintf("expected new step %s did not appear", id))
+	}
+	return diffs
+}
+
+func (before lineageSnapshot) unchangedDiff(after lineageSnapshot) []string {
+	diffs := before.stableDiff(after)
+	appendValueDiff(&diffs, "approval decision", before.ApprovalDecision, after.ApprovalDecision)
+	appendValueDiff(&diffs, "execution status", before.ExecutionStatus, after.ExecutionStatus)
+	appendValueDiff(&diffs, "execution attempt count", before.ExecutionAttemptCount, after.ExecutionAttemptCount)
+	appendValueDiff(&diffs, "trigger source", before.TriggerSource, after.TriggerSource)
+	appendValueDiff(&diffs, "lease owner", before.LeaseOwner, after.LeaseOwner)
+	appendValueDiff(&diffs, "lease expiry", before.LeaseExpiresAt, after.LeaseExpiresAt)
+	appendValueDiff(&diffs, "task status", before.TaskStatus, after.TaskStatus)
+	appendValueDiff(&diffs, "workflow status", before.WorkflowStatus, after.WorkflowStatus)
+	appendValueDiff(&diffs, "steps", before.Steps, after.Steps)
+	appendValueDiff(&diffs, "tool-run counts", before.ToolRunCounts, after.ToolRunCounts)
+	appendValueDiff(&diffs, "fixture counters", before.Fixture, after.Fixture)
+	appendValueDiff(&diffs, "guard counters", before.Guard, after.Guard)
+	appendValueDiff(&diffs, "claim audit count", before.ClaimAuditCount, after.ClaimAuditCount)
+	appendValueDiff(&diffs, "resume audit count", before.ResumeAuditCount, after.ResumeAuditCount)
+	return diffs
+}
+
+func (before lineageSnapshot) priorSucceededDiff(after lineageSnapshot) []string {
+	var diffs []string
+	ids := make([]string, 0, len(before.Steps))
+	for id := range before.Steps {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		left := before.Steps[id]
+		if left.Status != domain.StepSucceeded {
+			continue
+		}
+		right, ok := after.Steps[id]
+		if !ok {
+			diffs = append(diffs, fmt.Sprintf("previously successful step %s disappeared", id))
+			continue
+		}
+		appendValueDiff(&diffs, "previously successful step "+id, left, right)
+		appendValueDiff(&diffs, "previously successful step "+id+" tool-run count", before.ToolRunCounts[id], after.ToolRunCounts[id])
+	}
+	return diffs
+}
+
+func appendValueDiff(diffs *[]string, name string, before, after any) {
+	if !reflect.DeepEqual(before, after) {
+		*diffs = append(*diffs, fmt.Sprintf("%s changed: before=%#v after=%#v", name, before, after))
+	}
+}
+
+func (h *harness) assertSnapshotUnchanged(name string, before, after lineageSnapshot) {
+	h.t.Helper()
+	if diffs := before.unchangedDiff(after); len(diffs) != 0 {
+		h.t.Fatalf("%s changed unexpectedly:\n%s", name, strings.Join(diffs, "\n"))
+	}
+}
+
+func (h *harness) assertStableLineage(name string, before, after lineageSnapshot, allowedNewSteps ...string) {
+	h.t.Helper()
+	if diffs := before.stableDiff(after, allowedNewSteps...); len(diffs) != 0 {
+		h.t.Fatalf("%s lineage changed unexpectedly:\n%s", name, strings.Join(diffs, "\n"))
+	}
+}
+
+func (h *harness) assertPriorSucceededStepsUnchanged(name string, before, after lineageSnapshot) {
+	h.t.Helper()
+	if diffs := before.priorSucceededDiff(after); len(diffs) != 0 {
+		h.t.Fatalf("%s repeated or changed successful work:\n%s", name, strings.Join(diffs, "\n"))
+	}
+}
+
+func (h *harness) observeStoppedPollIntervals() {
+	h.t.Helper()
+	if h.currentScheduler != nil {
+		h.t.Fatalf("scheduler generation %d is still current", h.currentScheduler.Number)
+	}
+	h.observePollIntervals()
+}
+
+func (h *harness) observeSchedulerPollIntervals() {
+	h.t.Helper()
+	if h.currentScheduler == nil || h.currentScheduler.exited() {
+		h.t.Fatal("scheduler is not running")
+	}
+	h.observePollIntervals()
+}
+
+func (h *harness) observePollIntervals() {
+	h.t.Helper()
+	timer := time.NewTimer(600 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-h.ctx.Done():
+		h.t.Fatal(h.ctx.Err())
+	case <-timer.C:
+	}
+}
+
 func (h *harness) runCLI(args ...string) ([]byte, error) {
 	return h.runExternalInDir(h.ctx, h.root, h.platform, h.env, args...)
 }
@@ -997,7 +1717,7 @@ func startLocalFixture(t *testing.T, runID string) *localFixture {
 			ip := net.ParseIP(host)
 			remoteHost, _, remoteErr := net.SplitHostPort(r.RemoteAddr)
 			remoteIP := net.ParseIP(remoteHost)
-			if splitErr != nil || ip == nil || !ip.IsLoopback() || remoteErr != nil || remoteIP == nil || !remoteIP.IsLoopback() {
+			if splitErr != nil || !isExactLoopback(ip) || remoteErr != nil || !isExactLoopback(remoteIP) {
 				fixture.mu.Lock()
 				if fixture.violation == "" {
 					fixture.violation = fmt.Sprintf("host=%q remote=%q", r.Host, r.RemoteAddr)
@@ -1022,6 +1742,13 @@ func startLocalFixture(t *testing.T, runID string) *localFixture {
 
 func (f *localFixture) URL() string { return f.url }
 
+func (f *localFixture) Counts() fixtureRequestCounts {
+	return fixtureRequestCounts{
+		Total:  f.totalRequests.Load(),
+		Nuclei: f.nucleiRequests.Load(),
+	}
+}
+
 func (f *localFixture) Violation() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1033,6 +1760,10 @@ func (f *localFixture) Close() {
 	defer cancel()
 	_ = f.server.Shutdown(ctx)
 	_ = f.listener.Close()
+}
+
+func isExactLoopback(ip net.IP) bool {
+	return ip != nil && (ip.Equal(net.IPv4(127, 0, 0, 1)) || ip.Equal(net.IPv6loopback))
 }
 
 type lockedBuffer struct {
@@ -1050,6 +1781,22 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.b.String()
+}
+
+func (b *lockedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Len()
+}
+
+func (b *lockedBuffer) StringFrom(offset int) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	value := b.b.String()
+	if offset < 0 || offset > len(value) {
+		return ""
+	}
+	return value[offset:]
 }
 
 func poll(parent context.Context, timeout, interval time.Duration, check func() (bool, error)) error {

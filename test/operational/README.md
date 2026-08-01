@@ -1,12 +1,11 @@
-# Operational approval-lifecycle E2E test
+# Operational approval and recovery E2E tests
 
-This opt-in test exercises Reconductor's complete scheduled approval lifecycle
-against one in-process HTTP server bound to a dynamic `127.0.0.1` port. It
-creates disposable PostgreSQL and Redis containers, two fresh programs and
-schedules, rejects the first Nuclei approval, and approves plus explicitly
-resumes the second.
+These opt-in tests exercise Reconductor's scheduled approval and safe restart
+contracts against one in-process HTTP server bound to a dynamic `127.0.0.1`
+port. They create disposable PostgreSQL and Redis containers and use only an
+isolated harmless Nuclei template.
 
-The test is excluded from normal `go test ./...` runs by the `operational`
+The tests are excluded from normal `go test ./...` runs by the `operational`
 build tag.
 
 ## Prerequisites
@@ -20,6 +19,10 @@ build tag.
 - Compatible DNSx 1.x, Naabu 2.x, HTTPX 1.x, Katana 1.x, and Nuclei 3.x
   executables on `PATH`, or configured with their normal `*_EXECUTABLE`
   variables.
+
+The tagged process-lifecycle harness supports Windows and Linux. Other
+operating systems fail closed with a preflight skip before infrastructure or
+provider work begins.
 
 The harness never pulls images. Provision them explicitly, outside the test,
 if required:
@@ -40,12 +43,50 @@ From the repository root:
 .\scripts\test-operational-e2e.ps1
 ```
 
-The default outer timeout is eight minutes. A warm run normally takes one to
-three minutes:
+The default suite remains `Approval` for compatibility. Select either suite or
+both through the constrained selector:
 
 ```powershell
-.\scripts\test-operational-e2e.ps1 -Timeout ([TimeSpan]::FromMinutes(10))
+.\scripts\test-operational-e2e.ps1 -Suite Approval
+.\scripts\test-operational-e2e.ps1 -Suite Recovery
+.\scripts\test-operational-e2e.ps1 -Suite All
 ```
+
+The wrapper maps those three values to fixed test names and does not accept an
+arbitrary Go test expression. The default outer timeout is eight minutes. A
+warm Approval run normally takes one to three minutes; Recovery targets less
+than two minutes; All normally takes two to five minutes:
+
+```powershell
+.\scripts\test-operational-e2e.ps1 -Suite All -Timeout ([TimeSpan]::FromMinutes(8))
+```
+
+## Recovery boundaries
+
+The Recovery suite uses one disposable environment and one scheduled
+execution to verify:
+
+1. Restart while `paused_for_approval` preserves cleared leases, pending
+   approval, task/workflow/step lineage, idempotency keys, tool runs, and
+   provider request counts.
+2. An approval recorded while the scheduler is stopped remains approved but
+   does not implicitly resume after restart.
+3. An explicit resume requested while the scheduler is stopped produces the
+   canonical unclaimed `pending` state. A new scheduler generation then reuses
+   the existing execution and lineage, skips previously successful work, and
+   invokes the approved isolated Nuclei action exactly once.
+
+The scheduler log is append-only. Each process generation has an independent
+readiness offset, completion channel, exit result, and atomic JSON PID record.
+Restart termination requires the recorded PID, executable path, and process
+creation identity to match the live process before targeting that process and
+its descendants; it never terminates by executable name alone.
+
+Active-provider crashes are intentionally excluded. Under the current
+production contract, a stale claimed or running execution with workflow
+lineage becomes terminal `interrupted`; it is not safely resumable. Recovery
+after an HTTPX or Nuclei process has started requires a future production
+lineage and result-reconciliation change.
 
 ## Isolation
 
@@ -81,7 +122,10 @@ The test skips cleanly when the Docker CLI/daemon, a required local image, Go,
 or a required provider executable is unavailable. An executable that resolves
 but fails its identity/version check is a test failure. Containers that start
 but do not become healthy, template validation errors, unexpected Nuclei
-arguments, lifecycle timeouts, or any non-loopback request are failures.
+arguments, lifecycle timeouts, stale lineage, duplicate tool runs, surviving
+owned processes, or any non-loopback request are failures. Missing
+prerequisites after disposable resources have started are failures rather than
+skips.
 
 ## Cleanup and diagnostics
 
@@ -99,6 +143,14 @@ $env:RECONDUCTOR_E2E_PRESERVE_FAILURE = 'true'
 Remove-Item Env:RECONDUCTOR_E2E_PRESERVE_FAILURE
 ```
 
-Containers and scheduler processes are still stopped when diagnostics are
-preserved. Successful runs and failures without this explicit flag remove the
-temporary root.
+Scheduler and container cleanup is still attempted when diagnostics are
+preserved. Any cleanup failure fails the wrapper, is reported, and leaves the
+temporary root available for investigation. Unless preservation is requested
+for a failed run, the wrapper attempts to remove the temporary root after
+owned-resource cleanup.
+
+Cleanup releases test resources in dependency order: the current scheduler
+generation and its owned descendants are stopped and awaited, the store and
+fixture close, exact ownership-labelled containers are removed, and finally
+the validated temporary root is deleted. Cleanup failures fail the test
+without suppressing the original test failure.
