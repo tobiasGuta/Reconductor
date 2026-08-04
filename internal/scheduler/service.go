@@ -89,6 +89,7 @@ func (s *Service) Dispatch(ctx context.Context) error {
 	errs := make(chan error, max)
 	for i := 0; i < max; i++ {
 		exec, schedule, ok, err := s.Store.ClaimPendingScheduledExecution(ctx, s.Owner, s.Config.LeaseTimeout)
+
 		if err != nil {
 			return err
 		}
@@ -96,6 +97,7 @@ func (s *Service) Dispatch(ctx context.Context) error {
 			break
 		}
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
 			if err := s.execute(ctx, exec, schedule); err != nil {
@@ -103,7 +105,9 @@ func (s *Service) Dispatch(ctx context.Context) error {
 			}
 		}()
 	}
+
 	wg.Wait()
+
 	close(errs)
 	var joined error
 	for err := range errs {
@@ -113,25 +117,33 @@ func (s *Service) Dispatch(ctx context.Context) error {
 }
 
 func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, schedule domain.Schedule) error {
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancelRun := context.WithCancelCause(ctx)
 	runCtx = database.WithScheduledExecutionFence(runCtx, database.ScheduledExecutionFence{ExecutionID: exec.ID, LeaseOwner: s.Owner, Attempt: exec.AttemptCount})
-	defer cancel()
-	stopHeartbeat := make(chan struct{})
+	defer cancelRun(nil)
+
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	heartbeatDone := make(chan struct{})
 	go func() {
+		defer close(heartbeatDone)
 		ticker := time.NewTicker(maxDuration(time.Second, s.Config.LeaseTimeout/3))
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				_ = s.Store.HeartbeatScheduledExecution(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount, s.Config.LeaseTimeout)
-			case <-stopHeartbeat:
-				return
-			case <-ctx.Done():
+				err := s.Store.HeartbeatScheduledExecution(heartbeatCtx, exec.ID, s.Owner, exec.AttemptCount, s.Config.LeaseTimeout)
+				if errors.Is(err, database.ErrLostScheduledExecutionLease) {
+					cancelRun(err)
+					return
+				}
+			case <-heartbeatCtx.Done():
 				return
 			}
 		}
 	}()
-	defer close(stopHeartbeat)
+	defer func() {
+		cancelHeartbeat()
+		<-heartbeatDone
+	}()
 
 	request := orchestration.WorkflowRequest{
 		ProgramID:         schedule.ProgramID,
