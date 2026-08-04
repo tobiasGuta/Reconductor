@@ -263,7 +263,7 @@ func (s *Store) HeartbeatScheduledExecution(ctx context.Context, id domain.ID, o
 		return err
 	}
 	if !containsExecutionStatus([]domain.ScheduledExecutionStatus{domain.ScheduledExecutionClaimed, domain.ScheduledExecutionRunning}, item.Status) || !validLease {
-		return fmt.Errorf("scheduled execution %s cannot be heartbeated", id)
+		return fmt.Errorf("%w: scheduled execution %s cannot be heartbeated", ErrLostScheduledExecutionLease, id)
 	}
 	tag, err := tx.Exec(ctx, `UPDATE scheduled_executions
 		SET lease_expires_at=clock_timestamp()+($4::double precision * interval '1 second'),updated_at=now()
@@ -273,7 +273,7 @@ func (s *Store) HeartbeatScheduledExecution(ctx context.Context, id domain.ID, o
 		  AND status IN ('claimed','running')
 		  AND lease_expires_at>clock_timestamp()`, id, owner, attempt, leaseTimeout.Seconds())
 	if err == nil && tag.RowsAffected() != 1 {
-		return fmt.Errorf("scheduled execution %s cannot be heartbeated", id)
+		return fmt.Errorf("%w: scheduled execution %s cannot be heartbeated", ErrLostScheduledExecutionLease, id)
 	}
 	if err != nil {
 		return err

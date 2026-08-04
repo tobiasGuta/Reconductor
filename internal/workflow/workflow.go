@@ -407,7 +407,7 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 		}
 		if ctx.Err() != nil {
 			terminal, terminalErr := e.terminal(runCtx, state, domain.RunCancelled, "workflow_cancelled")
-			return terminal, errors.Join(ctx.Err(), terminalErr)
+			return terminal, errors.Join(context.Cause(ctx), terminalErr)
 		}
 		if paused {
 			state.Run.Status = domain.RunPaused
@@ -551,7 +551,7 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 		if cancelled || ctx.Err() != nil {
 			terminal, terminalErr := e.terminal(runCtx, state, domain.RunCancelled, "workflow_cancelled")
 			if ctx.Err() != nil {
-				return terminal, errors.Join(ctx.Err(), terminalErr)
+				return terminal, errors.Join(context.Cause(ctx), terminalErr)
 			}
 			return terminal, terminalErr
 		}
@@ -626,6 +626,11 @@ func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain
 		}
 		outcome.Result, outcome.Err = e.Executor.Execute(attemptCtx, capability.Request{Action: action, Provider: plan.Provider, Approved: plan.Approved, Policy: policy.ParallelShare(e.Policy, plan.ParallelShare), Scope: e.Scope})
 		cancelAttempt()
+
+		if outcome.Err != nil && ctx.Err() != nil {
+			outcome.Err = context.Cause(ctx)
+		}
+
 		if outcome.Err == nil {
 			break
 		}
@@ -640,7 +645,7 @@ func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			outcome.Err = ctx.Err()
+			outcome.Err = context.Cause(ctx)
 			completeStep(&outcome.State)
 			return outcome
 		case <-timer.C:
