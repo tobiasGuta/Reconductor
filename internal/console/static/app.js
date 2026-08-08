@@ -34,6 +34,42 @@ function setChildren(target, ...children) {
   target.replaceChildren(...children.filter(Boolean));
 }
 
+const drawerTabbableSelector = [
+  'button:not([disabled]):not([tabindex="-1"])',
+  'a[href]:not([tabindex="-1"])',
+  'input:not([disabled]):not([type="hidden"]):not([tabindex="-1"])',
+  'select:not([disabled]):not([tabindex="-1"])',
+  'textarea:not([disabled]):not([tabindex="-1"])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(", ");
+
+function drawerTabbableElements(drawer) {
+  return $$(drawerTabbableSelector, drawer).filter((item) => {
+    if (item.tabIndex < 0 || item.hidden || item.getAttribute("aria-hidden") === "true") return false;
+    return typeof item.getClientRects !== "function" || item.getClientRects().length > 0;
+  });
+}
+
+function containDrawerTab(event, focusable, activeElement, fallback) {
+  if (event.key !== "Tab") return false;
+  const first = focusable[0] || null;
+  const last = focusable[focusable.length - 1] || null;
+  let target = null;
+  if (!first) {
+    target = fallback;
+  } else if (focusable.length === 1) {
+    target = first;
+  } else if (event.shiftKey && (event.target === first || activeElement === first || !focusable.includes(activeElement))) {
+    target = last;
+  } else if (!event.shiftKey && (event.target === last || activeElement === last || !focusable.includes(activeElement))) {
+    target = first;
+  }
+  if (!target) return false;
+  event.preventDefault();
+  target.focus();
+  return true;
+}
+
 function shortID(value) {
   return value ? String(value).slice(0, 8) : "—";
 }
@@ -550,6 +586,7 @@ function openDrawer({ eyebrow, title, returnFocus = null, returnTarget = null })
   $("#drawer-title").textContent = title;
   $("#drawer-backdrop").classList.remove("hidden");
   const drawer = $("#detail-drawer");
+  drawer.tabIndex = -1;
   drawer.classList.add("open");
   drawer.removeAttribute("inert");
   drawer.setAttribute("aria-hidden", "false");
@@ -1143,26 +1180,15 @@ function bindEvents() {
       else if ($("#detail-drawer").classList.contains("open")) closeDrawer();
       return;
     }
-    if (event.key !== "Tab" || !$("#detail-drawer").classList.contains("open")) return;
-    const focusable = $$('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])', $("#detail-drawer"));
-    if (!focusable.length) {
-      event.preventDefault();
-      return;
-    }
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
+    const drawer = $("#detail-drawer");
+    if (event.key !== "Tab" || !drawer.classList.contains("open")) return;
+    containDrawerTab(event, drawerTabbableElements(drawer), document.activeElement, drawer);
   });
 }
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    containDrawerTab,
     state,
     closeDrawer,
     openExecutionDetail,

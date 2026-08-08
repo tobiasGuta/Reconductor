@@ -316,6 +316,67 @@ function deferred() {
   return { promise, resolve };
 }
 
+function tabEvent(target, shiftKey = false) {
+  return {
+    key: "Tab",
+    shiftKey,
+    target,
+    prevented: false,
+    preventDefault() { this.prevented = true; },
+  };
+}
+
+test("drawer focus containment keeps one control for Tab and Shift+Tab", () => {
+  const document = installDocument();
+  const close = document.querySelector("#drawer-close");
+  for (const shiftKey of [false, true]) {
+    document.activeElement = null;
+    const event = tabEvent(close, shiftKey);
+    assert.equal(app.containDrawerTab(event, [close], document.activeElement, document.querySelector("#detail-drawer")), true);
+    assert.equal(event.prevented, true);
+    assert.equal(document.activeElement, close);
+  }
+});
+
+test("drawer focus containment wraps both multi-control boundaries", () => {
+  const document = installDocument();
+  const first = document.createElement("button");
+  const middle = document.createElement("button");
+  const last = document.createElement("button");
+  const focusable = [first, middle, last];
+
+  let event = tabEvent(last);
+  assert.equal(app.containDrawerTab(event, focusable, last, document.querySelector("#detail-drawer")), true);
+  assert.equal(event.prevented, true);
+  assert.equal(document.activeElement, first);
+
+  document.activeElement = null;
+  event = tabEvent(first, true);
+  assert.equal(app.containDrawerTab(event, focusable, document.activeElement, document.querySelector("#detail-drawer")), true);
+  assert.equal(event.prevented, true);
+  assert.equal(document.activeElement, last);
+});
+
+test("drawer focus containment leaves non-boundary Tab alone", () => {
+  const document = installDocument();
+  const first = document.createElement("button");
+  const middle = document.createElement("button");
+  const last = document.createElement("button");
+  const event = tabEvent(middle);
+  assert.equal(app.containDrawerTab(event, [first, middle, last], middle, document.querySelector("#detail-drawer")), false);
+  assert.equal(event.prevented, false);
+  assert.equal(document.activeElement, null);
+});
+
+test("drawer focus containment uses the drawer when it has no controls", () => {
+  const document = installDocument();
+  const drawer = document.querySelector("#detail-drawer");
+  const event = tabEvent(drawer, true);
+  assert.equal(app.containDrawerTab(event, [], null, drawer), true);
+  assert.equal(event.prevented, true);
+  assert.equal(document.activeElement, drawer);
+});
+
 test("scheduled execution detail is explicit and uses the execution id", async () => {
   const document = installDocument();
   const calls = [];
