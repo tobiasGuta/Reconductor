@@ -6,12 +6,14 @@ import (
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/findings"
 )
 
 const (
-	executionProjectionToolRunLimit  = 64
-	executionProjectionApprovalLimit = 32
-	executionProjectionArtifactLimit = 128
+	executionProjectionToolRunLimit   = 64
+	executionProjectionApprovalLimit  = 32
+	executionProjectionArtifactLimit  = 128
+	executionProjectionCandidateLimit = 64
 
 	executionProjectionToolRunsQuery = `SELECT tr.id,tr.step_run_id,sr.step_definition_id,tr.capability,tr.provider,tr.tool_version,
 		tr.started_at,tr.completed_at,tr.exit_code,tr.timed_out,tr.stdout_artifact_id,tr.stderr_artifact_id,count(*) OVER()
@@ -37,6 +39,14 @@ const (
 		  AND a.sensitive=false
 		  AND (a.expires_at IS NULL OR a.expires_at>$2)
 		ORDER BY a.created_at ASC,a.id ASC
+		LIMIT $4`
+	executionProjectionCandidatesQuery = `SELECT cf.id,cf.task_id,cf.workflow_run_id,cf.target_asset_id,cf.source_capability,
+		cf.detection_confidence,cf.status,cf.evidence_artifact_ids,cf.created_at,cf.updated_at,count(*) OVER(),
+		bool_or(cf.task_id<>$2 OR a.program_id IS DISTINCT FROM $3) OVER()
+		FROM candidate_findings cf
+		LEFT JOIN assets a ON a.id=cf.target_asset_id
+		WHERE cf.workflow_run_id=$1
+		ORDER BY cf.created_at ASC,cf.id ASC
 		LIMIT $4`
 )
 
@@ -90,6 +100,22 @@ type ExecutionProjectionArtifact struct {
 	RedactionState string     `json:"redaction_state"`
 	CreatedAt      time.Time  `json:"created_at"`
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+}
+
+// ExecutionProjectionCandidate contains only allow-listed candidate metadata.
+// Status and UpdatedAt are mutable current state observed with the projection,
+// not immutable facts captured when the execution ran.
+type ExecutionProjectionCandidate struct {
+	ID                  domain.ID                `json:"id"`
+	TaskID              domain.ID                `json:"task_id"`
+	WorkflowRunID       domain.ID                `json:"workflow_run_id"`
+	TargetAssetID       domain.ID                `json:"target_asset_id"`
+	SourceCapability    string                   `json:"source_capability"`
+	DetectionConfidence float64                  `json:"detection_confidence"`
+	Status              findings.CandidateStatus `json:"status"`
+	EvidenceArtifactIDs []domain.ID              `json:"evidence_artifact_ids"`
+	CreatedAt           time.Time                `json:"created_at"`
+	UpdatedAt           time.Time                `json:"updated_at"`
 }
 
 func newExecutionProjectionCollection[T any]() ExecutionProjectionCollection[T] {
@@ -187,6 +213,47 @@ func loadExecutionProjectionArtifacts(ctx context.Context, query executionProjec
 		appendExecutionLineageIssue(&projection.Lineage, ExecutionLineageArtifactInconsistent)
 	}
 	finalizeExecutionProjectionCollection(&projection.Artifacts)
+	return nil
+}
+
+func loadExecutionProjectionCandidates(ctx context.Context, query executionProjectionQuerier, projection *ExecutionProjection) error {
+	if projection.Workflow == nil {
+		return nil
+	}
+	rows, err := query.Query(
+		ctx,
+		executionProjectionCandidatesQuery,
+		projection.Workflow.ID,
+		projection.Workflow.TaskID,
+		projection.CurrentProgram.ID,
+		executionProjectionCandidateLimit,
+	)
+	if err != nil {
+		return fmt.Errorf("query execution projection candidates: %w", err)
+	}
+	defer rows.Close()
+	inconsistent := false
+	for rows.Next() {
+		var item ExecutionProjectionCandidate
+		var evidenceArtifactIDs []string
+		if err := rows.Scan(
+			&item.ID, &item.TaskID, &item.WorkflowRunID, &item.TargetAssetID,
+			&item.SourceCapability, &item.DetectionConfidence, &item.Status,
+			&evidenceArtifactIDs, &item.CreatedAt, &item.UpdatedAt,
+			&projection.Candidates.Total, &inconsistent,
+		); err != nil {
+			return fmt.Errorf("scan execution projection candidate: %w", err)
+		}
+		item.EvidenceArtifactIDs = idsFromStrings(evidenceArtifactIDs)
+		projection.Candidates.Items = append(projection.Candidates.Items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate execution projection candidates: %w", err)
+	}
+	if inconsistent {
+		appendExecutionLineageIssue(&projection.Lineage, ExecutionLineageCandidateFindingInconsistent)
+	}
+	finalizeExecutionProjectionCollection(&projection.Candidates)
 	return nil
 }
 

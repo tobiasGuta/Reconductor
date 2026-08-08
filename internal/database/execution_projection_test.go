@@ -29,13 +29,14 @@ func TestExecutionProjectionRootUsesOnePostgreSQLStatementTimestamp(t *testing.T
 }
 
 func TestExecutionProjectionEvidenceCollectionContracts(t *testing.T) {
-	if executionProjectionToolRunLimit != 64 || executionProjectionApprovalLimit != 32 || executionProjectionArtifactLimit != 128 {
-		t.Fatalf("evidence limits tool=%d approval=%d artifact=%d", executionProjectionToolRunLimit, executionProjectionApprovalLimit, executionProjectionArtifactLimit)
+	if executionProjectionToolRunLimit != 64 || executionProjectionApprovalLimit != 32 || executionProjectionArtifactLimit != 128 || executionProjectionCandidateLimit != 64 {
+		t.Fatalf("collection limits tool=%d approval=%d artifact=%d candidate=%d", executionProjectionToolRunLimit, executionProjectionApprovalLimit, executionProjectionArtifactLimit, executionProjectionCandidateLimit)
 	}
 	for name, query := range map[string]string{
-		"tool runs": executionProjectionToolRunsQuery,
-		"approvals": executionProjectionApprovalsQuery,
-		"artifacts": executionProjectionArtifactsQuery,
+		"tool runs":  executionProjectionToolRunsQuery,
+		"approvals":  executionProjectionApprovalsQuery,
+		"artifacts":  executionProjectionArtifactsQuery,
+		"candidates": executionProjectionCandidatesQuery,
 	} {
 		if count := strings.Count(query, "count(*) OVER()"); count != 1 {
 			t.Fatalf("%s window count = %d, want 1", name, count)
@@ -56,6 +57,17 @@ func TestExecutionProjectionEvidenceCollectionContracts(t *testing.T) {
 		strings.Contains(executionProjectionArtifactsQuery, "clock_timestamp()") ||
 		strings.Contains(executionProjectionArtifactsQuery, "storage_location") {
 		t.Fatalf("artifact query violates visibility or allow-list contract: %s", executionProjectionArtifactsQuery)
+	}
+	if !strings.Contains(executionProjectionCandidatesQuery, "LEFT JOIN assets a ON a.id=cf.target_asset_id") ||
+		!strings.Contains(executionProjectionCandidatesQuery, "WHERE cf.workflow_run_id=$1") ||
+		!strings.Contains(executionProjectionCandidatesQuery, "bool_or(cf.task_id<>$2 OR a.program_id IS DISTINCT FROM $3) OVER()") ||
+		!strings.Contains(executionProjectionCandidatesQuery, "ORDER BY cf.created_at ASC,cf.id ASC") {
+		t.Fatalf("candidate query violates membership, lineage, or ordering contract: %s", executionProjectionCandidatesQuery)
+	}
+	for _, excluded := range []string{"canonical_value", "template_id", "claimed_vulnerability", "severity", "verification_results", "storage_location"} {
+		if strings.Contains(executionProjectionCandidatesQuery, excluded) {
+			t.Fatalf("candidate query selects excluded field %q: %s", excluded, executionProjectionCandidatesQuery)
+		}
 	}
 }
 
@@ -132,11 +144,12 @@ func TestDeriveExecutionLeaseState(t *testing.T) {
 
 func TestExecutionProjectionJSONOmitsUnsafeState(t *testing.T) {
 	projection := ExecutionProjection{
-		Steps:     []ExecutionProjectionStep{},
-		ToolRuns:  newExecutionProjectionCollection[ExecutionProjectionToolRun](),
-		Approvals: newExecutionProjectionCollection[ExecutionProjectionApproval](),
-		Artifacts: newExecutionProjectionCollection[ExecutionProjectionArtifact](),
-		Lineage:   ExecutionProjectionLineage{Issues: []ExecutionLineageIssue{}},
+		Steps:      []ExecutionProjectionStep{},
+		ToolRuns:   newExecutionProjectionCollection[ExecutionProjectionToolRun](),
+		Approvals:  newExecutionProjectionCollection[ExecutionProjectionApproval](),
+		Artifacts:  newExecutionProjectionCollection[ExecutionProjectionArtifact](),
+		Candidates: newExecutionProjectionCollection[ExecutionProjectionCandidate](),
+		Lineage:    ExecutionProjectionLineage{Issues: []ExecutionLineageIssue{}},
 	}
 	encoded, err := json.Marshal(projection)
 	if err != nil {
@@ -164,6 +177,7 @@ func TestExecutionProjectionJSONOmitsUnsafeState(t *testing.T) {
 		`"tool_runs":{"items":[],"total":0,"truncated":false}`,
 		`"approvals":{"items":[],"total":0,"truncated":false}`,
 		`"artifacts":{"items":[],"total":0,"truncated":false}`,
+		`"candidate_findings":{"items":[],"total":0,"truncated":false}`,
 		`"issues":[]`,
 	} {
 		if !strings.Contains(serialized, empty) {
