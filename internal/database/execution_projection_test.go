@@ -71,6 +71,30 @@ func TestExecutionProjectionEvidenceCollectionContracts(t *testing.T) {
 	}
 }
 
+func TestExecutionProjectionAssetObservationSummaryQueryContract(t *testing.T) {
+	query := strings.ToLower(executionProjectionAssetObservationsQuery)
+	for _, required := range []string{
+		"count(*)",
+		"count(distinct ao.asset_id)",
+		"left join assets a on a.id=ao.asset_id",
+		"a.program_id is distinct from $2",
+		"where ao.workflow_run_id=$1",
+	} {
+		if !strings.Contains(query, required) {
+			t.Fatalf("observation summary query missing %q: %s", required, executionProjectionAssetObservationsQuery)
+		}
+	}
+	where := strings.Index(query, "where ")
+	if where < 0 || strings.TrimSpace(query[where:]) != "where ao.workflow_run_id=$1" {
+		t.Fatalf("observation membership must filter only by workflow_run_id: %s", executionProjectionAssetObservationsQuery)
+	}
+	for _, excluded := range []string{"observed_value", "metadata", "canonical_value", "evidence_artifact_ids", "source_capability"} {
+		if strings.Contains(query, excluded) {
+			t.Fatalf("observation summary query selects excluded field %q: %s", excluded, executionProjectionAssetObservationsQuery)
+		}
+	}
+}
+
 func TestExecutionProjectionCollectionFinalization(t *testing.T) {
 	collection := newExecutionProjectionCollection[int]()
 	if collection.Items == nil || collection.Total != 0 || collection.Truncated {
@@ -178,6 +202,7 @@ func TestExecutionProjectionJSONOmitsUnsafeState(t *testing.T) {
 		`"approvals":{"items":[],"total":0,"truncated":false}`,
 		`"artifacts":{"items":[],"total":0,"truncated":false}`,
 		`"candidate_findings":{"items":[],"total":0,"truncated":false}`,
+		`"asset_observations":{"total":0,"distinct_asset_count":0}`,
 		`"issues":[]`,
 	} {
 		if !strings.Contains(serialized, empty) {

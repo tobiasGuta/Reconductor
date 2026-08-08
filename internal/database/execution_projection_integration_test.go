@@ -57,6 +57,9 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 			projection.ToolRuns.Truncated || projection.Approvals.Truncated || projection.Artifacts.Truncated || projection.Candidates.Truncated {
 			t.Fatalf("empty children tools=%#v approvals=%#v artifacts=%#v candidates=%#v", projection.ToolRuns, projection.Approvals, projection.Artifacts, projection.Candidates)
 		}
+		if projection.AssetObservations.Total != 0 || projection.AssetObservations.DistinctAssetCount != 0 {
+			t.Fatalf("pending observation summary = %#v", projection.AssetObservations)
+		}
 		if projection.CurrentSchedule.Name != schedule.Name || projection.CurrentSchedule.Objective != schedule.Objective || projection.CurrentProgram.ID != env.programID {
 			t.Fatalf("current context schedule=%#v program=%#v", projection.CurrentSchedule, projection.CurrentProgram)
 		}
@@ -330,7 +333,7 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 			}
 		}()
 		completedAt := time.Now().UTC()
-		toolID, approvalID, artifactID, assetID, candidateID := domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID()
+		toolID, approvalID, artifactID, assetID, candidateID, observationID := domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID()
 		if _, err := writeTx.Exec(ctx, `UPDATE tasks SET status='completed',updated_at=$2 WHERE id=$1`, fixture.task.ID, completedAt); err != nil {
 			t.Fatal(err)
 		}
@@ -355,6 +358,9 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if _, err := writeTx.Exec(ctx, `INSERT INTO candidate_findings(id,task_id,workflow_run_id,target_asset_id,source_capability,template_id,claimed_vulnerability,severity,evidence_artifact_ids,detection_confidence,status,created_at,updated_at) VALUES($1,$2,$3,$4,'scan.nuclei','snapshot-template','snapshot candidate','medium','{}',0.7,'new',$5,$5)`, candidateID, fixture.task.ID, fixture.runID, assetID, completedAt); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := writeTx.Exec(ctx, `INSERT INTO asset_observations(id,asset_id,workflow_run_id,source_capability,observed_value,metadata,first_seen_at,observed_at,confidence,evidence_artifact_ids) VALUES($1,$2,$3,'probe.http','snapshot-observation','{}',$4,$4,1,'{}')`, observationID, assetID, fixture.runID, completedAt); err != nil {
+			t.Fatal(err)
+		}
 		if err := writeTx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -373,8 +379,8 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if first.projection.Task == nil || first.projection.Task.Status != domain.TaskRunning || first.projection.Workflow == nil || first.projection.Workflow.Status != domain.RunRunning || first.projection.Steps[0].Status != domain.StepRunning {
 			t.Fatalf("first snapshot task=%#v workflow=%#v steps=%#v", first.projection.Task, first.projection.Workflow, first.projection.Steps)
 		}
-		if first.projection.ToolRuns.Total != 0 || first.projection.Approvals.Total != 0 || first.projection.Artifacts.Total != 0 || first.projection.Candidates.Total != 0 {
-			t.Fatalf("first snapshot saw later children tools=%#v approvals=%#v artifacts=%#v candidates=%#v", first.projection.ToolRuns, first.projection.Approvals, first.projection.Artifacts, first.projection.Candidates)
+		if first.projection.ToolRuns.Total != 0 || first.projection.Approvals.Total != 0 || first.projection.Artifacts.Total != 0 || first.projection.Candidates.Total != 0 || first.projection.AssetObservations.Total != 0 || first.projection.AssetObservations.DistinctAssetCount != 0 {
+			t.Fatalf("first snapshot saw later children tools=%#v approvals=%#v artifacts=%#v candidates=%#v observations=%#v", first.projection.ToolRuns, first.projection.Approvals, first.projection.Artifacts, first.projection.Candidates, first.projection.AssetObservations)
 		}
 		if err := readTx.Commit(ctx); err != nil {
 			t.Fatal(err)
@@ -387,8 +393,8 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if second.Task == nil || second.Task.Status != domain.TaskCompleted || second.Workflow == nil || second.Workflow.Status != domain.RunCompleted || second.Steps[0].Status != domain.StepSucceeded {
 			t.Fatalf("second snapshot task=%#v workflow=%#v steps=%#v", second.Task, second.Workflow, second.Steps)
 		}
-		if second.ToolRuns.Total != 1 || second.Approvals.Total != 1 || second.Artifacts.Total != 1 || second.Candidates.Total != 1 || second.Candidates.Items[0].ID != candidateID {
-			t.Fatalf("second snapshot children tools=%#v approvals=%#v artifacts=%#v candidates=%#v", second.ToolRuns, second.Approvals, second.Artifacts, second.Candidates)
+		if second.ToolRuns.Total != 1 || second.Approvals.Total != 1 || second.Artifacts.Total != 1 || second.Candidates.Total != 1 || second.Candidates.Items[0].ID != candidateID || second.AssetObservations.Total != 1 || second.AssetObservations.DistinctAssetCount != 1 {
+			t.Fatalf("second snapshot children tools=%#v approvals=%#v artifacts=%#v candidates=%#v observations=%#v", second.ToolRuns, second.Approvals, second.Artifacts, second.Candidates, second.AssetObservations)
 		}
 	})
 }
@@ -656,6 +662,13 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 				TaskID: fixture.task.ID, WorkflowRunID: fixture.runID, TargetAssetID: assetID,
 				TemplateID: fmt.Sprintf("query-count-%d", index), CreatedAt: now.Add(time.Duration(index) * time.Millisecond),
 			})
+			for observationIndex := 0; observationIndex < 2; observationIndex++ {
+				insertProjectionObservation(t, env, projectionObservationSpec{
+					AssetID: assetID, WorkflowRunID: fixture.runID,
+					SourceCapability: fmt.Sprintf("query.count.%d", observationIndex),
+					ObservedValue:    fmt.Sprintf("query-count-%d-%d", index, observationIndex),
+				})
+			}
 		}
 
 		tx, err := env.store.beginExecutionProjection(env.ctx)
@@ -668,11 +681,11 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if counter.count != 9 {
-			t.Fatalf("projection query count = %d, want 9", counter.count)
+		if counter.count != 10 {
+			t.Fatalf("projection query count = %d, want 10", counter.count)
 		}
-		if len(projection.Steps) != 3 || projection.ToolRuns.Total != 3 || projection.Approvals.Total != 3 || projection.Artifacts.Total != 3 || projection.Candidates.Total != 3 {
-			t.Fatalf("counted projection steps=%d tools=%#v approvals=%#v artifacts=%#v candidates=%#v", len(projection.Steps), projection.ToolRuns, projection.Approvals, projection.Artifacts, projection.Candidates)
+		if len(projection.Steps) != 3 || projection.ToolRuns.Total != 3 || projection.Approvals.Total != 3 || projection.Artifacts.Total != 3 || projection.Candidates.Total != 3 || projection.AssetObservations.Total != 6 || projection.AssetObservations.DistinctAssetCount != 3 {
+			t.Fatalf("counted projection steps=%d tools=%#v approvals=%#v artifacts=%#v candidates=%#v observations=%#v", len(projection.Steps), projection.ToolRuns, projection.Approvals, projection.Artifacts, projection.Candidates, projection.AssetObservations)
 		}
 		if err := tx.Commit(env.ctx); err != nil {
 			t.Fatal(err)
@@ -851,6 +864,143 @@ func TestExecutionProjectionCandidateChildrenIntegration(t *testing.T) {
 	})
 }
 
+func TestExecutionProjectionAssetObservationSummaryIntegration(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "execution-projection-observations")
+	running := domain.RunRunning
+
+	t.Run("zero observations serialize as a non-null summary", func(t *testing.T) {
+		fixture := createRecoveryFixture(t, env, "projection-observation-zero", &running, domain.TaskRunning, nil)
+		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projection.AssetObservations.Total != 0 || projection.AssetObservations.DistinctAssetCount != 0 {
+			t.Fatalf("zero observation summary = %#v", projection.AssetObservations)
+		}
+		if containsLineageIssue(projection.Lineage.Issues, ExecutionLineageAssetObservationInconsistent) {
+			t.Fatalf("zero observations reported lineage inconsistency: %v", projection.Lineage.Issues)
+		}
+		encoded, err := json.Marshal(projection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(encoded), `"asset_observations":{"total":0,"distinct_asset_count":0}`) {
+			t.Fatalf("zero observation JSON contract missing: %s", encoded)
+		}
+	})
+
+	t.Run("direct workflow membership distinct count and security boundary", func(t *testing.T) {
+		fixture := createRecoveryFixture(t, env, "projection-observation-membership", &running, domain.TaskRunning, nil)
+		now := time.Now().UTC()
+		evidenceSentinel := domain.NewID()
+		sharedAssetID := insertProjectionAsset(t, env, env.programID, "https://asset-canonical-observation-sentinel.example.test/private")
+		uniqueAssetID := insertProjectionAsset(t, env, env.programID, "https://observation-second.example.test/")
+		insertProjectionObservation(t, env, projectionObservationSpec{
+			AssetID: sharedAssetID, WorkflowRunID: fixture.runID,
+			SourceCapability:    "observation-source-capability-sentinel",
+			ObservedValue:       "observation-observed-value-sentinel",
+			Metadata:            json.RawMessage(`{"outer":{"inner":"observation-deep-metadata-sentinel"}}`),
+			EvidenceArtifactIDs: []domain.ID{evidenceSentinel}, ObservedAt: now,
+		})
+		insertProjectionObservation(t, env, projectionObservationSpec{
+			AssetID: sharedAssetID, WorkflowRunID: fixture.runID,
+			SourceCapability: "probe.http", ObservedValue: "shared-asset-second-value", ObservedAt: now.Add(time.Millisecond),
+		})
+		insertProjectionObservation(t, env, projectionObservationSpec{
+			AssetID: uniqueAssetID, WorkflowRunID: fixture.runID,
+			SourceCapability: "probe.dns", ObservedValue: "unique-asset-value", ObservedAt: now.Add(2 * time.Millisecond),
+		})
+
+		otherRunID := domain.NewID()
+		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary) VALUES($1,$2,$3,'1','running',$4,'integration','{}')`, otherRunID, fixture.task.ID, env.definitionID, now); err != nil {
+			t.Fatal(err)
+		}
+		otherProgramID, _ := createSchedulerIntegrationProgram(t, env.ctx, env.store, "observation-other-workflow-program")
+		otherWorkflowAssetID := insertProjectionAsset(t, env, otherProgramID, "https://other-workflow-observation.example.test/")
+		insertProjectionObservation(t, env, projectionObservationSpec{
+			AssetID: otherWorkflowAssetID, WorkflowRunID: otherRunID,
+			SourceCapability: "excluded.other.workflow", ObservedValue: "excluded-other-workflow-value", ObservedAt: now,
+		})
+
+		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projection.AssetObservations.Total != 3 || projection.AssetObservations.DistinctAssetCount != 2 {
+			t.Fatalf("workflow observation summary = %#v, want total=3 distinct=2", projection.AssetObservations)
+		}
+		if containsLineageIssue(projection.Lineage.Issues, ExecutionLineageAssetObservationInconsistent) {
+			t.Fatalf("other-workflow contradiction affected lineage: %v", projection.Lineage.Issues)
+		}
+		encoded, err := json.Marshal(projection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sentinel := range []string{
+			"asset-canonical-observation-sentinel",
+			"observation-source-capability-sentinel",
+			"observation-observed-value-sentinel",
+			"observation-deep-metadata-sentinel",
+			string(evidenceSentinel),
+			"excluded-other-workflow-value",
+		} {
+			if strings.Contains(string(encoded), sentinel) {
+				t.Fatalf("observation summary leaked %q: %s", sentinel, encoded)
+			}
+		}
+	})
+
+	t.Run("cross-program observations count and emit one aggregate issue", func(t *testing.T) {
+		fixture := createRecoveryFixture(t, env, "projection-observation-contradictions", &running, domain.TaskRunning, nil)
+		otherProgramID, _ := createSchedulerIntegrationProgram(t, env.ctx, env.store, "observation-other-program")
+		validAssetID := insertProjectionAsset(t, env, env.programID, "https://observation-valid.example.test/")
+		wrongAssetA := insertProjectionAsset(t, env, otherProgramID, "https://observation-wrong-a.example.test/")
+		wrongAssetB := insertProjectionAsset(t, env, otherProgramID, "https://observation-wrong-b.example.test/")
+		for index, assetID := range []domain.ID{validAssetID, wrongAssetA, wrongAssetA, wrongAssetB} {
+			insertProjectionObservation(t, env, projectionObservationSpec{
+				AssetID: assetID, WorkflowRunID: fixture.runID,
+				SourceCapability: fmt.Sprintf("contradiction.%d", index),
+				ObservedValue:    fmt.Sprintf("contradiction-value-%d", index),
+			})
+		}
+
+		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projection.AssetObservations.Total != 4 || projection.AssetObservations.DistinctAssetCount != 3 {
+			t.Fatalf("contradictory observation summary = %#v, want total=4 distinct=3", projection.AssetObservations)
+		}
+		if got := countLineageIssue(projection.Lineage.Issues, ExecutionLineageAssetObservationInconsistent); got != 1 {
+			t.Fatalf("observation lineage issue count = %d, issues=%v", got, projection.Lineage.Issues)
+		}
+	})
+
+	t.Run("high cardinality remains exact", func(t *testing.T) {
+		fixture := createRecoveryFixture(t, env, "projection-observation-cardinality", &running, domain.TaskRunning, nil)
+		const assetCount = 5
+		const observationsPerAsset = 7
+		for assetIndex := 0; assetIndex < assetCount; assetIndex++ {
+			assetID := insertProjectionAsset(t, env, env.programID, fmt.Sprintf("https://observation-cardinality-%d.example.test/", assetIndex))
+			for observationIndex := 0; observationIndex < observationsPerAsset; observationIndex++ {
+				insertProjectionObservation(t, env, projectionObservationSpec{
+					AssetID: assetID, WorkflowRunID: fixture.runID,
+					SourceCapability: fmt.Sprintf("cardinality.%d", observationIndex),
+					ObservedValue:    fmt.Sprintf("cardinality-%d-%d", assetIndex, observationIndex),
+				})
+			}
+		}
+
+		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projection.AssetObservations.Total != assetCount*observationsPerAsset || projection.AssetObservations.DistinctAssetCount != assetCount {
+			t.Fatalf("high-cardinality observation summary = %#v", projection.AssetObservations)
+		}
+	})
+}
+
 func enqueueSpecificProjectionExecution(t *testing.T, env recoveryTestEnvironment, executionID domain.ID, owner string) domain.ScheduledExecution {
 	t.Helper()
 	claimed, _, ok, err := env.store.ClaimPendingScheduledExecution(env.ctx, owner, time.Minute)
@@ -983,11 +1133,45 @@ type projectionCandidateSpec struct {
 	UpdatedAt            time.Time
 }
 
+type projectionObservationSpec struct {
+	AssetID             domain.ID
+	WorkflowRunID       domain.ID
+	SourceCapability    string
+	ObservedValue       string
+	Metadata            json.RawMessage
+	EvidenceArtifactIDs []domain.ID
+	ObservedAt          time.Time
+}
+
 func insertProjectionAsset(t *testing.T, env recoveryTestEnvironment, programID domain.ID, canonicalValue string) domain.ID {
 	t.Helper()
 	id := domain.NewID()
 	now := time.Now().UTC()
 	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO assets(id,program_id,type,canonical_value,created_at,updated_at) VALUES($1,$2,'url',$3,$4,$4)`, id, programID, canonicalValue, now); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func insertProjectionObservation(t *testing.T, env recoveryTestEnvironment, spec projectionObservationSpec) domain.ID {
+	t.Helper()
+	id := domain.NewID()
+	if spec.SourceCapability == "" {
+		spec.SourceCapability = "probe.http"
+	}
+	if spec.ObservedValue == "" {
+		spec.ObservedValue = "projection-observation-" + string(id)
+	}
+	if spec.Metadata == nil {
+		spec.Metadata = json.RawMessage(`{}`)
+	}
+	if spec.EvidenceArtifactIDs == nil {
+		spec.EvidenceArtifactIDs = []domain.ID{}
+	}
+	if spec.ObservedAt.IsZero() {
+		spec.ObservedAt = time.Now().UTC()
+	}
+	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO asset_observations(id,asset_id,workflow_run_id,source_capability,observed_value,metadata,first_seen_at,observed_at,confidence,evidence_artifact_ids) VALUES($1,$2,$3,$4,$5,$6,$7,$7,1,$8)`, id, spec.AssetID, spec.WorkflowRunID, spec.SourceCapability, spec.ObservedValue, spec.Metadata, spec.ObservedAt, idStrings(spec.EvidenceArtifactIDs)); err != nil {
 		t.Fatal(err)
 	}
 	return id
