@@ -18,6 +18,11 @@ const state = {
     error: "",
     controller: null,
   },
+  runWorkspace: {
+    selection: null,
+    item: null,
+    projection: { id: "", status: "idle", data: null, error: "" },
+  },
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -96,25 +101,27 @@ function relativeTime(value) {
   return formatter.format(Math.round(amount), "year");
 }
 
-function statusBadge(status) {
+function statusBadge(status, label = "") {
   const normalized = String(status || "unknown").toLowerCase();
   let tone = "neutral";
   if (["succeeded", "completed", "approved", "open", "confirmed"].includes(normalized)) tone = "";
   if (["pending", "claimed", "running", "queued", "paused", "paused_operator", "paused_for_approval", "awaiting_approval", "new", "needs_manual_review", "moderate", "medium", "skipped_overlap"].includes(normalized)) tone = "warning";
   if (["failed", "retryable", "rejected", "cancelled", "critical", "high", "blocked_scope_change", "approval_rejected", "interrupted", "expired", "inconsistent"].includes(normalized)) tone = "danger";
-  return element("span", `status-badge ${tone}`.trim(), normalized.replaceAll("_", " "));
+  const text = normalized.replaceAll("_", " ");
+  return element("span", `status-badge ${tone}`.trim(), label ? `${label}: ${text}` : text);
 }
 
 function empty(message) {
   return element("div", "empty-copy", message);
 }
 
-function showView(name) {
+function showView(name, { focusWorkspace = false } = {}) {
   state.view = name;
   $$(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === name));
   $$(".view").forEach((item) => item.classList.toggle("active", item.dataset.viewPanel === name));
   $(".sidebar").classList.remove("open");
   window.scrollTo({ top: 0, behavior: "smooth" });
+  if (name === "runs") return activateRunWorkspace({ focus: focusWorkspace });
 }
 
 async function loadData({ quiet = false } = {}) {
@@ -368,39 +375,357 @@ function activityItem(event) {
   return card;
 }
 
-function renderRuns() {
+const activeWorkspaceStatuses = new Set(["pending", "claimed", "running", "paused", "paused_operator", "paused_for_approval", "awaiting_approval"]);
+
+function runEntryKey(entry) {
+  return entry ? `${entry.kind}:${entry.id}` : "";
+}
+
+function buildRunSelectorEntries(runs = [], executions = []) {
+  const runsByID = new Map(runs.map((run) => [String(run.id), run]));
+  const linkedRunIDs = new Set();
+  const entries = executions.map((execution) => {
+    const workflowRunID = execution.workflow_run_id ? String(execution.workflow_run_id) : "";
+    const run = workflowRunID ? runsByID.get(workflowRunID) || null : null;
+    if (run) linkedRunIDs.add(workflowRunID);
+    return {
+      kind: "execution",
+      id: String(execution.id),
+      executionId: String(execution.id),
+      workflowRunId: workflowRunID,
+      execution,
+      run,
+    };
+  });
+  runs.forEach((run) => {
+    const id = String(run.id);
+    if (linkedRunIDs.has(id)) return;
+    entries.push({ kind: "workflow", id, executionId: "", workflowRunId: id, execution: null, run });
+  });
+  return entries;
+}
+
+function runWorkspaceEntries() {
+  return buildRunSelectorEntries(state.data?.runs || [], state.data?.scheduled_executions || []);
+}
+
+function runEntryIsActive(entry) {
+  return activeWorkspaceStatuses.has(String(entry.execution?.status || "").toLowerCase())
+    || activeWorkspaceStatuses.has(String(entry.run?.status || "").toLowerCase());
+}
+
+function selectedRunEntry(entries = runWorkspaceEntries()) {
+  const current = runEntryKey(state.runWorkspace.selection);
+  return entries.find((entry) => runEntryKey(entry) === current) || entries.find(runEntryIsActive) || entries[0] || null;
+}
+
+function resetRunWorkspaceProjection() {
+  state.runWorkspace.projection = { id: "", status: "idle", data: null, error: "" };
+}
+
+function setRunWorkspaceSelection(entry) {
+  const previous = runEntryKey(state.runWorkspace.selection);
+  const next = runEntryKey(entry);
+  if (previous !== next) {
+    cancelExecutionDetail();
+    resetRunWorkspaceProjection();
+    state.runWorkspace.item = null;
+  }
+  state.runWorkspace.selection = entry ? { kind: entry.kind, id: entry.id } : null;
+  if (!state.runWorkspace.item) {
+    state.runWorkspace.item = entry
+      ? { kind: entry.executionId ? "execution" : "workflow", id: entry.executionId || entry.workflowRunId }
+      : null;
+  }
+}
+
+function scheduleForExecution(execution) {
+  return (state.data?.schedules || []).find((item) => String(item.id) === String(execution?.schedule_id || "")) || null;
+}
+
+function runEntryTitle(entry) {
+  return entry?.run?.objective || scheduleForExecution(entry?.execution)?.name || "Scheduled execution";
+}
+
+function runEntrySteps(entry, projection = null) {
+  if (projection) return Array.isArray(projection.steps) ? projection.steps : [];
+  const runID = entry?.workflowRunId;
+  return (state.data?.steps || []).filter((step) => String(step.workflow_run_id) === String(runID || ""));
+}
+
+function currentRunProjection(entry) {
+  const cached = state.runWorkspace.projection;
+  return entry?.executionId && cached.id === entry.executionId && cached.status === "ready" ? cached.data : null;
+}
+
+function runStatusBadges(entry, projection = null) {
+  const schedulerStatus = projection ? projection.scheduler?.status : entry?.execution?.status;
+  const workflowStatus = projection ? projection.workflow?.status : entry?.run?.status;
+  const badges = [];
+  if (schedulerStatus) badges.push(statusBadge(schedulerStatus, "Scheduler"));
+  if (workflowStatus) badges.push(statusBadge(workflowStatus, "Workflow"));
+  return badges;
+}
+
+function runStatusGroup(entry, projection = null) {
+  const group = element("span", "run-status-group");
+  group.append(...runStatusBadges(entry, projection));
+  return group;
+}
+
+function renderRunSelector(entries, selected) {
   const target = $("#runs-list");
-  const runs = state.data.runs || [];
-  if (!runs.length) {
-    setChildren(target, empty("No workflow runs have been persisted."));
+  if (!entries.length) {
+    setChildren(target, empty("No scheduled executions or workflow runs have been persisted."));
     return;
   }
-  setChildren(target, ...runs.map((run) => {
-    const steps = (state.data.steps || []).filter((step) => step.workflow_run_id === run.id);
+  setChildren(target, ...entries.map((entry) => {
+    const steps = runEntrySteps(entry);
     const completed = steps.filter((step) => ["succeeded", "skipped"].includes(step.status)).length;
-    const progress = steps.length ? Math.round((completed / steps.length) * 100) : 0;
-    const card = element("article", "run-card");
-    card.tabIndex = 0;
-    card.setAttribute("role", "button");
-    const copy = element("div");
-    copy.append(element("h3", "", run.objective), element("p", "", `${run.workflow_name} · run ${shortID(run.id)}`));
-    const status = element("div", "run-meta");
-    status.append(element("span", "", "Status"), statusBadge(run.status));
-    const timing = element("div", "run-meta");
-    timing.append(element("span", "", "Started"), element("strong", "", relativeTime(run.started_at)));
-    const finish = element("div", "run-meta");
-    finish.append(element("span", "", "Progress"), element("strong", "", `${completed}/${steps.length}`));
-    const bar = element("progress", "run-progress");
-    bar.max = 100;
-    bar.value = progress;
-    bar.setAttribute("aria-label", `${progress}% complete`);
-    copy.append(bar);
-    card.append(copy, status, timing, finish);
-    card.dataset.runId = String(run.id);
-    card.addEventListener("click", () => openRunDrawer(run, card));
-    card.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openRunDrawer(run, card); } });
-    return card;
+    const timing = entry.run?.started_at || entry.execution?.started_at || entry.execution?.planned_at;
+    const button = element("button", "run-selector-item");
+    button.type = "button";
+    button.dataset.runSelection = runEntryKey(entry);
+    if (entry.workflowRunId) button.dataset.runId = entry.workflowRunId;
+    button.setAttribute("aria-pressed", String(runEntryKey(entry) === runEntryKey(selected)));
+    button.append(element("strong", "", runEntryTitle(entry)), element("small", "", `${entry.kind === "execution" ? "execution" : "workflow"} ${shortID(entry.id)}`));
+    const row = element("div", "run-selector-row");
+    row.append(runStatusGroup(entry), element("span", "", steps.length ? `${completed}/${steps.length} steps · ${relativeTime(timing)}` : relativeTime(timing)));
+    button.append(row);
+    button.addEventListener("click", () => selectRunWorkspaceEntry(entry));
+    return button;
   }));
+}
+
+function laneNode(kind, id, title, description, status) {
+  const button = element("button", "lane-node");
+  button.type = "button";
+  button.dataset.workspaceItem = `${kind}:${id}`;
+  button.setAttribute("aria-pressed", String(state.runWorkspace.item?.kind === kind && String(state.runWorkspace.item.id) === String(id)));
+  const copy = element("span");
+  copy.append(element("strong", "", title), element("small", "", description));
+  button.append(copy, statusBadge(status));
+  button.addEventListener("click", () => selectRunWorkspaceItem(kind, id));
+  return button;
+}
+
+function renderRunLane(entry, projection) {
+  const lane = $("#run-lane");
+  if (!entry) {
+    setChildren(lane, empty("Select a run to inspect its associated lineage."));
+    return;
+  }
+  if (entry.executionId && state.runWorkspace.projection.id === entry.executionId && state.runWorkspace.projection.status === "loading") {
+    setChildren(lane, empty("Loading the coherent execution observation…"));
+    return;
+  }
+  const workflow = projection?.workflow || entry.run || null;
+  const steps = runEntrySteps(entry, projection);
+  const levels = [];
+  if (entry.executionId) {
+    const execution = projection?.execution || entry.execution;
+    const scheduler = projection?.scheduler || entry.execution;
+    const level = element("div", "lane-level");
+    level.append(element("span", "lane-label", "Execution"), laneNode("execution", entry.executionId, runEntryTitle(entry), `Execution ${shortID(entry.executionId)}`, scheduler?.status));
+    levels.push(level);
+  }
+  if (workflow) {
+    if (levels.length) levels.push(element("div", "lane-association", "Associated workflow"));
+    const level = element("div", "lane-level");
+    level.append(element("span", "lane-label", "Workflow run"), laneNode("workflow", workflow.id, workflow.definition_name || workflow.workflow_name || "Workflow run", `Run ${shortID(workflow.id)} · v${workflow.workflow_version || "—"}`, workflow.status));
+    levels.push(level);
+  }
+  if (steps.length) {
+    levels.push(element("div", "lane-association", "Associated steps · stable display order, not dependency order"));
+    const level = element("div", "lane-level");
+    level.append(element("span", "lane-label", `Workflow steps (${steps.length})`));
+    const list = element("div", "lane-steps");
+    steps.forEach((step, index) => list.append(laneNode("step", step.id, step.step_definition_id || `Step ${index + 1}`, step.capability || "No capability recorded", step.status)));
+    level.append(list);
+    levels.push(level);
+  }
+  if (!levels.length) levels.push(empty("No associated workflow lineage is available yet."));
+  setChildren(lane, ...levels);
+}
+
+function inspectorShell(title, subtitle, status, details, ids = [], counts = []) {
+  const block = element("section");
+  const heading = element("div", "inspector-heading");
+  const copy = element("div");
+  copy.append(element("h4", "", title), element("p", "", subtitle));
+  heading.append(copy, statusBadge(status));
+  block.append(heading);
+  const list = element("dl", "inspector-details");
+  appendDetails(list, details);
+  block.append(list);
+  if (counts.length) {
+    const countGrid = element("div", "inspector-counts");
+    counts.forEach(([label, value, truncated]) => {
+      const item = element("div", "inspector-count");
+      item.append(element("strong", "", value), element("span", "", `${label}${truncated ? " · truncated" : ""}`));
+      countGrid.append(item);
+    });
+    block.append(countGrid);
+  }
+  if (ids.length) {
+    const disclosure = element("details", "compact-disclosure");
+    disclosure.append(element("summary", "", "Lineage and IDs"));
+    const idList = element("dl", "inspector-details mono");
+    appendDetails(idList, ids);
+    disclosure.append(idList);
+    block.append(disclosure);
+  }
+  return block;
+}
+
+function renderRunInspector(entry, projection) {
+  const target = $("#run-inspector");
+  if (!entry || !state.runWorkspace.item) {
+    setChildren(target, empty("Select an execution, workflow, or step."));
+    return;
+  }
+  const selection = state.runWorkspace.item;
+  if (selection.kind === "execution") {
+    if (!projection) {
+      const execution = entry.execution || {};
+      setChildren(target, inspectorShell(runEntryTitle(entry), "Limited execution detail · dashboard snapshot", execution.status, [
+        ["Trigger", execution.trigger_source], ["Planned", formatTime(execution.planned_at, true)], ["Started", formatTime(execution.started_at, true)],
+        ["Completed", formatTime(execution.completed_at, true)], ["Attempts", execution.attempt_count], ["Workflow linked", execution.workflow_run_id ? "Yes" : "No"],
+      ], [["Execution ID", execution.id], ["Workflow run ID", execution.workflow_run_id || "Not linked"]]));
+      return;
+    }
+    const execution = projection.execution || {};
+    const scheduler = projection.scheduler || {};
+    const trigger = projection.trigger || {};
+    const issues = Array.isArray(projection.lineage?.issues) ? projection.lineage.issues : [];
+    const toolRuns = collectionValue(projection.tool_runs);
+    const approvals = collectionValue(projection.approvals);
+    const artifacts = collectionValue(projection.artifacts);
+    const candidates = collectionValue(projection.candidate_findings);
+    const changes = collectionValue(projection.change_items);
+    setChildren(target, inspectorShell(projection.current_schedule?.name || `Execution ${shortID(execution.id)}`, `Coherent observation · ${formatTime(projection.observed_at, true)}`, scheduler.status, [
+      ["Trigger", trigger.source], ["Planned", formatTime(trigger.planned_at, true)], ["Started", formatTime(scheduler.started_at, true)],
+      ["Completed", formatTime(scheduler.completed_at, true)], ["Attempts", scheduler.attempt_count], ["Workflow linked", execution.workflow_run_id ? "Yes" : "No"],
+      ["Lineage issues", issues.length],
+    ], [["Execution ID", execution.id], ["Schedule ID", execution.schedule_id], ["Task ID", execution.task_id || "Not linked"], ["Workflow run ID", execution.workflow_run_id || "Not linked"], ["Scope version ID", execution.scope_version_id || "Not linked"]], [
+      ["Tool runs", toolRuns.total, toolRuns.truncated], ["Approvals", approvals.total, approvals.truncated], ["Artifacts", artifacts.total, artifacts.truncated],
+      ["Candidates", candidates.total, candidates.truncated], ["Changes", changes.total, changes.truncated], ["Steps", Array.isArray(projection.steps) ? projection.steps.length : 0, false],
+    ]));
+    return;
+  }
+  if (selection.kind === "workflow") {
+    const workflow = projection?.workflow || entry.run;
+    if (!workflow) {
+      setChildren(target, empty("The linked workflow run is unavailable."));
+      return;
+    }
+    const task = projection?.task || null;
+    setChildren(target, inspectorShell(workflow.definition_name || workflow.workflow_name || "Workflow run", projection ? "Execution projection" : "Limited run detail · dashboard snapshot", workflow.status, [
+      ["Version", workflow.workflow_version], ["Trigger", workflow.trigger_source], ["Started", formatTime(workflow.started_at, true)],
+      ["Completed", formatTime(workflow.completed_at, true)], ["Task objective", task?.objective || entry.run?.objective], ["Task status", task?.status || "Not available in snapshot"],
+    ], [["Workflow run ID", workflow.id], ["Task ID", workflow.task_id], ["Workflow definition ID", workflow.workflow_definition_id || "Not available in snapshot"]]));
+    return;
+  }
+  const step = runEntrySteps(entry, projection).find((item) => String(item.id) === String(selection.id));
+  if (!step) {
+    state.runWorkspace.item = { kind: entry.executionId ? "execution" : "workflow", id: entry.executionId || entry.workflowRunId };
+    renderRunInspector(entry, projection);
+    return;
+  }
+  setChildren(target, inspectorShell(step.step_definition_id || "Workflow step", step.capability || "No capability recorded", step.status, [
+    ["Attempt count", step.attempt_count], ["Approval state", step.approval_state], ["Started", formatTime(step.started_at, true)],
+    ["Completed", formatTime(step.completed_at, true)], ["Error classification", step.error_classification],
+  ], [["Step run ID", step.id], ["Workflow run ID", step.workflow_run_id], ["Step definition ID", step.step_definition_id]]));
+}
+
+function renderRunWorkspace(entry) {
+  const projection = currentRunProjection(entry);
+  const actions = $("#run-workspace-actions");
+  if (!entry) {
+    $("#run-workspace-eyebrow").textContent = "Run workspace";
+    $("#run-workspace-title").textContent = "No runs available";
+    $("#run-workspace-meta").textContent = "Create or schedule a workflow to begin.";
+    actions.replaceChildren();
+    renderRunLane(null, null);
+    renderRunInspector(null, null);
+    return;
+  }
+  const projected = Boolean(projection);
+  const projectionState = entry.executionId && state.runWorkspace.projection.id === entry.executionId ? state.runWorkspace.projection : null;
+  $("#run-workspace-eyebrow").textContent = entry.executionId ? "Scheduled execution" : "Workflow run";
+  $("#run-workspace-title").textContent = projected ? (projection.current_schedule?.name || runEntryTitle(entry)) : runEntryTitle(entry);
+  let stateCopy = "limited dashboard snapshot detail";
+  if (projected) stateCopy = `observed ${formatTime(projection.observed_at, true)}`;
+  else if (projectionState?.status === "loading") stateCopy = "loading coherent execution observation";
+  else if (projectionState?.status === "error") stateCopy = projectionState.error;
+  $("#run-workspace-meta").textContent = `${entry.kind === "execution" ? "Execution" : "Run"} ${entry.id} · ${stateCopy}`;
+  const actionItems = runStatusBadges(entry, projection);
+  if (projected) {
+    const full = element("button", "secondary-button", "Full detail");
+    full.type = "button";
+    full.dataset.fullDetailId = entry.executionId;
+    full.addEventListener("click", () => openExecutionDetail(entry.executionId, full, { selector: "[data-full-detail-id]", datasetKey: "fullDetailId", id: entry.executionId }));
+    actionItems.push(full);
+  } else if (projectionState?.status === "error") {
+    const retry = element("button", "secondary-button", "Retry detail");
+    retry.type = "button";
+    retry.addEventListener("click", () => loadRunWorkspaceProjection(entry.executionId));
+    actionItems.push(retry);
+  } else if (!entry.executionId && entry.run) {
+    const full = element("button", "secondary-button", "Full detail");
+    full.type = "button";
+    full.dataset.runId = entry.workflowRunId;
+    full.addEventListener("click", () => openRunDrawer(entry.run, full));
+    actionItems.push(full);
+  }
+  setChildren(actions, ...actionItems);
+  renderRunLane(entry, projection);
+  renderRunInspector(entry, projection);
+}
+
+function renderRuns() {
+  const entries = runWorkspaceEntries();
+  const selected = selectedRunEntry(entries);
+  if (selected && runEntryKey(selected) !== runEntryKey(state.runWorkspace.selection)) {
+    state.runWorkspace.selection = { kind: selected.kind, id: selected.id };
+    state.runWorkspace.item = { kind: selected.executionId ? "execution" : "workflow", id: selected.executionId || selected.workflowRunId };
+    if (state.runWorkspace.projection.id !== selected.executionId) resetRunWorkspaceProjection();
+  } else if (!selected) {
+    state.runWorkspace.selection = null;
+    state.runWorkspace.item = null;
+    resetRunWorkspaceProjection();
+  }
+  renderRunSelector(entries, selected);
+  renderRunWorkspace(selected);
+}
+
+function selectRunWorkspaceItem(kind, id) {
+  state.runWorkspace.item = { kind, id: String(id) };
+  renderRunWorkspace(selectedRunEntry());
+}
+
+async function selectRunWorkspaceEntry(entry, { focus = false } = {}) {
+  setRunWorkspaceSelection(entry);
+  renderRuns();
+  if (focus) $("#run-workspace-header").focus();
+  if (!entry?.executionId) return;
+  await loadRunWorkspaceProjection(entry.executionId);
+}
+
+function activateRunWorkspace({ focus = false } = {}) {
+  const entry = selectedRunEntry();
+  if (!entry) {
+    renderRuns();
+    return Promise.resolve();
+  }
+  return selectRunWorkspaceEntry(entry, { focus });
+}
+
+function openExecutionWorkspace(id) {
+  const entry = runWorkspaceEntries().find((item) => item.executionId === String(id));
+  if (!entry) return Promise.resolve();
+  setRunWorkspaceSelection(entry);
+  return showView("runs", { focusWorkspace: true });
 }
 
 function renderSchedules() {
@@ -439,11 +764,15 @@ function renderSchedules() {
     const copy = element("div");
     copy.append(element("h3", "", `${item.trigger_source.replaceAll("_", " ")} · ${formatTime(item.planned_at, true)}`), element("p", "", item.error_summary || `task ${shortID(item.task_id)} · run ${shortID(item.workflow_run_id)}`));
     const actions = element("div", "card-actions");
+    const workspace = element("button", "primary-button", "Open workspace");
+    workspace.type = "button";
+    workspace.dataset.workspaceExecutionId = String(item.id);
+    workspace.addEventListener("click", () => openExecutionWorkspace(item.id));
     const details = element("button", "secondary-button", "View details");
     details.type = "button";
     details.dataset.executionId = String(item.id);
     details.addEventListener("click", () => openExecutionDetail(item.id, details));
-    actions.append(details);
+    actions.append(workspace, details);
     if (["paused_for_approval", "paused_operator"].includes(item.status)) {
       const resume = element("button", "primary-button", "Resume");
       resume.addEventListener("click", () => postAction(`/api/v1/scheduled-executions/${encodeURIComponent(item.id)}/resume`, {}, "Scheduled execution queued for resume."));
@@ -1044,18 +1373,12 @@ function renderExecutionProjection(projection) {
   setChildren($("#drawer-content"), ...blocks);
 }
 
-async function openExecutionDetail(id, opener = null) {
+async function requestExecutionProjection(id, { onLoading, onReady, onError }) {
   cancelExecutionDetail();
   const selectedID = String(id || "");
   const controller = new AbortController();
   state.executionDetail = { id: selectedID, status: "loading", data: null, error: "", controller };
-  openDrawer({
-    eyebrow: "Scheduled execution",
-    title: `Execution ${shortID(selectedID)}`,
-    returnFocus: opener,
-    returnTarget: { selector: "[data-execution-id]", datasetKey: "executionId", id: selectedID },
-  });
-  renderExecutionLoading(selectedID);
+  onLoading(selectedID);
   try {
     const response = await fetch(`/api/v1/scheduled-executions/${encodeURIComponent(selectedID)}`, {
       headers: { Accept: "application/json" },
@@ -1067,19 +1390,81 @@ async function openExecutionDetail(id, opener = null) {
     if (!response.ok) {
       const message = response.status === 404 ? "Scheduled execution no longer exists." : "Execution detail is temporarily unavailable.";
       state.executionDetail = { id: selectedID, status: "error", data: null, error: message, controller };
-      renderExecutionError(message, selectedID);
+      onError(message, selectedID);
       return;
     }
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid execution detail response");
     state.executionDetail = { id: selectedID, status: "ready", data: body, error: "", controller };
-    renderExecutionProjection(body);
+    onReady(body, selectedID);
+    return body;
   } catch (error) {
     if (error?.name === "AbortError") return;
     if (state.executionDetail.controller !== controller || state.executionDetail.id !== selectedID) return;
     const message = "Execution detail is temporarily unavailable.";
     state.executionDetail = { id: selectedID, status: "error", data: null, error: message, controller };
-    renderExecutionError(message, selectedID);
+    onError(message, selectedID);
   }
+}
+
+async function loadRunWorkspaceProjection(id) {
+  const selectedID = String(id || "");
+  const cached = state.runWorkspace.projection;
+  if (cached.id === selectedID && cached.status === "ready") {
+    renderRuns();
+    return cached.data;
+  }
+  if (cached.id === selectedID && cached.status === "loading" && state.executionDetail.id === selectedID && state.executionDetail.status === "loading") return null;
+  state.runWorkspace.projection = { id: selectedID, status: "loading", data: null, error: "" };
+  renderRuns();
+  return requestExecutionProjection(selectedID, {
+    onLoading() {},
+    onReady(body) {
+      if (selectedRunEntry()?.executionId !== selectedID) return;
+      state.runWorkspace.projection = { id: selectedID, status: "ready", data: body, error: "" };
+      if (!state.runWorkspace.item) state.runWorkspace.item = { kind: "execution", id: selectedID };
+      renderRuns();
+    },
+    onError(message) {
+      if (selectedRunEntry()?.executionId !== selectedID) return;
+      state.runWorkspace.projection = { id: selectedID, status: "error", data: null, error: message };
+      renderRuns();
+    },
+  });
+}
+
+async function openExecutionDetail(id, opener = null, returnTarget = null) {
+  const selectedID = String(id || "");
+  const cached = state.runWorkspace.projection.id === selectedID && state.runWorkspace.projection.status === "ready"
+    ? state.runWorkspace.projection.data
+    : null;
+  if (cached) {
+    cancelExecutionDetail();
+    state.executionDetail = { id: selectedID, status: "ready", data: cached, error: "", controller: null };
+    openDrawer({
+      eyebrow: "Scheduled execution",
+      title: `Execution ${shortID(selectedID)}`,
+      returnFocus: opener,
+      returnTarget: returnTarget || { selector: "[data-execution-id]", datasetKey: "executionId", id: selectedID },
+    });
+    renderExecutionProjection(cached);
+    return cached;
+  }
+  return requestExecutionProjection(selectedID, {
+    onLoading() {
+      openDrawer({
+        eyebrow: "Scheduled execution",
+        title: `Execution ${shortID(selectedID)}`,
+        returnFocus: opener,
+        returnTarget: returnTarget || { selector: "[data-execution-id]", datasetKey: "executionId", id: selectedID },
+      });
+      renderExecutionLoading(selectedID);
+    },
+    onReady(body) {
+      if (selectedRunEntry()?.executionId === selectedID) state.runWorkspace.projection = { id: selectedID, status: "ready", data: body, error: "" };
+      renderExecutionProjection(body);
+    },
+    onError: renderExecutionError,
+  });
 }
 
 function openModal(config) {
@@ -1188,14 +1573,18 @@ function bindEvents() {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    buildRunSelectorEntries,
     containDrawerTab,
     state,
     closeDrawer,
+    openExecutionWorkspace,
     openExecutionDetail,
     openRunDrawer,
     renderExecutionProjection,
     renderRuns,
     renderSchedules,
+    selectRunWorkspaceEntry,
+    selectRunWorkspaceItem,
   };
 } else {
   bindEvents();
