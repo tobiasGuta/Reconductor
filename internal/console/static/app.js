@@ -7,6 +7,17 @@ const state = {
   loading: false,
   timer: null,
   modalAction: null,
+  drawer: {
+    returnFocus: null,
+    returnTarget: null,
+  },
+  executionDetail: {
+    id: "",
+    status: "idle",
+    data: null,
+    error: "",
+    controller: null,
+  },
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -53,8 +64,8 @@ function statusBadge(status) {
   const normalized = String(status || "unknown").toLowerCase();
   let tone = "neutral";
   if (["succeeded", "completed", "approved", "open", "confirmed"].includes(normalized)) tone = "";
-  if (["pending", "running", "queued", "paused", "paused_operator", "paused_for_approval", "awaiting_approval", "new", "needs_manual_review", "moderate", "medium"].includes(normalized)) tone = "warning";
-  if (["failed", "retryable", "rejected", "cancelled", "critical", "high"].includes(normalized)) tone = "danger";
+  if (["pending", "claimed", "running", "queued", "paused", "paused_operator", "paused_for_approval", "awaiting_approval", "new", "needs_manual_review", "moderate", "medium", "skipped_overlap"].includes(normalized)) tone = "warning";
+  if (["failed", "retryable", "rejected", "cancelled", "critical", "high", "blocked_scope_change", "approval_rejected", "interrupted", "expired", "inconsistent"].includes(normalized)) tone = "danger";
   return element("span", `status-badge ${tone}`.trim(), normalized.replaceAll("_", " "));
 }
 
@@ -349,8 +360,9 @@ function renderRuns() {
     bar.setAttribute("aria-label", `${progress}% complete`);
     copy.append(bar);
     card.append(copy, status, timing, finish);
-    card.addEventListener("click", () => openRunDrawer(run));
-    card.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openRunDrawer(run); } });
+    card.dataset.runId = String(run.id);
+    card.addEventListener("click", () => openRunDrawer(run, card));
+    card.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openRunDrawer(run, card); } });
     return card;
   }));
 }
@@ -391,6 +403,11 @@ function renderSchedules() {
     const copy = element("div");
     copy.append(element("h3", "", `${item.trigger_source.replaceAll("_", " ")} · ${formatTime(item.planned_at, true)}`), element("p", "", item.error_summary || `task ${shortID(item.task_id)} · run ${shortID(item.workflow_run_id)}`));
     const actions = element("div", "card-actions");
+    const details = element("button", "secondary-button", "View details");
+    details.type = "button";
+    details.dataset.executionId = String(item.id);
+    details.addEventListener("click", () => openExecutionDetail(item.id, details));
+    actions.append(details);
     if (["paused_for_approval", "paused_operator"].includes(item.status)) {
       const resume = element("button", "primary-button", "Resume");
       resume.addEventListener("click", () => postAction(`/api/v1/scheduled-executions/${encodeURIComponent(item.id)}/resume`, {}, "Scheduled execution queued for resume."));
@@ -497,8 +514,15 @@ function renderChangeInbox() {
   }));
 }
 
-function openRunDrawer(run) {
+function openRunDrawer(run, opener = null) {
+  cancelExecutionDetail();
   const steps = latestRunSteps(run);
+  openDrawer({
+    eyebrow: "Run detail",
+    title: run.objective,
+    returnFocus: opener,
+    returnTarget: { selector: "[data-run-id]", datasetKey: "runId", id: String(run.id) },
+  });
   $("#drawer-title").textContent = run.objective;
   const content = $("#drawer-content");
   const overview = element("section", "detail-block");
@@ -516,16 +540,49 @@ function openRunDrawer(run) {
     stepBlock.append(row);
   });
   setChildren(content, overview, stepBlock);
+  $("#detail-drawer").setAttribute("aria-busy", "false");
+}
+
+function openDrawer({ eyebrow, title, returnFocus = null, returnTarget = null }) {
+  state.drawer.returnFocus = returnFocus;
+  state.drawer.returnTarget = returnTarget;
+  $("#drawer-eyebrow").textContent = eyebrow;
+  $("#drawer-title").textContent = title;
   $("#drawer-backdrop").classList.remove("hidden");
-  $("#detail-drawer").classList.add("open");
-  $("#detail-drawer").setAttribute("aria-hidden", "false");
+  const drawer = $("#detail-drawer");
+  drawer.classList.add("open");
+  drawer.removeAttribute("inert");
+  drawer.setAttribute("aria-hidden", "false");
   $("#drawer-close").focus();
 }
 
+function resetExecutionDetail() {
+  state.executionDetail = { id: "", status: "idle", data: null, error: "", controller: null };
+}
+
+function cancelExecutionDetail() {
+  const controller = state.executionDetail.controller;
+  state.executionDetail.controller = null;
+  if (controller) controller.abort();
+  resetExecutionDetail();
+}
+
 function closeDrawer() {
+  const returnTarget = state.drawer.returnTarget;
+  const returnFocus = state.drawer.returnFocus;
+  cancelExecutionDetail();
   $("#drawer-backdrop").classList.add("hidden");
-  $("#detail-drawer").classList.remove("open");
-  $("#detail-drawer").setAttribute("aria-hidden", "true");
+  const drawer = $("#detail-drawer");
+  drawer.classList.remove("open");
+  drawer.setAttribute("aria-hidden", "true");
+  drawer.setAttribute("aria-busy", "false");
+  drawer.setAttribute("inert", "");
+  const currentReturnTarget = returnTarget
+    ? $$(returnTarget.selector).find((item) => item.dataset[returnTarget.datasetKey] === returnTarget.id)
+    : null;
+  const target = currentReturnTarget || returnFocus;
+  state.drawer = { returnFocus: null, returnTarget: null };
+  if (target && typeof target.focus === "function") target.focus();
 }
 
 function renderAssets() {
@@ -683,6 +740,311 @@ function appendDetails(list, details) {
   });
 }
 
+function detailBlock(title, details = []) {
+  const block = element("section", "detail-block");
+  block.append(element("h3", "", title));
+  if (details.length) {
+    const list = element("dl", "modal-details detail-grid");
+    appendDetails(list, details);
+    block.append(list);
+  }
+  return block;
+}
+
+function detailSubsection(title, details) {
+  const block = element("div", "detail-subsection");
+  block.append(element("h4", "", title));
+  const list = element("dl", "modal-details detail-grid");
+  appendDetails(list, details);
+  block.append(list);
+  return block;
+}
+
+function boolText(value) {
+  return value ? "Yes" : "No";
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function collectionValue(value) {
+  const items = Array.isArray(value?.items) ? value.items : [];
+  const total = Number.isFinite(Number(value?.total)) ? Number(value.total) : items.length;
+  return { items, total, truncated: Boolean(value?.truncated) };
+}
+
+function appendCollectionSummary(block, collection) {
+  const summary = element("div", "collection-summary");
+  summary.append(element("span", "", `Showing ${collection.items.length} of ${collection.total}`));
+  if (collection.truncated) summary.append(element("span", "status-badge warning", "Results truncated"));
+  block.append(summary);
+}
+
+function appendEmptyOrItems(block, items, emptyMessage, renderItem) {
+  if (!items.length) {
+    block.append(empty(emptyMessage));
+    return;
+  }
+  const list = element("div", "detail-item-list");
+  items.forEach((item, index) => list.append(renderItem(item, index)));
+  block.append(list);
+}
+
+const lineageIssueDescriptions = {
+  scope_missing: "The referenced scope row was unavailable.",
+  scope_program_mismatch: "The scope program does not match the execution program.",
+  task_missing: "The referenced task row was unavailable.",
+  task_program_mismatch: "The task program does not match the execution program.",
+  workflow_missing: "The referenced workflow run was unavailable.",
+  workflow_without_execution_task: "A workflow is linked while the execution has no task link.",
+  workflow_task_mismatch: "The workflow task does not match the execution task.",
+  workflow_definition_missing: "The referenced workflow definition was unavailable.",
+  workflow_definition_mismatch: "Task and workflow definition links do not match.",
+  workflow_definition_version_mismatch: "The workflow run version differs from the current definition version.",
+  approval_lineage_inconsistent: "At least one approval has contradictory task lineage.",
+  artifact_lineage_inconsistent: "At least one artifact has contradictory execution lineage.",
+  candidate_finding_lineage_inconsistent: "At least one candidate has contradictory execution lineage.",
+  asset_observation_lineage_inconsistent: "At least one observation has contradictory program lineage.",
+  change_item_lineage_inconsistent: "At least one change item has contradictory execution lineage.",
+};
+
+function renderExecutionLoading(id) {
+  $("#detail-drawer").setAttribute("aria-busy", "true");
+  const loading = element("div", "detail-state");
+  loading.setAttribute("role", "status");
+  loading.setAttribute("aria-live", "polite");
+  loading.append(element("div", "scanner-line"), element("h3", "", "Loading execution detail"), element("p", "", `Reading the coherent projection for execution ${id}.`));
+  setChildren($("#drawer-content"), loading);
+}
+
+function renderExecutionError(message, id) {
+  $("#detail-drawer").setAttribute("aria-busy", "false");
+  const failure = element("div", "detail-state detail-error");
+  failure.setAttribute("role", "alert");
+  failure.append(element("h3", "", message), element("p", "", `Execution ${id}`));
+  const retry = element("button", "secondary-button", "Retry");
+  retry.type = "button";
+  retry.addEventListener("click", () => openExecutionDetail(id, retry));
+  failure.append(retry);
+  setChildren($("#drawer-content"), failure);
+}
+
+function renderExecutionProjection(projection) {
+  const execution = projection?.execution || {};
+  const scheduler = projection?.scheduler || {};
+  const trigger = projection?.trigger || {};
+  const schedule = projection?.current_schedule || {};
+  const program = projection?.current_program || {};
+  const scope = projection?.scope || null;
+  const task = projection?.task || null;
+  const workflow = projection?.workflow || null;
+  const steps = Array.isArray(projection?.steps) ? projection.steps : [];
+  const issues = Array.isArray(projection?.lineage?.issues) ? projection.lineage.issues : [];
+
+  $("#drawer-title").textContent = schedule.name || `Execution ${shortID(execution.id || state.executionDetail.id)}`;
+  $("#detail-drawer").setAttribute("aria-busy", "false");
+
+  const summary = detailBlock("Execution summary");
+  const summaryHead = element("div", "detail-summary-head");
+  const summaryCopy = element("div");
+  summaryCopy.append(element("strong", "mono", execution.id || state.executionDetail.id), element("small", "", `Observed ${formatTime(projection?.observed_at, true)}`));
+  summaryHead.append(summaryCopy, statusBadge(scheduler.status));
+  summary.append(summaryHead);
+
+  const blocks = [summary];
+  if (issues.length) {
+    const diagnostics = detailBlock("Lineage diagnostics");
+    diagnostics.classList.add("diagnostic-block");
+    const list = element("div", "warning-list");
+    issues.forEach((issue) => {
+      const row = element("div", "warning-row");
+      row.append(element("strong", "mono", issue), element("span", "", lineageIssueDescriptions[issue] || "The projection reported a lineage inconsistency."));
+      list.append(row);
+    });
+    diagnostics.append(list);
+    blocks.push(diagnostics);
+  }
+
+  blocks.push(detailBlock("Scheduler status", [
+    ["Status", scheduler.status],
+    ["Trigger", trigger.source],
+    ["Planned", formatTime(trigger.planned_at, true)],
+    ["Started", formatTime(scheduler.started_at, true)],
+    ["Completed", formatTime(scheduler.completed_at, true)],
+    ["Attempts", scheduler.attempt_count],
+    ["Lease state", scheduler.lease_state],
+    ["Lease owner", scheduler.lease_owner],
+    ["Lease expires", formatTime(scheduler.lease_expires_at, true)],
+    ["Recovery protocol", scheduler.recovery_protocol_version],
+    ["Error classification", scheduler.error_classification],
+    ["Error summary", scheduler.error_summary],
+    ["Execution created", formatTime(execution.created_at, true)],
+    ["Execution updated", formatTime(execution.updated_at, true)],
+  ]));
+
+  const current = detailBlock("Current program / schedule");
+  current.append(element("p", "detail-note", "Current schedule settings are mutable and are not an execution-time schedule snapshot."));
+  current.append(detailSubsection("Program", [["Name", program.name], ["Platform", program.platform], ["Program ID", program.id]]));
+  current.append(detailSubsection("Current schedule settings", [
+    ["Name", schedule.name], ["Workflow", schedule.workflow_name], ["Objective", schedule.objective],
+    ["Cron", schedule.cron_expression], ["Timezone", schedule.timezone], ["Enabled", boolText(schedule.enabled)],
+    ["Headless", boolText(schedule.headless)], ["Created by", schedule.created_by],
+    ["Last run", formatTime(schedule.last_run_at, true)], ["Next run", formatTime(schedule.next_run_at, true)],
+  ]));
+  blocks.push(current);
+
+  const lineage = detailBlock("Lineage");
+  lineage.append(detailSubsection("Execution links", [
+    ["Execution ID", execution.id], ["Schedule ID", execution.schedule_id], ["Program ID", execution.program_id],
+    ["Scope version ID", execution.scope_version_id || "Not linked"], ["Task ID", execution.task_id || "Not linked"],
+    ["Workflow run ID", execution.workflow_run_id || "Not linked"],
+  ]));
+  if (scope) {
+    const scopeDetails = detailSubsection("Scope", [
+      ["ID", scope.id], ["Current scope reference", scope.scope_reference], ["Scope digest", scope.scope_digest],
+      ["Target plan digest", scope.target_plan_digest], ["Expands scope", boolText(scope.expands_scope)],
+      ["Acknowledged", formatTime(scope.acknowledged_at, true)], ["Created", formatTime(scope.created_at, true)],
+    ]);
+    scopeDetails.append(element("p", "detail-note", "Scope and target-plan digests are historical values on this scope row. Scope reference is current locator metadata and may have been repaired."));
+    lineage.append(scopeDetails);
+  } else {
+    lineage.append(element("p", "empty-copy", `Scope: ${execution.scope_version_id ? "Unavailable" : "Not linked"}`));
+  }
+  lineage.append(task ? detailSubsection("Task", [
+    ["ID", task.id], ["Objective", task.objective], ["Status", task.status], ["Requested by", task.requested_by],
+    ["Workflow definition ID", task.workflow_definition_id], ["Schedule reference", task.schedule_reference],
+    ["Cancelled", formatTime(task.cancelled_at, true)], ["Created", formatTime(task.created_at, true)], ["Updated", formatTime(task.updated_at, true)],
+  ]) : element("p", "empty-copy", `Task: ${execution.task_id ? "Unavailable" : "Not linked"}`));
+  lineage.append(workflow ? detailSubsection("Workflow run", [
+    ["ID", workflow.id], ["Task ID", workflow.task_id], ["Workflow definition ID", workflow.workflow_definition_id],
+    ["Definition name", workflow.definition_name], ["Workflow version", workflow.workflow_version], ["Status", workflow.status],
+    ["Previous run ID", workflow.previous_run_id], ["Trigger", workflow.trigger_source],
+    ["Started", formatTime(workflow.started_at, true)], ["Completed", formatTime(workflow.completed_at, true)],
+  ]) : element("p", "empty-copy", `Workflow run: ${execution.workflow_run_id ? "Unavailable" : "Not linked"}`));
+  blocks.push(lineage);
+
+  const stepBlock = detailBlock("Workflow steps");
+  appendEmptyOrItems(stepBlock, steps, "No workflow steps are linked to this execution.", (step, index) => {
+    const row = element("div", "detail-item step-detail");
+    const copy = element("div");
+    copy.append(element("strong", "", step.step_definition_id || `Step ${index + 1}`), element("small", "", `${step.capability || "—"} · ${step.attempt_count || 0} attempt${step.attempt_count === 1 ? "" : "s"}`));
+    const facts = element("dl", "compact-details");
+    appendDetails(facts, [["Step ID", step.id], ["Workflow run", step.workflow_run_id], ["Approval", step.approval_state], ["Error", step.error_classification], ["Started", formatTime(step.started_at, true)], ["Completed", formatTime(step.completed_at, true)]]);
+    copy.append(facts);
+    row.append(element("span", "step-index", String(index + 1).padStart(2, "0")), copy, statusBadge(step.status));
+    return row;
+  });
+  blocks.push(stepBlock);
+
+  const toolRuns = collectionValue(projection?.tool_runs);
+  const toolBlock = detailBlock("Tool runs");
+  appendCollectionSummary(toolBlock, toolRuns);
+  appendEmptyOrItems(toolBlock, toolRuns.items, "No tool runs are linked to this execution.", (item) => detailSubsection(`${item.provider || "Unknown provider"}${item.tool_version ? ` · ${item.tool_version}` : ""}`, [
+    ["ID", item.id], ["Step run ID", item.step_run_id], ["Step definition", item.step_definition_id], ["Capability", item.capability],
+    ["Started", formatTime(item.started_at, true)], ["Completed", formatTime(item.completed_at, true)],
+    ["Exit code", item.exit_code], ["Timed out", boolText(item.timed_out)],
+    ["Stdout artifact ID", item.stdout_artifact_id], ["Stderr artifact ID", item.stderr_artifact_id],
+  ]));
+  blocks.push(toolBlock);
+
+  const approvals = collectionValue(projection?.approvals);
+  const approvalBlock = detailBlock("Approvals");
+  appendCollectionSummary(approvalBlock, approvals);
+  appendEmptyOrItems(approvalBlock, approvals.items, "No approvals are linked to this execution.", (item) => detailSubsection(item.reason || `Approval ${shortID(item.id)}`, [
+    ["ID", item.id], ["Step run ID", item.step_run_id], ["Task ID", item.task_id], ["Risk level", item.requested_risk_level],
+    ["Decision", item.decision], ["Requested", formatTime(item.requested_at, true)], ["Decided by", item.decided_by],
+    ["Decided", formatTime(item.decided_at, true)], ["Expires", formatTime(item.expires_at, true)],
+  ]));
+  blocks.push(approvalBlock);
+
+  const artifacts = collectionValue(projection?.artifacts);
+  const artifactBlock = detailBlock("Artifact references");
+  artifactBlock.append(element("p", "detail-note", "Metadata only. Artifact contents are not retrieved by this console view."));
+  appendCollectionSummary(artifactBlock, artifacts);
+  appendEmptyOrItems(artifactBlock, artifacts.items, "No visible artifact references are linked to this execution.", (item) => detailSubsection(`${item.type || "Artifact"} · ${shortID(item.id)}`, [
+    ["ID", item.id], ["Task ID", item.task_id], ["Workflow run ID", item.workflow_run_id], ["Step run ID", item.step_run_id],
+    ["Tool run ID", item.tool_run_id], ["Content type", item.content_type], ["Size", formatBytes(item.size)],
+    ["SHA-256", item.sha256], ["Redaction state", item.redaction_state], ["Created", formatTime(item.created_at, true)], ["Expires", formatTime(item.expires_at, true)],
+  ]));
+  blocks.push(artifactBlock);
+
+  const candidates = collectionValue(projection?.candidate_findings);
+  const candidateBlock = detailBlock("Candidate findings");
+  candidateBlock.append(element("p", "detail-note", "Candidate metadata is separate from verified findings. Status and updated time reflect current candidate state. Verification provenance is not included in this projection."));
+  appendCollectionSummary(candidateBlock, candidates);
+  appendEmptyOrItems(candidateBlock, candidates.items, "No candidate findings are linked to this execution.", (item) => detailSubsection(`Candidate ${shortID(item.id)}`, [
+    ["ID", item.id], ["Task ID", item.task_id], ["Workflow run ID", item.workflow_run_id], ["Target asset ID", item.target_asset_id],
+    ["Source capability", item.source_capability], ["Detection confidence", `${Math.round((Number(item.detection_confidence) || 0) * 100)}%`],
+    ["Current status", item.status], ["Evidence artifact IDs", (Array.isArray(item.evidence_artifact_ids) ? item.evidence_artifact_ids : []).join(", ")],
+    ["Created", formatTime(item.created_at, true)], ["Current state updated", formatTime(item.updated_at, true)],
+  ]));
+  blocks.push(candidateBlock);
+
+  blocks.push(detailBlock("Asset observation summary", [
+    ["Observations", projection?.asset_observations?.total ?? 0],
+    ["Distinct assets", projection?.asset_observations?.distinct_asset_count ?? 0],
+  ]));
+
+  const changes = collectionValue(projection?.change_items);
+  const changeBlock = detailBlock("Change items");
+  appendCollectionSummary(changeBlock, changes);
+  appendEmptyOrItems(changeBlock, changes.items, "No change items are linked to this execution.", (item) => detailSubsection(`${item.kind || "Change"} · ${item.entity_type || "entity"}`, [
+    ["ID", item.id], ["Program ID", item.program_id], ["Workflow run ID", item.workflow_run_id], ["Scheduled execution ID", item.scheduled_execution_id],
+    ["Priority", item.priority], ["Source capabilities", (Array.isArray(item.source_capabilities) ? item.source_capabilities : []).join(", ")],
+    ["Evidence artifact IDs", (Array.isArray(item.evidence_artifact_ids) ? item.evidence_artifact_ids : []).join(", ")],
+    ["Observed", formatTime(item.observed_at, true)], ["Created", formatTime(item.created_at, true)],
+  ]));
+  blocks.push(changeBlock);
+
+  if (!issues.length) {
+    blocks.push(detailBlock("Projection diagnostics", [["Lineage issues reported", 0]]));
+  }
+  setChildren($("#drawer-content"), ...blocks);
+}
+
+async function openExecutionDetail(id, opener = null) {
+  cancelExecutionDetail();
+  const selectedID = String(id || "");
+  const controller = new AbortController();
+  state.executionDetail = { id: selectedID, status: "loading", data: null, error: "", controller };
+  openDrawer({
+    eyebrow: "Scheduled execution",
+    title: `Execution ${shortID(selectedID)}`,
+    returnFocus: opener,
+    returnTarget: { selector: "[data-execution-id]", datasetKey: "executionId", id: selectedID },
+  });
+  renderExecutionLoading(selectedID);
+  try {
+    const response = await fetch(`/api/v1/scheduled-executions/${encodeURIComponent(selectedID)}`, {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    const body = await response.json().catch(() => null);
+    if (state.executionDetail.controller !== controller || state.executionDetail.id !== selectedID) return;
+    if (!response.ok) {
+      const message = response.status === 404 ? "Scheduled execution no longer exists." : "Execution detail is temporarily unavailable.";
+      state.executionDetail = { id: selectedID, status: "error", data: null, error: message, controller };
+      renderExecutionError(message, selectedID);
+      return;
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid execution detail response");
+    state.executionDetail = { id: selectedID, status: "ready", data: body, error: "", controller };
+    renderExecutionProjection(body);
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    if (state.executionDetail.controller !== controller || state.executionDetail.id !== selectedID) return;
+    const message = "Execution detail is temporarily unavailable.";
+    state.executionDetail = { id: selectedID, status: "error", data: null, error: message, controller };
+    renderExecutionError(message, selectedID);
+  }
+}
+
 function openModal(config) {
   state.modalAction = config.action;
   $("#modal-eyebrow").textContent = config.eyebrow;
@@ -776,12 +1138,41 @@ function bindEvents() {
     }
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape") return;
-    if (!$("#action-modal").classList.contains("hidden")) closeModal();
-    else closeDrawer();
+    if (event.key === "Escape") {
+      if (!$("#action-modal").classList.contains("hidden")) closeModal();
+      else if ($("#detail-drawer").classList.contains("open")) closeDrawer();
+      return;
+    }
+    if (event.key !== "Tab" || !$("#detail-drawer").classList.contains("open")) return;
+    const focusable = $$('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])', $("#detail-drawer"));
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   });
 }
 
-bindEvents();
-loadData();
-state.timer = setInterval(() => loadData({ quiet: true }), 5000);
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    state,
+    closeDrawer,
+    openExecutionDetail,
+    openRunDrawer,
+    renderExecutionProjection,
+    renderRuns,
+    renderSchedules,
+  };
+} else {
+  bindEvents();
+  loadData();
+  state.timer = setInterval(() => loadData({ quiet: true }), 5000);
+}

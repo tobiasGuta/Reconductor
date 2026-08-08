@@ -494,7 +494,7 @@ func TestStaticConsoleHasSecurityHeaders(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), "Reconductor Console") {
 		t.Fatal("console shell was not served")
 	}
-	for _, expected := range []string{"Pending scope expansions", "continuous-web-recon", "authorized-web-baseline", "headless", "schedule-cancel", "show-low-priority"} {
+	for _, expected := range []string{"Pending scope expansions", "continuous-web-recon", "authorized-web-baseline", "headless", "schedule-cancel", "show-low-priority", `role="dialog"`, `aria-modal="true"`, "inert"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("console shell is missing schedule/scope control %q", expected)
 		}
@@ -504,7 +504,7 @@ func TestStaticConsoleHasSecurityHeaders(t *testing.T) {
 	if appRecorder.Code != http.StatusOK {
 		t.Fatalf("app.js status = %d", appRecorder.Code)
 	}
-	for _, expected := range []string{"Optional review note", "show-low-priority", "note.value.trim()"} {
+	for _, expected := range []string{"Optional review note", "show-low-priority", "note.value.trim()", "View details", "openExecutionDetail", "dataset.executionId"} {
 		if !strings.Contains(appRecorder.Body.String(), expected) {
 			t.Fatalf("console app is missing change-review control %q", expected)
 		}
