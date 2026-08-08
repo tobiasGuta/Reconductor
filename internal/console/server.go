@@ -24,6 +24,7 @@ var staticFiles embed.FS
 
 type Store interface {
 	ConsoleSnapshot(context.Context, domain.ID) (database.ConsoleSnapshot, error)
+	GetExecutionProjection(context.Context, domain.ID) (database.ExecutionProjection, error)
 	DecideApproval(context.Context, domain.ID, string, string) error
 }
 
@@ -82,6 +83,7 @@ func New(store Store, workQueue Queue, validators ...*schedulecron.ScheduleValid
 	}
 	s := &Server{store: store, queue: workQueue, validator: validator, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /api/v1/snapshot", s.snapshot)
+	s.mux.HandleFunc("GET /api/v1/scheduled-executions/{id}", s.executionDetail)
 	s.mux.HandleFunc("POST /api/v1/approvals/{id}/decision", s.decideApproval)
 	s.mux.HandleFunc("POST /api/v1/schedules", s.createSchedule)
 	s.mux.HandleFunc("POST /api/v1/schedules/{id}/update", s.updateSchedule)
@@ -382,6 +384,25 @@ func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) executionDetail(w http.ResponseWriter, r *http.Request) {
+	id := domain.ID(r.PathValue("id"))
+	projection, err := s.store.GetExecutionProjection(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, database.ErrScheduledExecutionNotFound) {
+			writeError(w, http.StatusNotFound, "scheduled execution not found")
+			return
+		}
+		slog.Error(
+			"operator console execution detail failed",
+			"scheduled_execution_id", id,
+			"error", err,
+		)
+		writeError(w, http.StatusInternalServerError, "execution detail is temporarily unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, projection)
 }
 
 func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request) {
