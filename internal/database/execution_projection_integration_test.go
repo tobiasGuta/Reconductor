@@ -34,8 +34,8 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if counter.count != 1 {
-			t.Fatalf("pending projection query count = %d, want root query only", counter.count)
+		if counter.count != 2 {
+			t.Fatalf("pending projection query count = %d, want root and direct change-item queries", counter.count)
 		}
 		if err := tx.Commit(env.ctx); err != nil {
 			t.Fatal(err)
@@ -52,10 +52,10 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if projection.Task != nil || projection.Workflow != nil || projection.Scope != nil || len(projection.Steps) != 0 {
 			t.Fatalf("unexpected optional lineage task=%#v workflow=%#v scope=%#v steps=%#v", projection.Task, projection.Workflow, projection.Scope, projection.Steps)
 		}
-		if projection.ToolRuns.Items == nil || projection.Approvals.Items == nil || projection.Artifacts.Items == nil || projection.Candidates.Items == nil ||
-			projection.ToolRuns.Total != 0 || projection.Approvals.Total != 0 || projection.Artifacts.Total != 0 || projection.Candidates.Total != 0 ||
-			projection.ToolRuns.Truncated || projection.Approvals.Truncated || projection.Artifacts.Truncated || projection.Candidates.Truncated {
-			t.Fatalf("empty children tools=%#v approvals=%#v artifacts=%#v candidates=%#v", projection.ToolRuns, projection.Approvals, projection.Artifacts, projection.Candidates)
+		if projection.ToolRuns.Items == nil || projection.Approvals.Items == nil || projection.Artifacts.Items == nil || projection.Candidates.Items == nil || projection.ChangeItems.Items == nil ||
+			projection.ToolRuns.Total != 0 || projection.Approvals.Total != 0 || projection.Artifacts.Total != 0 || projection.Candidates.Total != 0 || projection.ChangeItems.Total != 0 ||
+			projection.ToolRuns.Truncated || projection.Approvals.Truncated || projection.Artifacts.Truncated || projection.Candidates.Truncated || projection.ChangeItems.Truncated {
+			t.Fatalf("empty children tools=%#v approvals=%#v artifacts=%#v candidates=%#v changes=%#v", projection.ToolRuns, projection.Approvals, projection.Artifacts, projection.Candidates, projection.ChangeItems)
 		}
 		if projection.AssetObservations.Total != 0 || projection.AssetObservations.DistinctAssetCount != 0 {
 			t.Fatalf("pending observation summary = %#v", projection.AssetObservations)
@@ -333,7 +333,7 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 			}
 		}()
 		completedAt := time.Now().UTC()
-		toolID, approvalID, artifactID, assetID, candidateID, observationID := domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID()
+		toolID, approvalID, artifactID, assetID, candidateID, observationID, changeItemID := domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID()
 		if _, err := writeTx.Exec(ctx, `UPDATE tasks SET status='completed',updated_at=$2 WHERE id=$1`, fixture.task.ID, completedAt); err != nil {
 			t.Fatal(err)
 		}
@@ -361,6 +361,9 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if _, err := writeTx.Exec(ctx, `INSERT INTO asset_observations(id,asset_id,workflow_run_id,source_capability,observed_value,metadata,first_seen_at,observed_at,confidence,evidence_artifact_ids) VALUES($1,$2,$3,'probe.http','snapshot-observation','{}',$4,$4,1,'{}')`, observationID, assetID, fixture.runID, completedAt); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := writeTx.Exec(ctx, `INSERT INTO change_items(id,program_id,workflow_run_id,scheduled_execution_id,kind,entity_type,entity_key,priority,title,safe_summary,reasons,previous_value,current_value,source_capabilities,evidence_artifact_ids,observed_at,created_at) VALUES($1,$2,$3,$4,'snapshot','asset','snapshot-change','medium','snapshot title','snapshot summary','[]',NULL,NULL,'{}','{}',$5,$5)`, changeItemID, env.programID, fixture.runID, fixture.execution.ID, completedAt); err != nil {
+			t.Fatal(err)
+		}
 		if err := writeTx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -379,8 +382,8 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if first.projection.Task == nil || first.projection.Task.Status != domain.TaskRunning || first.projection.Workflow == nil || first.projection.Workflow.Status != domain.RunRunning || first.projection.Steps[0].Status != domain.StepRunning {
 			t.Fatalf("first snapshot task=%#v workflow=%#v steps=%#v", first.projection.Task, first.projection.Workflow, first.projection.Steps)
 		}
-		if first.projection.ToolRuns.Total != 0 || first.projection.Approvals.Total != 0 || first.projection.Artifacts.Total != 0 || first.projection.Candidates.Total != 0 || first.projection.AssetObservations.Total != 0 || first.projection.AssetObservations.DistinctAssetCount != 0 {
-			t.Fatalf("first snapshot saw later children tools=%#v approvals=%#v artifacts=%#v candidates=%#v observations=%#v", first.projection.ToolRuns, first.projection.Approvals, first.projection.Artifacts, first.projection.Candidates, first.projection.AssetObservations)
+		if first.projection.ToolRuns.Total != 0 || first.projection.Approvals.Total != 0 || first.projection.Artifacts.Total != 0 || first.projection.Candidates.Total != 0 || first.projection.AssetObservations.Total != 0 || first.projection.AssetObservations.DistinctAssetCount != 0 || first.projection.ChangeItems.Total != 0 {
+			t.Fatalf("first snapshot saw later children tools=%#v approvals=%#v artifacts=%#v candidates=%#v observations=%#v changes=%#v", first.projection.ToolRuns, first.projection.Approvals, first.projection.Artifacts, first.projection.Candidates, first.projection.AssetObservations, first.projection.ChangeItems)
 		}
 		if err := readTx.Commit(ctx); err != nil {
 			t.Fatal(err)
@@ -393,8 +396,8 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if second.Task == nil || second.Task.Status != domain.TaskCompleted || second.Workflow == nil || second.Workflow.Status != domain.RunCompleted || second.Steps[0].Status != domain.StepSucceeded {
 			t.Fatalf("second snapshot task=%#v workflow=%#v steps=%#v", second.Task, second.Workflow, second.Steps)
 		}
-		if second.ToolRuns.Total != 1 || second.Approvals.Total != 1 || second.Artifacts.Total != 1 || second.Candidates.Total != 1 || second.Candidates.Items[0].ID != candidateID || second.AssetObservations.Total != 1 || second.AssetObservations.DistinctAssetCount != 1 {
-			t.Fatalf("second snapshot children tools=%#v approvals=%#v artifacts=%#v candidates=%#v observations=%#v", second.ToolRuns, second.Approvals, second.Artifacts, second.Candidates, second.AssetObservations)
+		if second.ToolRuns.Total != 1 || second.Approvals.Total != 1 || second.Artifacts.Total != 1 || second.Candidates.Total != 1 || second.Candidates.Items[0].ID != candidateID || second.AssetObservations.Total != 1 || second.AssetObservations.DistinctAssetCount != 1 || second.ChangeItems.Total != 1 || second.ChangeItems.Items[0].ID != changeItemID {
+			t.Fatalf("second snapshot children tools=%#v approvals=%#v artifacts=%#v candidates=%#v observations=%#v changes=%#v", second.ToolRuns, second.Approvals, second.Artifacts, second.Candidates, second.AssetObservations, second.ChangeItems)
 		}
 	})
 }
@@ -669,6 +672,10 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 					ObservedValue:    fmt.Sprintf("query-count-%d-%d", index, observationIndex),
 				})
 			}
+			insertProjectionChangeItem(t, env, projectionChangeItemSpec{
+				ProgramID: env.programID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &fixture.execution.ID,
+				EntityKey: fmt.Sprintf("query-count-%d", index), ObservedAt: now.Add(time.Duration(index) * time.Millisecond),
+			})
 		}
 
 		tx, err := env.store.beginExecutionProjection(env.ctx)
@@ -681,11 +688,11 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if counter.count != 10 {
-			t.Fatalf("projection query count = %d, want 10", counter.count)
+		if counter.count != 11 {
+			t.Fatalf("projection query count = %d, want 11", counter.count)
 		}
-		if len(projection.Steps) != 3 || projection.ToolRuns.Total != 3 || projection.Approvals.Total != 3 || projection.Artifacts.Total != 3 || projection.Candidates.Total != 3 || projection.AssetObservations.Total != 6 || projection.AssetObservations.DistinctAssetCount != 3 {
-			t.Fatalf("counted projection steps=%d tools=%#v approvals=%#v artifacts=%#v candidates=%#v observations=%#v", len(projection.Steps), projection.ToolRuns, projection.Approvals, projection.Artifacts, projection.Candidates, projection.AssetObservations)
+		if len(projection.Steps) != 3 || projection.ToolRuns.Total != 3 || projection.Approvals.Total != 3 || projection.Artifacts.Total != 3 || projection.Candidates.Total != 3 || projection.AssetObservations.Total != 6 || projection.AssetObservations.DistinctAssetCount != 3 || projection.ChangeItems.Total != 3 {
+			t.Fatalf("counted projection steps=%d tools=%#v approvals=%#v artifacts=%#v candidates=%#v observations=%#v changes=%#v", len(projection.Steps), projection.ToolRuns, projection.Approvals, projection.Artifacts, projection.Candidates, projection.AssetObservations, projection.ChangeItems)
 		}
 		if err := tx.Commit(env.ctx); err != nil {
 			t.Fatal(err)
@@ -860,6 +867,228 @@ func TestExecutionProjectionCandidateChildrenIntegration(t *testing.T) {
 		}
 		if got := countLineageIssue(over.Lineage.Issues, ExecutionLineageCandidateFindingInconsistent); got != 1 {
 			t.Fatalf("post-limit candidate lineage issue count = %d, issues=%v", got, over.Lineage.Issues)
+		}
+	})
+}
+
+func TestExecutionProjectionChangeItemsIntegration(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "execution-projection-change-items")
+	running := domain.RunRunning
+
+	t.Run("empty direct collection", func(t *testing.T) {
+		fixture := createRecoveryFixture(t, env, "projection-change-empty", &running, domain.TaskRunning, nil)
+		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projection.ChangeItems.Items == nil || len(projection.ChangeItems.Items) != 0 || projection.ChangeItems.Total != 0 || projection.ChangeItems.Truncated {
+			t.Fatalf("empty change items = %#v", projection.ChangeItems)
+		}
+	})
+
+	t.Run("direct member remains visible without execution workflow", func(t *testing.T) {
+		supporting := createRecoveryFixture(t, env, "projection-change-supporting-workflow", &running, domain.TaskRunning, nil)
+		schedule := createIntegrationSchedule(t, env.ctx, env.store, env.programID, "projection-change-no-workflow")
+		execution, err := env.store.EnqueueRunNow(env.ctx, schedule.ID, "integration")
+		if err != nil {
+			t.Fatal(err)
+		}
+		changeID := insertProjectionChangeItem(t, env, projectionChangeItemSpec{
+			ProgramID: env.programID, WorkflowRunID: supporting.runID, ScheduledExecutionID: &execution.ID,
+			EntityKey: "no-execution-workflow",
+		})
+
+		projection, err := env.store.GetExecutionProjection(env.ctx, execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projection.Workflow != nil || projection.Execution.WorkflowRunID != nil {
+			t.Fatalf("pending execution unexpectedly has workflow lineage: execution=%#v workflow=%#v", projection.Execution, projection.Workflow)
+		}
+		if projection.ChangeItems.Total != 1 || len(projection.ChangeItems.Items) != 1 || projection.ChangeItems.Items[0].ID != changeID || projection.ChangeItems.Truncated {
+			t.Fatalf("direct no-workflow change items = %#v", projection.ChangeItems)
+		}
+		if got := countLineageIssue(projection.Lineage.Issues, ExecutionLineageChangeItemInconsistent); got != 1 {
+			t.Fatalf("no-workflow change-item lineage issue count = %d, issues=%v", got, projection.Lineage.Issues)
+		}
+		claimed := enqueueSpecificProjectionExecution(t, env, execution.ID, "projection-change-no-workflow-cleanup")
+		if err := env.store.MarkScheduledExecutionCancelled(env.ctx, claimed.ID, claimed.LeaseOwner, claimed.AttemptCount); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("direct execution membership lineage and security boundary", func(t *testing.T) {
+		fixture := createRecoveryFixture(t, env, "projection-change-membership", &running, domain.TaskRunning, nil)
+		now := time.Now().UTC()
+		evidenceID := domain.NewID()
+		visibleID := insertProjectionChangeItem(t, env, projectionChangeItemSpec{
+			ProgramID: env.programID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &fixture.execution.ID,
+			Kind: "endpoint", EntityType: "endpoint", EntityKey: "change-entity-key-sentinel", Priority: "high",
+			Title: "change-title-sentinel", SafeSummary: "change-safe-summary-sentinel",
+			Reasons:            json.RawMessage(`[{"detail":"change-reasons-sentinel"}]`),
+			PreviousValue:      json.RawMessage(`{"secret":"change-previous-sentinel"}`),
+			CurrentValue:       json.RawMessage(`{"secret":"change-current-sentinel"}`),
+			SourceCapabilities: []string{"change-source-capability-sentinel"}, EvidenceArtifactIDs: []domain.ID{evidenceID},
+			ObservedAt: now, CreatedAt: now,
+		})
+
+		otherTask := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "projection-change-other-workflow")
+		otherRunID := domain.NewID()
+		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary) VALUES($1,$2,$3,'1','running',$4,'integration','{}')`, otherRunID, otherTask.ID, env.definitionID, now); err != nil {
+			t.Fatal(err)
+		}
+		wrongWorkflowID := insertProjectionChangeItem(t, env, projectionChangeItemSpec{
+			ProgramID: env.programID, WorkflowRunID: otherRunID, ScheduledExecutionID: &fixture.execution.ID,
+			EntityKey: "wrong-workflow-direct", SourceCapabilities: []string{}, EvidenceArtifactIDs: []domain.ID{},
+			ObservedAt: now.Add(time.Millisecond), CreatedAt: now.Add(time.Millisecond),
+		})
+
+		otherProgramID, _ := createSchedulerIntegrationProgram(t, env.ctx, env.store, "projection-change-other-program")
+		wrongProgramID := insertProjectionChangeItem(t, env, projectionChangeItemSpec{
+			ProgramID: otherProgramID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &fixture.execution.ID,
+			EntityKey: "wrong-program-direct", ObservedAt: now.Add(2 * time.Millisecond), CreatedAt: now.Add(2 * time.Millisecond),
+		})
+
+		insertProjectionChangeItem(t, env, projectionChangeItemSpec{
+			ProgramID: env.programID, WorkflowRunID: fixture.runID, ScheduledExecutionID: nil,
+			EntityKey: "matching-workflow-null-execution", ObservedAt: now,
+		})
+		otherSchedule := createIntegrationSchedule(t, env.ctx, env.store, env.programID, "projection-change-other-execution")
+		otherExecution, err := env.store.EnqueueRunNow(env.ctx, otherSchedule.ID, "integration")
+		if err != nil {
+			t.Fatal(err)
+		}
+		insertProjectionChangeItem(t, env, projectionChangeItemSpec{
+			ProgramID: env.programID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &otherExecution.ID,
+			EntityKey: "matching-workflow-other-execution", ObservedAt: now,
+		})
+
+		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projection.ChangeItems.Total != 3 || len(projection.ChangeItems.Items) != 3 || projection.ChangeItems.Truncated {
+			t.Fatalf("direct change items = %#v", projection.ChangeItems)
+		}
+		seen := map[domain.ID]ExecutionProjectionChangeItem{}
+		for _, item := range projection.ChangeItems.Items {
+			seen[item.ID] = item
+			if item.ScheduledExecutionID != fixture.execution.ID {
+				t.Fatalf("non-member change item returned: %#v", item)
+			}
+		}
+		for _, id := range []domain.ID{visibleID, wrongWorkflowID, wrongProgramID} {
+			if _, ok := seen[id]; !ok {
+				t.Fatalf("direct execution member %s missing: %#v", id, projection.ChangeItems)
+			}
+		}
+		visible := seen[visibleID]
+		if visible.ProgramID != env.programID || visible.WorkflowRunID != fixture.runID || visible.Kind != "endpoint" || visible.EntityType != "endpoint" || visible.Priority != "high" || len(visible.SourceCapabilities) != 1 || visible.SourceCapabilities[0] != "change-source-capability-sentinel" || len(visible.EvidenceArtifactIDs) != 1 || visible.EvidenceArtifactIDs[0] != evidenceID {
+			t.Fatalf("change-item allow-list fields = %#v", visible)
+		}
+		emptyArrays := seen[wrongWorkflowID]
+		if emptyArrays.SourceCapabilities == nil || len(emptyArrays.SourceCapabilities) != 0 || emptyArrays.EvidenceArtifactIDs == nil || len(emptyArrays.EvidenceArtifactIDs) != 0 {
+			t.Fatalf("empty change-item arrays = %#v", emptyArrays)
+		}
+		if got := countLineageIssue(projection.Lineage.Issues, ExecutionLineageChangeItemInconsistent); got != 1 {
+			t.Fatalf("multiple change-item contradictions produced %d issues: %v", got, projection.Lineage.Issues)
+		}
+
+		encoded, err := json.Marshal(projection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		serialized := string(encoded)
+		for _, sentinel := range []string{
+			"change-entity-key-sentinel", "change-title-sentinel", "change-safe-summary-sentinel",
+			"change-reasons-sentinel", "change-previous-sentinel", "change-current-sentinel",
+		} {
+			if strings.Contains(serialized, sentinel) {
+				t.Fatalf("change-item projection leaked %q: %s", sentinel, encoded)
+			}
+		}
+		for _, allowed := range []string{"change-source-capability-sentinel", string(evidenceID)} {
+			if !strings.Contains(serialized, allowed) {
+				t.Fatalf("change-item projection omitted allowed value %q: %s", allowed, encoded)
+			}
+		}
+		if !strings.Contains(serialized, `"source_capabilities":[]`) || !strings.Contains(serialized, `"evidence_artifact_ids":[]`) {
+			t.Fatalf("empty change-item arrays did not serialize as []: %s", encoded)
+		}
+		claimed := enqueueSpecificProjectionExecution(t, env, otherExecution.ID, "projection-change-other-execution-cleanup")
+		if err := env.store.MarkScheduledExecutionCancelled(env.ctx, claimed.ID, claimed.LeaseOwner, claimed.AttemptCount); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("observed created and id ordering is deterministic", func(t *testing.T) {
+		fixture := createRecoveryFixture(t, env, "projection-change-order", &running, domain.TaskRunning, nil)
+		base := time.Now().UTC()
+		tiedIDs := []domain.ID{domain.NewID(), domain.NewID()}
+		sort.Slice(tiedIDs, func(i, j int) bool { return tiedIDs[i] < tiedIDs[j] })
+		firstID, createdSecondID, createdThirdID := domain.NewID(), domain.NewID(), domain.NewID()
+
+		insertProjectionChangeItem(t, env, projectionChangeItemSpec{ID: tiedIDs[1], ProgramID: env.programID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &fixture.execution.ID, EntityKey: "order-id-b", ObservedAt: base.Add(2 * time.Millisecond), CreatedAt: base.Add(4 * time.Millisecond)})
+		insertProjectionChangeItem(t, env, projectionChangeItemSpec{ID: createdThirdID, ProgramID: env.programID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &fixture.execution.ID, EntityKey: "order-created-third", ObservedAt: base.Add(time.Millisecond), CreatedAt: base.Add(3 * time.Millisecond)})
+		insertProjectionChangeItem(t, env, projectionChangeItemSpec{ID: firstID, ProgramID: env.programID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &fixture.execution.ID, EntityKey: "order-observed-first", ObservedAt: base, CreatedAt: base.Add(10 * time.Millisecond)})
+		insertProjectionChangeItem(t, env, projectionChangeItemSpec{ID: tiedIDs[0], ProgramID: env.programID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &fixture.execution.ID, EntityKey: "order-id-a", ObservedAt: base.Add(2 * time.Millisecond), CreatedAt: base.Add(4 * time.Millisecond)})
+		insertProjectionChangeItem(t, env, projectionChangeItemSpec{ID: createdSecondID, ProgramID: env.programID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &fixture.execution.ID, EntityKey: "order-created-second", ObservedAt: base.Add(time.Millisecond), CreatedAt: base.Add(2 * time.Millisecond)})
+
+		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []domain.ID{firstID, createdSecondID, createdThirdID, tiedIDs[0], tiedIDs[1]}
+		if len(projection.ChangeItems.Items) != len(want) {
+			t.Fatalf("ordered change-item count = %d, want %d", len(projection.ChangeItems.Items), len(want))
+		}
+		for index, id := range want {
+			if projection.ChangeItems.Items[index].ID != id {
+				t.Fatalf("change-item order[%d] = %s, want %s; items=%#v", index, projection.ChangeItems.Items[index].ID, id, projection.ChangeItems.Items)
+			}
+		}
+	})
+
+	t.Run("exact limit and post-limit contradiction", func(t *testing.T) {
+		fixture := createRecoveryFixture(t, env, "projection-change-limit", &running, domain.TaskRunning, nil)
+		observedAt := time.Now().UTC()
+		for index := 0; index < executionProjectionChangeItemLimit; index++ {
+			insertProjectionChangeItem(t, env, projectionChangeItemSpec{
+				ProgramID: env.programID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &fixture.execution.ID,
+				EntityKey: fmt.Sprintf("limit-%03d", index), ObservedAt: observedAt.Add(time.Duration(index) * time.Millisecond), CreatedAt: observedAt.Add(time.Duration(index) * time.Millisecond),
+			})
+		}
+
+		exact, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exact.ChangeItems.Total != executionProjectionChangeItemLimit || len(exact.ChangeItems.Items) != executionProjectionChangeItemLimit || exact.ChangeItems.Truncated {
+			t.Fatalf("exact-limit change items = %#v", exact.ChangeItems)
+		}
+		if containsLineageIssue(exact.Lineage.Issues, ExecutionLineageChangeItemInconsistent) {
+			t.Fatalf("consistent exact-limit change items reported contradiction: %v", exact.Lineage.Issues)
+		}
+
+		otherProgramID, _ := createSchedulerIntegrationProgram(t, env.ctx, env.store, "projection-change-limit-other-program")
+		contradictoryID := insertProjectionChangeItem(t, env, projectionChangeItemSpec{
+			ProgramID: otherProgramID, WorkflowRunID: fixture.runID, ScheduledExecutionID: &fixture.execution.ID,
+			EntityKey: "limit-064-contradictory", ObservedAt: observedAt.Add(executionProjectionChangeItemLimit * time.Millisecond), CreatedAt: observedAt.Add(executionProjectionChangeItemLimit * time.Millisecond),
+		})
+		over, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if over.ChangeItems.Total != executionProjectionChangeItemLimit+1 || len(over.ChangeItems.Items) != executionProjectionChangeItemLimit || !over.ChangeItems.Truncated {
+			t.Fatalf("over-limit change items = %#v", over.ChangeItems)
+		}
+		for _, item := range over.ChangeItems.Items {
+			if item.ID == contradictoryID {
+				t.Fatalf("post-limit contradictory change item was returned: %s", contradictoryID)
+			}
+		}
+		if got := countLineageIssue(over.Lineage.Issues, ExecutionLineageChangeItemInconsistent); got != 1 {
+			t.Fatalf("post-limit change-item lineage issue count = %d, issues=%v", got, over.Lineage.Issues)
 		}
 	})
 }
@@ -1143,6 +1372,26 @@ type projectionObservationSpec struct {
 	ObservedAt          time.Time
 }
 
+type projectionChangeItemSpec struct {
+	ID                   domain.ID
+	ProgramID            domain.ID
+	WorkflowRunID        domain.ID
+	ScheduledExecutionID *domain.ID
+	Kind                 string
+	EntityType           string
+	EntityKey            string
+	Priority             string
+	Title                string
+	SafeSummary          string
+	Reasons              json.RawMessage
+	PreviousValue        json.RawMessage
+	CurrentValue         json.RawMessage
+	SourceCapabilities   []string
+	EvidenceArtifactIDs  []domain.ID
+	ObservedAt           time.Time
+	CreatedAt            time.Time
+}
+
 func insertProjectionAsset(t *testing.T, env recoveryTestEnvironment, programID domain.ID, canonicalValue string) domain.ID {
 	t.Helper()
 	id := domain.NewID()
@@ -1175,6 +1424,50 @@ func insertProjectionObservation(t *testing.T, env recoveryTestEnvironment, spec
 		t.Fatal(err)
 	}
 	return id
+}
+
+func insertProjectionChangeItem(t *testing.T, env recoveryTestEnvironment, spec projectionChangeItemSpec) domain.ID {
+	t.Helper()
+	if spec.ID == "" {
+		spec.ID = domain.NewID()
+	}
+	if spec.Kind == "" {
+		spec.Kind = "projection-change"
+	}
+	if spec.EntityType == "" {
+		spec.EntityType = "asset"
+	}
+	if spec.EntityKey == "" {
+		spec.EntityKey = "projection-change-" + string(spec.ID)
+	}
+	if spec.Priority == "" {
+		spec.Priority = "medium"
+	}
+	if spec.Title == "" {
+		spec.Title = "projection change"
+	}
+	if spec.SafeSummary == "" {
+		spec.SafeSummary = "projection change summary"
+	}
+	if spec.Reasons == nil {
+		spec.Reasons = json.RawMessage(`[]`)
+	}
+	if spec.SourceCapabilities == nil {
+		spec.SourceCapabilities = []string{}
+	}
+	if spec.EvidenceArtifactIDs == nil {
+		spec.EvidenceArtifactIDs = []domain.ID{}
+	}
+	if spec.ObservedAt.IsZero() {
+		spec.ObservedAt = time.Now().UTC()
+	}
+	if spec.CreatedAt.IsZero() {
+		spec.CreatedAt = spec.ObservedAt
+	}
+	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO change_items(id,program_id,workflow_run_id,scheduled_execution_id,kind,entity_type,entity_key,priority,title,safe_summary,reasons,previous_value,current_value,source_capabilities,evidence_artifact_ids,observed_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, spec.ID, spec.ProgramID, spec.WorkflowRunID, spec.ScheduledExecutionID, spec.Kind, spec.EntityType, spec.EntityKey, spec.Priority, spec.Title, spec.SafeSummary, spec.Reasons, spec.PreviousValue, spec.CurrentValue, spec.SourceCapabilities, idStrings(spec.EvidenceArtifactIDs), spec.ObservedAt, spec.CreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	return spec.ID
 }
 
 func insertProjectionCandidate(t *testing.T, env recoveryTestEnvironment, spec projectionCandidateSpec) domain.ID {

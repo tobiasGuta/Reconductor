@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	executionProjectionToolRunLimit   = 64
-	executionProjectionApprovalLimit  = 32
-	executionProjectionArtifactLimit  = 128
-	executionProjectionCandidateLimit = 64
+	executionProjectionToolRunLimit    = 64
+	executionProjectionApprovalLimit   = 32
+	executionProjectionArtifactLimit   = 128
+	executionProjectionCandidateLimit  = 64
+	executionProjectionChangeItemLimit = 64
 
 	executionProjectionToolRunsQuery = `SELECT tr.id,tr.step_run_id,sr.step_definition_id,tr.capability,tr.provider,tr.tool_version,
 		tr.started_at,tr.completed_at,tr.exit_code,tr.timed_out,tr.stdout_artifact_id,tr.stderr_artifact_id,count(*) OVER()
@@ -53,6 +54,13 @@ const (
 		FROM asset_observations ao
 		LEFT JOIN assets a ON a.id=ao.asset_id
 		WHERE ao.workflow_run_id=$1`
+	executionProjectionChangeItemsQuery = `SELECT ci.id,ci.program_id,ci.workflow_run_id,ci.scheduled_execution_id,
+		ci.kind,ci.entity_type,ci.priority,ci.source_capabilities,ci.evidence_artifact_ids,ci.observed_at,ci.created_at,
+		count(*) OVER(),bool_or(ci.workflow_run_id IS DISTINCT FROM $2 OR ci.program_id IS DISTINCT FROM $3) OVER()
+		FROM change_items ci
+		WHERE ci.scheduled_execution_id=$1
+		ORDER BY ci.observed_at ASC,ci.created_at ASC,ci.id ASC
+		LIMIT $4`
 )
 
 // ExecutionProjectionCollection is a bounded child collection observed in the
@@ -128,6 +136,23 @@ type ExecutionProjectionCandidate struct {
 	EvidenceArtifactIDs []domain.ID              `json:"evidence_artifact_ids"`
 	CreatedAt           time.Time                `json:"created_at"`
 	UpdatedAt           time.Time                `json:"updated_at"`
+}
+
+// ExecutionProjectionChangeItem contains only allow-listed classification,
+// lineage, opaque evidence-reference, and timestamp fields. Target-derived
+// payload fields and mutable review state are intentionally excluded.
+type ExecutionProjectionChangeItem struct {
+	ID                   domain.ID   `json:"id"`
+	ProgramID            domain.ID   `json:"program_id"`
+	WorkflowRunID        domain.ID   `json:"workflow_run_id"`
+	ScheduledExecutionID domain.ID   `json:"scheduled_execution_id"`
+	Kind                 string      `json:"kind"`
+	EntityType           string      `json:"entity_type"`
+	Priority             string      `json:"priority"`
+	SourceCapabilities   []string    `json:"source_capabilities"`
+	EvidenceArtifactIDs  []domain.ID `json:"evidence_artifact_ids"`
+	ObservedAt           time.Time   `json:"observed_at"`
+	CreatedAt            time.Time   `json:"created_at"`
 }
 
 func newExecutionProjectionCollection[T any]() ExecutionProjectionCollection[T] {
@@ -290,6 +315,47 @@ func loadExecutionProjectionAssetObservations(ctx context.Context, query executi
 	if inconsistent {
 		appendExecutionLineageIssue(&projection.Lineage, ExecutionLineageAssetObservationInconsistent)
 	}
+	return nil
+}
+
+func loadExecutionProjectionChangeItems(ctx context.Context, query executionProjectionQuerier, projection *ExecutionProjection) error {
+	rows, err := query.Query(
+		ctx,
+		executionProjectionChangeItemsQuery,
+		projection.Execution.ID,
+		projection.Execution.WorkflowRunID,
+		projection.CurrentProgram.ID,
+		executionProjectionChangeItemLimit,
+	)
+	if err != nil {
+		return fmt.Errorf("query execution projection change items: %w", err)
+	}
+	defer rows.Close()
+	inconsistent := false
+	for rows.Next() {
+		var item ExecutionProjectionChangeItem
+		var evidenceArtifactIDs []string
+		if err := rows.Scan(
+			&item.ID, &item.ProgramID, &item.WorkflowRunID, &item.ScheduledExecutionID,
+			&item.Kind, &item.EntityType, &item.Priority, &item.SourceCapabilities,
+			&evidenceArtifactIDs, &item.ObservedAt, &item.CreatedAt,
+			&projection.ChangeItems.Total, &inconsistent,
+		); err != nil {
+			return fmt.Errorf("scan execution projection change item: %w", err)
+		}
+		if item.SourceCapabilities == nil {
+			item.SourceCapabilities = []string{}
+		}
+		item.EvidenceArtifactIDs = idsFromStrings(evidenceArtifactIDs)
+		projection.ChangeItems.Items = append(projection.ChangeItems.Items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate execution projection change items: %w", err)
+	}
+	if inconsistent {
+		appendExecutionLineageIssue(&projection.Lineage, ExecutionLineageChangeItemInconsistent)
+	}
+	finalizeExecutionProjectionCollection(&projection.ChangeItems)
 	return nil
 }
 

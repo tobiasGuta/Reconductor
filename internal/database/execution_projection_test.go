@@ -29,8 +29,8 @@ func TestExecutionProjectionRootUsesOnePostgreSQLStatementTimestamp(t *testing.T
 }
 
 func TestExecutionProjectionEvidenceCollectionContracts(t *testing.T) {
-	if executionProjectionToolRunLimit != 64 || executionProjectionApprovalLimit != 32 || executionProjectionArtifactLimit != 128 || executionProjectionCandidateLimit != 64 {
-		t.Fatalf("collection limits tool=%d approval=%d artifact=%d candidate=%d", executionProjectionToolRunLimit, executionProjectionApprovalLimit, executionProjectionArtifactLimit, executionProjectionCandidateLimit)
+	if executionProjectionToolRunLimit != 64 || executionProjectionApprovalLimit != 32 || executionProjectionArtifactLimit != 128 || executionProjectionCandidateLimit != 64 || executionProjectionChangeItemLimit != 64 {
+		t.Fatalf("collection limits tool=%d approval=%d artifact=%d candidate=%d change_item=%d", executionProjectionToolRunLimit, executionProjectionApprovalLimit, executionProjectionArtifactLimit, executionProjectionCandidateLimit, executionProjectionChangeItemLimit)
 	}
 	for name, query := range map[string]string{
 		"tool runs":  executionProjectionToolRunsQuery,
@@ -67,6 +67,38 @@ func TestExecutionProjectionEvidenceCollectionContracts(t *testing.T) {
 	for _, excluded := range []string{"canonical_value", "template_id", "claimed_vulnerability", "severity", "verification_results", "storage_location"} {
 		if strings.Contains(executionProjectionCandidatesQuery, excluded) {
 			t.Fatalf("candidate query selects excluded field %q: %s", excluded, executionProjectionCandidatesQuery)
+		}
+	}
+}
+
+func TestExecutionProjectionChangeItemQueryContract(t *testing.T) {
+	query := strings.ToLower(executionProjectionChangeItemsQuery)
+	for _, required := range []string{
+		"count(*) over()",
+		"bool_or(ci.workflow_run_id is distinct from $2 or ci.program_id is distinct from $3) over()",
+		"where ci.scheduled_execution_id=$1",
+		"order by ci.observed_at asc,ci.created_at asc,ci.id asc",
+		"limit $4",
+	} {
+		if !strings.Contains(query, required) {
+			t.Fatalf("change-item query missing %q: %s", required, executionProjectionChangeItemsQuery)
+		}
+	}
+	where := strings.Index(query, "where ")
+	order := strings.Index(query, "order by ")
+	if where < 0 || order < where {
+		t.Fatalf("change-item query has no bounded membership clause: %s", executionProjectionChangeItemsQuery)
+	}
+	membership := query[where:order]
+	if strings.Contains(membership, "workflow_run_id") || strings.Contains(membership, "program_id") {
+		t.Fatalf("change-item membership must use only scheduled_execution_id: %s", membership)
+	}
+	for _, excluded := range []string{
+		"ci.entity_key", "ci.title", "ci.safe_summary", "ci.reasons", "ci.previous_value", "ci.current_value",
+		"change_reviews", " join ", "verification_results", "verified_findings",
+	} {
+		if strings.Contains(query, excluded) {
+			t.Fatalf("change-item query selects or dereferences excluded state %q: %s", excluded, executionProjectionChangeItemsQuery)
 		}
 	}
 }
@@ -168,12 +200,13 @@ func TestDeriveExecutionLeaseState(t *testing.T) {
 
 func TestExecutionProjectionJSONOmitsUnsafeState(t *testing.T) {
 	projection := ExecutionProjection{
-		Steps:      []ExecutionProjectionStep{},
-		ToolRuns:   newExecutionProjectionCollection[ExecutionProjectionToolRun](),
-		Approvals:  newExecutionProjectionCollection[ExecutionProjectionApproval](),
-		Artifacts:  newExecutionProjectionCollection[ExecutionProjectionArtifact](),
-		Candidates: newExecutionProjectionCollection[ExecutionProjectionCandidate](),
-		Lineage:    ExecutionProjectionLineage{Issues: []ExecutionLineageIssue{}},
+		Steps:       []ExecutionProjectionStep{},
+		ToolRuns:    newExecutionProjectionCollection[ExecutionProjectionToolRun](),
+		Approvals:   newExecutionProjectionCollection[ExecutionProjectionApproval](),
+		Artifacts:   newExecutionProjectionCollection[ExecutionProjectionArtifact](),
+		Candidates:  newExecutionProjectionCollection[ExecutionProjectionCandidate](),
+		ChangeItems: newExecutionProjectionCollection[ExecutionProjectionChangeItem](),
+		Lineage:     ExecutionProjectionLineage{Issues: []ExecutionLineageIssue{}},
 	}
 	encoded, err := json.Marshal(projection)
 	if err != nil {
@@ -191,6 +224,14 @@ func TestExecutionProjectionJSONOmitsUnsafeState(t *testing.T) {
 		`"action_request_id":`,
 		`"storage_location":`,
 		`"audit_details":`,
+		`"entity_key":`,
+		`"safe_summary":`,
+		`"reasons":`,
+		`"previous_value":`,
+		`"current_value":`,
+		`"change_reviews":`,
+		`"reviewed_by":`,
+		`"reviewed_at":`,
 	} {
 		if strings.Contains(serialized, excluded) {
 			t.Fatalf("projection serialized excluded field %s: %s", excluded, serialized)
@@ -203,6 +244,7 @@ func TestExecutionProjectionJSONOmitsUnsafeState(t *testing.T) {
 		`"artifacts":{"items":[],"total":0,"truncated":false}`,
 		`"candidate_findings":{"items":[],"total":0,"truncated":false}`,
 		`"asset_observations":{"total":0,"distinct_asset_count":0}`,
+		`"change_items":{"items":[],"total":0,"truncated":false}`,
 		`"issues":[]`,
 	} {
 		if !strings.Contains(serialized, empty) {
