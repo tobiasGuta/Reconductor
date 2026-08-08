@@ -40,26 +40,28 @@ const (
 	ExecutionLineageApprovalInconsistent              ExecutionLineageIssue = "approval_lineage_inconsistent"
 	ExecutionLineageArtifactInconsistent              ExecutionLineageIssue = "artifact_lineage_inconsistent"
 	ExecutionLineageCandidateFindingInconsistent      ExecutionLineageIssue = "candidate_finding_lineage_inconsistent"
+	ExecutionLineageAssetObservationInconsistent      ExecutionLineageIssue = "asset_observation_lineage_inconsistent"
 )
 
 // ExecutionProjection is a read-only observation of independently
 // authoritative scheduler, task, workflow, and step state.
 type ExecutionProjection struct {
-	ObservedAt      time.Time                                                   `json:"observed_at"`
-	Execution       ExecutionProjectionExecution                                `json:"execution"`
-	Trigger         ExecutionProjectionTrigger                                  `json:"trigger"`
-	Scheduler       ExecutionProjectionScheduler                                `json:"scheduler"`
-	CurrentSchedule ExecutionProjectionCurrentSchedule                          `json:"current_schedule"`
-	CurrentProgram  ExecutionProjectionCurrentProgram                           `json:"current_program"`
-	Scope           *ExecutionProjectionScope                                   `json:"scope,omitempty"`
-	Task            *ExecutionProjectionTask                                    `json:"task,omitempty"`
-	Workflow        *ExecutionProjectionWorkflow                                `json:"workflow,omitempty"`
-	Steps           []ExecutionProjectionStep                                   `json:"steps"`
-	ToolRuns        ExecutionProjectionCollection[ExecutionProjectionToolRun]   `json:"tool_runs"`
-	Approvals       ExecutionProjectionCollection[ExecutionProjectionApproval]  `json:"approvals"`
-	Artifacts       ExecutionProjectionCollection[ExecutionProjectionArtifact]  `json:"artifacts"`
-	Candidates      ExecutionProjectionCollection[ExecutionProjectionCandidate] `json:"candidate_findings"`
-	Lineage         ExecutionProjectionLineage                                  `json:"lineage"`
+	ObservedAt        time.Time                                                   `json:"observed_at"`
+	Execution         ExecutionProjectionExecution                                `json:"execution"`
+	Trigger           ExecutionProjectionTrigger                                  `json:"trigger"`
+	Scheduler         ExecutionProjectionScheduler                                `json:"scheduler"`
+	CurrentSchedule   ExecutionProjectionCurrentSchedule                          `json:"current_schedule"`
+	CurrentProgram    ExecutionProjectionCurrentProgram                           `json:"current_program"`
+	Scope             *ExecutionProjectionScope                                   `json:"scope,omitempty"`
+	Task              *ExecutionProjectionTask                                    `json:"task,omitempty"`
+	Workflow          *ExecutionProjectionWorkflow                                `json:"workflow,omitempty"`
+	Steps             []ExecutionProjectionStep                                   `json:"steps"`
+	ToolRuns          ExecutionProjectionCollection[ExecutionProjectionToolRun]   `json:"tool_runs"`
+	Approvals         ExecutionProjectionCollection[ExecutionProjectionApproval]  `json:"approvals"`
+	Artifacts         ExecutionProjectionCollection[ExecutionProjectionArtifact]  `json:"artifacts"`
+	Candidates        ExecutionProjectionCollection[ExecutionProjectionCandidate] `json:"candidate_findings"`
+	AssetObservations ExecutionProjectionObservationSummary                       `json:"asset_observations"`
+	Lineage           ExecutionProjectionLineage                                  `json:"lineage"`
 }
 
 type ExecutionProjectionExecution struct {
@@ -289,6 +291,9 @@ func queryExecutionProjection(ctx context.Context, query executionProjectionQuer
 		return ExecutionProjection{}, err
 	}
 	if err := loadExecutionProjectionCandidates(ctx, query, &projection); err != nil {
+		return ExecutionProjection{}, err
+	}
+	if err := loadExecutionProjectionAssetObservations(ctx, query, &projection); err != nil {
 		return ExecutionProjection{}, err
 	}
 	return projection, nil

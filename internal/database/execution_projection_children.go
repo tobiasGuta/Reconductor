@@ -48,6 +48,11 @@ const (
 		WHERE cf.workflow_run_id=$1
 		ORDER BY cf.created_at ASC,cf.id ASC
 		LIMIT $4`
+	executionProjectionAssetObservationsQuery = `SELECT count(*),count(DISTINCT ao.asset_id),
+		COALESCE(bool_or(a.program_id IS DISTINCT FROM $2),false)
+		FROM asset_observations ao
+		LEFT JOIN assets a ON a.id=ao.asset_id
+		WHERE ao.workflow_run_id=$1`
 )
 
 // ExecutionProjectionCollection is a bounded child collection observed in the
@@ -57,6 +62,13 @@ type ExecutionProjectionCollection[T any] struct {
 	Items     []T   `json:"items"`
 	Total     int64 `json:"total"`
 	Truncated bool  `json:"truncated"`
+}
+
+// ExecutionProjectionObservationSummary exposes only aggregate membership
+// counts. Observation and asset payload fields are intentionally excluded.
+type ExecutionProjectionObservationSummary struct {
+	Total              int64 `json:"total"`
+	DistinctAssetCount int64 `json:"distinct_asset_count"`
 }
 
 type ExecutionProjectionToolRun struct {
@@ -254,6 +266,30 @@ func loadExecutionProjectionCandidates(ctx context.Context, query executionProje
 		appendExecutionLineageIssue(&projection.Lineage, ExecutionLineageCandidateFindingInconsistent)
 	}
 	finalizeExecutionProjectionCollection(&projection.Candidates)
+	return nil
+}
+
+func loadExecutionProjectionAssetObservations(ctx context.Context, query executionProjectionQuerier, projection *ExecutionProjection) error {
+	if projection.Workflow == nil {
+		return nil
+	}
+	inconsistent := false
+	err := query.QueryRow(
+		ctx,
+		executionProjectionAssetObservationsQuery,
+		projection.Workflow.ID,
+		projection.CurrentProgram.ID,
+	).Scan(
+		&projection.AssetObservations.Total,
+		&projection.AssetObservations.DistinctAssetCount,
+		&inconsistent,
+	)
+	if err != nil {
+		return fmt.Errorf("query execution projection asset observations: %w", err)
+	}
+	if inconsistent {
+		appendExecutionLineageIssue(&projection.Lineage, ExecutionLineageAssetObservationInconsistent)
+	}
 	return nil
 }
 
