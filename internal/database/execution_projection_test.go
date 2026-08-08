@@ -28,6 +28,55 @@ func TestExecutionProjectionRootUsesOnePostgreSQLStatementTimestamp(t *testing.T
 	}
 }
 
+func TestExecutionProjectionEvidenceCollectionContracts(t *testing.T) {
+	if executionProjectionToolRunLimit != 64 || executionProjectionApprovalLimit != 32 || executionProjectionArtifactLimit != 128 {
+		t.Fatalf("evidence limits tool=%d approval=%d artifact=%d", executionProjectionToolRunLimit, executionProjectionApprovalLimit, executionProjectionArtifactLimit)
+	}
+	for name, query := range map[string]string{
+		"tool runs": executionProjectionToolRunsQuery,
+		"approvals": executionProjectionApprovalsQuery,
+		"artifacts": executionProjectionArtifactsQuery,
+	} {
+		if count := strings.Count(query, "count(*) OVER()"); count != 1 {
+			t.Fatalf("%s window count = %d, want 1", name, count)
+		}
+	}
+	if strings.Contains(executionProjectionToolRunsQuery, "sanitized_arguments") || strings.Contains(executionProjectionToolRunsQuery, "execution_environment") {
+		t.Fatalf("tool query selects unsafe state: %s", executionProjectionToolRunsQuery)
+	}
+	if !strings.Contains(executionProjectionApprovalsQuery, "JOIN step_runs sr ON sr.id=a.request_id") || strings.Contains(executionProjectionApprovalsQuery, "action_request_id") {
+		t.Fatalf("approval query does not use the step membership contract: %s", executionProjectionApprovalsQuery)
+	}
+	if !strings.Contains(executionProjectionApprovalsQuery, "bool_or(a.task_id<>$2) OVER()") {
+		t.Fatalf("approval query does not aggregate pre-limit inconsistency: %s", executionProjectionApprovalsQuery)
+	}
+	if !strings.Contains(executionProjectionArtifactsQuery, "a.expires_at>$2") ||
+		!strings.Contains(executionProjectionArtifactsQuery, "bool_or(a.task_id<>$3 OR sr.workflow_run_id IS DISTINCT FROM $1 OR tr.step_run_id IS DISTINCT FROM a.step_run_id) OVER()") ||
+		strings.Contains(executionProjectionArtifactsQuery, "now()") ||
+		strings.Contains(executionProjectionArtifactsQuery, "clock_timestamp()") ||
+		strings.Contains(executionProjectionArtifactsQuery, "storage_location") {
+		t.Fatalf("artifact query violates visibility or allow-list contract: %s", executionProjectionArtifactsQuery)
+	}
+}
+
+func TestExecutionProjectionCollectionFinalization(t *testing.T) {
+	collection := newExecutionProjectionCollection[int]()
+	if collection.Items == nil || collection.Total != 0 || collection.Truncated {
+		t.Fatalf("empty collection = %#v", collection)
+	}
+	collection.Items = append(collection.Items, 1, 2)
+	collection.Total = 3
+	finalizeExecutionProjectionCollection(&collection)
+	if !collection.Truncated {
+		t.Fatalf("bounded collection = %#v, want truncated", collection)
+	}
+	collection.Total = 2
+	finalizeExecutionProjectionCollection(&collection)
+	if collection.Truncated {
+		t.Fatalf("complete collection = %#v, want not truncated", collection)
+	}
+}
+
 func TestDeriveExecutionLeaseStateUsesCapturedObservedAt(t *testing.T) {
 	expiresAt := time.Date(2026, time.August, 8, 12, 0, 0, 0, time.UTC)
 	beforeExpiry := expiresAt.Add(-time.Nanosecond)
@@ -83,8 +132,11 @@ func TestDeriveExecutionLeaseState(t *testing.T) {
 
 func TestExecutionProjectionJSONOmitsUnsafeState(t *testing.T) {
 	projection := ExecutionProjection{
-		Steps:   []ExecutionProjectionStep{},
-		Lineage: ExecutionProjectionLineage{Issues: []ExecutionLineageIssue{}},
+		Steps:     []ExecutionProjectionStep{},
+		ToolRuns:  newExecutionProjectionCollection[ExecutionProjectionToolRun](),
+		Approvals: newExecutionProjectionCollection[ExecutionProjectionApproval](),
+		Artifacts: newExecutionProjectionCollection[ExecutionProjectionArtifact](),
+		Lineage:   ExecutionProjectionLineage{Issues: []ExecutionLineageIssue{}},
 	}
 	encoded, err := json.Marshal(projection)
 	if err != nil {
@@ -97,7 +149,9 @@ func TestExecutionProjectionJSONOmitsUnsafeState(t *testing.T) {
 		`"error_details":`,
 		`"summary":`,
 		`"definition":`,
+		`"sanitized_arguments":`,
 		`"execution_environment":`,
+		`"action_request_id":`,
 		`"storage_location":`,
 		`"audit_details":`,
 	} {
@@ -105,7 +159,15 @@ func TestExecutionProjectionJSONOmitsUnsafeState(t *testing.T) {
 			t.Fatalf("projection serialized excluded field %s: %s", excluded, serialized)
 		}
 	}
-	if !strings.Contains(serialized, `"steps":[]`) || !strings.Contains(serialized, `"issues":[]`) {
-		t.Fatalf("projection must serialize empty collections, got %s", serialized)
+	for _, empty := range []string{
+		`"steps":[]`,
+		`"tool_runs":{"items":[],"total":0,"truncated":false}`,
+		`"approvals":{"items":[],"total":0,"truncated":false}`,
+		`"artifacts":{"items":[],"total":0,"truncated":false}`,
+		`"issues":[]`,
+	} {
+		if !strings.Contains(serialized, empty) {
+			t.Fatalf("projection must serialize empty collection %s, got %s", empty, serialized)
+		}
 	}
 }

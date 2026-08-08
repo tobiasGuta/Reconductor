@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +39,11 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		}
 		if projection.Task != nil || projection.Workflow != nil || projection.Scope != nil || len(projection.Steps) != 0 {
 			t.Fatalf("unexpected optional lineage task=%#v workflow=%#v scope=%#v steps=%#v", projection.Task, projection.Workflow, projection.Scope, projection.Steps)
+		}
+		if projection.ToolRuns.Items == nil || projection.Approvals.Items == nil || projection.Artifacts.Items == nil ||
+			projection.ToolRuns.Total != 0 || projection.Approvals.Total != 0 || projection.Artifacts.Total != 0 ||
+			projection.ToolRuns.Truncated || projection.Approvals.Truncated || projection.Artifacts.Truncated {
+			t.Fatalf("empty evidence children tools=%#v approvals=%#v artifacts=%#v", projection.ToolRuns, projection.Approvals, projection.Artifacts)
 		}
 		if projection.CurrentSchedule.Name != schedule.Name || projection.CurrentSchedule.Objective != schedule.Objective || projection.CurrentProgram.ID != env.programID {
 			t.Fatalf("current context schedule=%#v program=%#v", projection.CurrentSchedule, projection.CurrentProgram)
@@ -311,6 +318,7 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 			}
 		}()
 		completedAt := time.Now().UTC()
+		toolID, approvalID, artifactID := domain.NewID(), domain.NewID(), domain.NewID()
 		if _, err := writeTx.Exec(ctx, `UPDATE tasks SET status='completed',updated_at=$2 WHERE id=$1`, fixture.task.ID, completedAt); err != nil {
 			t.Fatal(err)
 		}
@@ -318,6 +326,15 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := writeTx.Exec(ctx, `UPDATE step_runs SET status='succeeded',completed_at=$2 WHERE id=$1`, fixture.steps["active"], completedAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeTx.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,completed_at,exit_code,timed_out) VALUES($1,$2,'test.active','snapshot','1','{}','{}',$3,$3,0,false)`, toolID, fixture.steps["active"], completedAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeTx.Exec(ctx, `INSERT INTO approvals(id,request_id,task_id,action_request_id,requested_risk_level,reason,requested_at,decision) VALUES($1,$2,$3,$4,'moderate','snapshot child',$5,'pending')`, approvalID, fixture.steps["active"], fixture.task.ID, domain.NewID(), completedAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeTx.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,'normalized-result','application/json',2,'snapshot-sha','snapshot://hidden',$6,$7,'redacted',false)`, artifactID, fixture.task.ID, fixture.runID, fixture.steps["active"], toolID, completedAt, completedAt.Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 		if err := writeTx.Commit(ctx); err != nil {
@@ -338,6 +355,9 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if first.projection.Task == nil || first.projection.Task.Status != domain.TaskRunning || first.projection.Workflow == nil || first.projection.Workflow.Status != domain.RunRunning || first.projection.Steps[0].Status != domain.StepRunning {
 			t.Fatalf("first snapshot task=%#v workflow=%#v steps=%#v", first.projection.Task, first.projection.Workflow, first.projection.Steps)
 		}
+		if first.projection.ToolRuns.Total != 0 || first.projection.Approvals.Total != 0 || first.projection.Artifacts.Total != 0 {
+			t.Fatalf("first snapshot saw later children tools=%#v approvals=%#v artifacts=%#v", first.projection.ToolRuns, first.projection.Approvals, first.projection.Artifacts)
+		}
 		if err := readTx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -348,6 +368,289 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		}
 		if second.Task == nil || second.Task.Status != domain.TaskCompleted || second.Workflow == nil || second.Workflow.Status != domain.RunCompleted || second.Steps[0].Status != domain.StepSucceeded {
 			t.Fatalf("second snapshot task=%#v workflow=%#v steps=%#v", second.Task, second.Workflow, second.Steps)
+		}
+		if second.ToolRuns.Total != 1 || second.Approvals.Total != 1 || second.Artifacts.Total != 1 {
+			t.Fatalf("second snapshot children tools=%#v approvals=%#v artifacts=%#v", second.ToolRuns, second.Approvals, second.Artifacts)
+		}
+	})
+}
+
+func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "execution-projection-evidence")
+
+	t.Run("tool membership ordering incomplete outcome and truncation", func(t *testing.T) {
+		running := domain.RunRunning
+		fixture := createRecoveryFixture(t, env, "projection-tools", &running, domain.TaskRunning, []recoveryStepSpec{
+			{name: "alpha", status: domain.StepRunning, started: true, attemptCount: 1},
+			{name: "beta", status: domain.StepRunning, started: true, attemptCount: 1},
+		})
+		started := time.Now().UTC().Add(-time.Minute)
+		firstID, secondID := domain.NewID(), domain.NewID()
+		ids := []domain.ID{firstID, secondID}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		completed := started.Add(time.Second)
+		exitCode := 0
+		insertProjectionTool(t, env, firstID, fixture.steps["alpha"], "test.alpha", started, &completed, &exitCode, `{"secret":"tool-arguments-sentinel"}`, `{"secret":"tool-environment-sentinel"}`)
+		insertProjectionTool(t, env, secondID, fixture.steps["beta"], "test.beta", started, nil, nil, `{}`, `{}`)
+
+		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projection.ToolRuns.Total != 2 || len(projection.ToolRuns.Items) != 2 || projection.ToolRuns.Truncated {
+			t.Fatalf("tools = %#v", projection.ToolRuns)
+		}
+		if projection.ToolRuns.Items[0].ID != ids[0] || projection.ToolRuns.Items[1].ID != ids[1] {
+			t.Fatalf("tool order = %s,%s want %s,%s", projection.ToolRuns.Items[0].ID, projection.ToolRuns.Items[1].ID, ids[0], ids[1])
+		}
+		for _, item := range projection.ToolRuns.Items {
+			wantStep := map[domain.ID]string{firstID: "alpha", secondID: "beta"}[item.ID]
+			if item.StepRunID != fixture.steps[wantStep] || item.StepDefinitionID != wantStep {
+				t.Fatalf("tool step lineage = %#v want step %q", item, wantStep)
+			}
+		}
+		incomplete := projection.ToolRuns.Items[0]
+		if incomplete.ID != secondID {
+			incomplete = projection.ToolRuns.Items[1]
+		}
+		if incomplete.CompletedAt != nil || incomplete.ExitCode != nil {
+			t.Fatalf("incomplete tool synthesized outcome: %#v", incomplete)
+		}
+		encoded, err := json.Marshal(incomplete)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), `"status"`) {
+			t.Fatalf("tool DTO invented status: %s", encoded)
+		}
+
+		limited := createRecoveryFixture(t, env, "projection-tool-limit", &running, domain.TaskRunning, []recoveryStepSpec{{name: "tool-limit", status: domain.StepRunning, started: true, attemptCount: 1}})
+		for index := 0; index < executionProjectionToolRunLimit+1; index++ {
+			when := started.Add(time.Duration(index) * time.Millisecond)
+			insertProjectionTool(t, env, domain.NewID(), limited.steps["tool-limit"], "test.tool-limit", when, &when, &exitCode, `{}`, `{}`)
+		}
+		bounded, err := env.store.GetExecutionProjection(env.ctx, limited.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bounded.ToolRuns.Total != int64(executionProjectionToolRunLimit+1) || len(bounded.ToolRuns.Items) != executionProjectionToolRunLimit || !bounded.ToolRuns.Truncated {
+			t.Fatalf("bounded tools = %#v", bounded.ToolRuns)
+		}
+	})
+
+	t.Run("approval step membership contradiction and truncation", func(t *testing.T) {
+		running := domain.RunRunning
+		fixture := createRecoveryFixture(t, env, "projection-approvals", &running, domain.TaskRunning, []recoveryStepSpec{
+			{name: "one", status: domain.StepAwaitingApproval, approvalState: "not_required"},
+			{name: "two", status: domain.StepAwaitingApproval, approvalState: "not_required"},
+			{name: "three", status: domain.StepAwaitingApproval, approvalState: "not_required"},
+		})
+		otherTask := domain.Task{ID: domain.NewID(), ProgramID: env.programID, Objective: "approval contradiction", WorkflowDefinitionID: env.definitionID, Status: domain.TaskPending, RequestedBy: "integration", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+		if err := env.store.CreateTask(env.ctx, otherTask); err != nil {
+			t.Fatal(err)
+		}
+		requested := time.Now().UTC()
+		validID := insertProjectionApproval(t, env, fixture.steps["one"], fixture.task.ID, requested)
+		contradictoryIDs := []domain.ID{
+			insertProjectionApproval(t, env, fixture.steps["two"], otherTask.ID, requested.Add(time.Millisecond)),
+			insertProjectionApproval(t, env, fixture.steps["three"], otherTask.ID, requested.Add(2*time.Millisecond)),
+		}
+
+		otherRunID, otherStepID := domain.NewID(), domain.NewID()
+		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary) VALUES($1,$2,$3,'1','running',$4,'integration','{}')`, otherRunID, fixture.task.ID, env.definitionID, requested); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO step_runs(id,workflow_run_id,step_definition_id,capability,status,idempotency_key) VALUES($1,$2,'other','test.other','awaiting_approval',$3)`, otherStepID, otherRunID, "approval-other-"+string(otherStepID)); err != nil {
+			t.Fatal(err)
+		}
+		excludedID := insertProjectionApproval(t, env, otherStepID, fixture.task.ID, requested.Add(3*time.Millisecond))
+
+		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projection.Approvals.Total != 3 || len(projection.Approvals.Items) != 3 || projection.Approvals.Truncated {
+			t.Fatalf("approvals = %#v", projection.Approvals)
+		}
+		seen := map[domain.ID]bool{}
+		for _, item := range projection.Approvals.Items {
+			seen[item.ID] = true
+		}
+		if !seen[validID] || !seen[contradictoryIDs[0]] || !seen[contradictoryIDs[1]] || seen[excludedID] {
+			t.Fatalf("approval membership = %#v", seen)
+		}
+		if got := countLineageIssue(projection.Lineage.Issues, ExecutionLineageApprovalInconsistent); got != 1 {
+			t.Fatalf("approval lineage issue count = %d, issues=%v", got, projection.Lineage.Issues)
+		}
+
+		specs := make([]recoveryStepSpec, 0, executionProjectionApprovalLimit+1)
+		for index := 0; index < executionProjectionApprovalLimit+1; index++ {
+			specs = append(specs, recoveryStepSpec{name: fmt.Sprintf("approval-%02d", index), status: domain.StepAwaitingApproval, approvalState: "not_required"})
+		}
+		limited := createRecoveryFixture(t, env, "projection-approval-limit", &running, domain.TaskRunning, specs)
+		var contradictoryAfterLimitID domain.ID
+		for index, spec := range specs {
+			taskID := limited.task.ID
+			if index == executionProjectionApprovalLimit {
+				taskID = otherTask.ID
+			}
+			approvalID := insertProjectionApproval(t, env, limited.steps[spec.name], taskID, requested.Add(time.Duration(index)*time.Millisecond))
+			if index == executionProjectionApprovalLimit {
+				contradictoryAfterLimitID = approvalID
+			}
+		}
+		bounded, err := env.store.GetExecutionProjection(env.ctx, limited.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bounded.Approvals.Total != int64(executionProjectionApprovalLimit+1) || len(bounded.Approvals.Items) != executionProjectionApprovalLimit || !bounded.Approvals.Truncated {
+			t.Fatalf("bounded approvals = %#v", bounded.Approvals)
+		}
+		for _, item := range bounded.Approvals.Items {
+			if item.ID == contradictoryAfterLimitID {
+				t.Fatalf("contradictory approval after limit was returned: %s", contradictoryAfterLimitID)
+			}
+		}
+		if got := countLineageIssue(bounded.Lineage.Issues, ExecutionLineageApprovalInconsistent); got != 1 {
+			t.Fatalf("bounded approval lineage issue count = %d, issues=%v", got, bounded.Lineage.Issues)
+		}
+	})
+
+	t.Run("artifact visibility contradiction security and truncation", func(t *testing.T) {
+		running := domain.RunRunning
+		fixture := createRecoveryFixture(t, env, "projection-artifacts", &running, domain.TaskRunning, []recoveryStepSpec{{name: "artifact", status: domain.StepRunning, started: true, attemptCount: 1}})
+		now := time.Now().UTC()
+		completed, exitCode := now, 0
+		toolID := domain.NewID()
+		insertProjectionTool(t, env, toolID, fixture.steps["artifact"], "test.artifact", now.Add(-time.Second), &completed, &exitCode, `{"secret":"artifact-tool-arguments-sentinel"}`, `{"secret":"artifact-tool-environment-sentinel"}`)
+		visibleID := insertProjectionArtifact(t, env, projectionArtifactSpec{
+			TaskID: fixture.task.ID, WorkflowRunID: fixture.runID, StepRunID: fixture.steps["artifact"], ToolRunID: toolID,
+			Type: "normalized-result", StorageLocation: "artifact://visible-storage-sentinel", ExpiresAt: timePointer(now.Add(time.Hour)),
+		})
+		insertProjectionArtifact(t, env, projectionArtifactSpec{
+			TaskID: fixture.task.ID, WorkflowRunID: fixture.runID, StepRunID: fixture.steps["artifact"], ToolRunID: toolID,
+			Type: "sensitive-type-sentinel", StorageLocation: "artifact://sensitive-storage-sentinel", Sensitive: true, ExpiresAt: timePointer(now.Add(time.Hour)),
+		})
+		insertProjectionArtifact(t, env, projectionArtifactSpec{
+			TaskID: fixture.task.ID, WorkflowRunID: fixture.runID, StepRunID: fixture.steps["artifact"], ToolRunID: toolID,
+			Type: "expired-type-sentinel", StorageLocation: "artifact://expired-storage-sentinel", ExpiresAt: timePointer(now.Add(-time.Hour)),
+		})
+
+		other := createRecoveryFixture(t, env, "projection-artifact-other", &running, domain.TaskRunning, []recoveryStepSpec{{name: "other", status: domain.StepRunning, started: true, attemptCount: 1}})
+		otherToolID := domain.NewID()
+		insertProjectionTool(t, env, otherToolID, other.steps["other"], "test.other", now, &completed, &exitCode, `{}`, `{}`)
+		contradictoryID := insertProjectionArtifact(t, env, projectionArtifactSpec{
+			TaskID: other.task.ID, WorkflowRunID: fixture.runID, StepRunID: other.steps["other"], ToolRunID: otherToolID,
+			Type: "contradictory", StorageLocation: "artifact://contradictory-storage-sentinel", ExpiresAt: timePointer(now.Add(time.Hour)),
+		})
+
+		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projection.Artifacts.Total != 2 || len(projection.Artifacts.Items) != 2 || projection.Artifacts.Truncated {
+			t.Fatalf("artifacts = %#v", projection.Artifacts)
+		}
+		seen := map[domain.ID]bool{}
+		for _, item := range projection.Artifacts.Items {
+			seen[item.ID] = true
+		}
+		if !seen[visibleID] || !seen[contradictoryID] {
+			t.Fatalf("artifact membership = %#v", seen)
+		}
+		if got := countLineageIssue(projection.Lineage.Issues, ExecutionLineageArtifactInconsistent); got != 1 {
+			t.Fatalf("artifact lineage issue count = %d, issues=%v", got, projection.Lineage.Issues)
+		}
+		encoded, err := json.Marshal(projection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{
+			"artifact-tool-arguments-sentinel", "artifact-tool-environment-sentinel",
+			"visible-storage-sentinel", "sensitive-type-sentinel", "sensitive-storage-sentinel",
+			"expired-type-sentinel", "expired-storage-sentinel", "contradictory-storage-sentinel",
+		} {
+			if strings.Contains(string(encoded), secret) {
+				t.Fatalf("projection leaked %q: %s", secret, encoded)
+			}
+		}
+
+		limited := createRecoveryFixture(t, env, "projection-artifact-limit", &running, domain.TaskRunning, []recoveryStepSpec{{name: "artifact-limit", status: domain.StepRunning, started: true, attemptCount: 1}})
+		limitedToolID := domain.NewID()
+		insertProjectionTool(t, env, limitedToolID, limited.steps["artifact-limit"], "test.artifact-limit", now, &completed, &exitCode, `{}`, `{}`)
+		var contradictoryAfterLimitID domain.ID
+		for index := 0; index < executionProjectionArtifactLimit+1; index++ {
+			created := now.Add(time.Duration(index) * time.Millisecond)
+			taskID, stepRunID, toolRunID := limited.task.ID, limited.steps["artifact-limit"], limitedToolID
+			if index == executionProjectionArtifactLimit {
+				taskID, stepRunID, toolRunID = other.task.ID, other.steps["other"], otherToolID
+			}
+			artifactID := insertProjectionArtifact(t, env, projectionArtifactSpec{
+				TaskID: taskID, WorkflowRunID: limited.runID, StepRunID: stepRunID, ToolRunID: toolRunID,
+				Type: "normalized-result", StorageLocation: fmt.Sprintf("artifact://limit/%d", index), CreatedAt: &created, ExpiresAt: timePointer(now.Add(time.Hour)),
+			})
+			if index == executionProjectionArtifactLimit {
+				contradictoryAfterLimitID = artifactID
+			}
+		}
+		bounded, err := env.store.GetExecutionProjection(env.ctx, limited.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bounded.Artifacts.Total != int64(executionProjectionArtifactLimit+1) || len(bounded.Artifacts.Items) != executionProjectionArtifactLimit || !bounded.Artifacts.Truncated {
+			t.Fatalf("bounded artifacts = %#v", bounded.Artifacts)
+		}
+		for _, item := range bounded.Artifacts.Items {
+			if item.ID == contradictoryAfterLimitID {
+				t.Fatalf("contradictory artifact after limit was returned: %s", contradictoryAfterLimitID)
+			}
+		}
+		if got := countLineageIssue(bounded.Lineage.Issues, ExecutionLineageArtifactInconsistent); got != 1 {
+			t.Fatalf("bounded artifact lineage issue count = %d, issues=%v", got, bounded.Lineage.Issues)
+		}
+	})
+
+	t.Run("query count remains fixed at maximum", func(t *testing.T) {
+		running := domain.RunRunning
+		fixture := createRecoveryFixture(t, env, "projection-query-count", &running, domain.TaskRunning, []recoveryStepSpec{
+			{name: "a", status: domain.StepRunning, started: true, attemptCount: 1},
+			{name: "b", status: domain.StepRunning, started: true, attemptCount: 1},
+			{name: "c", status: domain.StepRunning, started: true, attemptCount: 1},
+		})
+		var scopeID domain.ID
+		if err := env.store.Pool.QueryRow(env.ctx, `SELECT id FROM scope_versions WHERE program_id=$1 ORDER BY created_at DESC LIMIT 1`, env.programID).Scan(&scopeID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := env.store.Pool.Exec(env.ctx, `UPDATE scheduled_executions SET scope_version_id=$2 WHERE id=$1`, fixture.execution.ID, scopeID); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		exitCode := 0
+		for index, stepName := range []string{"a", "b", "c"} {
+			toolID := domain.NewID()
+			insertProjectionTool(t, env, toolID, fixture.steps[stepName], "test."+stepName, now.Add(time.Duration(index)*time.Millisecond), &now, &exitCode, `{}`, `{}`)
+			insertProjectionApproval(t, env, fixture.steps[stepName], fixture.task.ID, now.Add(time.Duration(index)*time.Millisecond))
+			insertProjectionArtifact(t, env, projectionArtifactSpec{TaskID: fixture.task.ID, WorkflowRunID: fixture.runID, StepRunID: fixture.steps[stepName], ToolRunID: toolID, Type: "normalized-result", ExpiresAt: timePointer(now.Add(time.Hour))})
+		}
+
+		tx, err := env.store.beginExecutionProjection(env.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(context.Background())
+		counter := &projectionQueryCounter{executionProjectionQuerier: tx}
+		projection, err := queryExecutionProjection(env.ctx, counter, fixture.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if counter.count != 8 {
+			t.Fatalf("projection query count = %d, want 8", counter.count)
+		}
+		if len(projection.Steps) != 3 || projection.ToolRuns.Total != 3 || projection.Approvals.Total != 3 || projection.Artifacts.Total != 3 {
+			t.Fatalf("counted projection steps=%d tools=%#v approvals=%#v artifacts=%#v", len(projection.Steps), projection.ToolRuns, projection.Approvals, projection.Artifacts)
+		}
+		if err := tx.Commit(env.ctx); err != nil {
+			t.Fatal(err)
 		}
 	})
 }
@@ -414,4 +717,75 @@ func countLineageIssue(issues []ExecutionLineageIssue, want ExecutionLineageIssu
 		}
 	}
 	return count
+}
+
+func insertProjectionTool(t *testing.T, env recoveryTestEnvironment, id, stepID domain.ID, capability string, startedAt time.Time, completedAt *time.Time, exitCode *int, sanitizedArguments, executionEnvironment string) {
+	t.Helper()
+	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,completed_at,exit_code,timed_out)
+		VALUES($1,$2,$3,'projection-fixture','1',$4,$5,$6,$7,$8,false)`, id, stepID, capability, json.RawMessage(sanitizedArguments), json.RawMessage(executionEnvironment), startedAt, completedAt, exitCode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertProjectionApproval(t *testing.T, env recoveryTestEnvironment, stepID, taskID domain.ID, requestedAt time.Time) domain.ID {
+	t.Helper()
+	id := domain.NewID()
+	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO approvals(id,request_id,task_id,action_request_id,requested_risk_level,reason,requested_at,decision)
+		VALUES($1,$2,$3,$4,'moderate','projection fixture',$5,'pending')`, id, stepID, taskID, domain.NewID(), requestedAt); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+type projectionArtifactSpec struct {
+	TaskID          domain.ID
+	WorkflowRunID   domain.ID
+	StepRunID       domain.ID
+	ToolRunID       domain.ID
+	Type            string
+	StorageLocation string
+	CreatedAt       *time.Time
+	ExpiresAt       *time.Time
+	Sensitive       bool
+}
+
+func insertProjectionArtifact(t *testing.T, env recoveryTestEnvironment, spec projectionArtifactSpec) domain.ID {
+	t.Helper()
+	id := domain.NewID()
+	artifactType := spec.Type
+	if artifactType == "" {
+		artifactType = "normalized-result"
+	}
+	storageLocation := spec.StorageLocation
+	if storageLocation == "" {
+		storageLocation = "artifact://projection-fixture/" + string(id)
+	}
+	createdAt := time.Now().UTC()
+	if spec.CreatedAt != nil {
+		createdAt = *spec.CreatedAt
+	}
+	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive)
+		VALUES($1,$2,$3,$4,$5,$6,'application/json',2,$7,$8,$9,$10,$11,$12)`, id, spec.TaskID, spec.WorkflowRunID, spec.StepRunID, spec.ToolRunID, artifactType, "sha-"+string(id), storageLocation, createdAt, spec.ExpiresAt, map[bool]string{true: "sensitive-separated", false: "redacted"}[spec.Sensitive], spec.Sensitive); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func timePointer(value time.Time) *time.Time {
+	return &value
+}
+
+type projectionQueryCounter struct {
+	executionProjectionQuerier
+	count int
+}
+
+func (query *projectionQueryCounter) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	query.count++
+	return query.executionProjectionQuerier.QueryRow(ctx, sql, args...)
+}
+
+func (query *projectionQueryCounter) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	query.count++
+	return query.executionProjectionQuerier.Query(ctx, sql, args...)
 }
