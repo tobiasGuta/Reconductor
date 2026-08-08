@@ -103,7 +103,18 @@ flowchart TD
     V --> Y
     D3 --> Y
 
-    Y --> Z[Local operator console<br/>Sanitized read models]
+    Y --> DB[(PostgreSQL)]
+    Y --> FS[(Artifact store and<br/>workflow-state files)]
+
+    DB --> EP[Scheduled Execution Projection<br/>Read-only Repeatable Read snapshot]
+
+    EP --> EP1[Execution context<br/>trigger, scheduler, schedule, program, scope]
+    EP --> EP2[Execution lineage<br/>Task, WorkflowRun, StepRuns]
+    EP --> EP3[Bounded evidence children<br/>ToolRuns, Approvals, non-sensitive Artifacts]
+    EP --> EP4[Bounded Candidate Findings<br/>Safe references and current state]
+    EP --> EP5[Lineage diagnostics<br/>Preserve contradictions; never repair]
+
+    DB --> Z[Local operator console<br/>Sanitized read models]
     Z --> Z1[Programs]
     Z --> Z2[Schedules]
     Z --> Z3[Scheduled executions]
@@ -113,9 +124,6 @@ flowchart TD
     Z --> Z7[Candidates and verified findings]
     Z --> Z8[Audit events]
 
-    Y --> DB[(PostgreSQL)]
-    Y --> FS[(Artifact store and<br/>workflow-state files)]
-
     style A fill:#1f2937,color:#fff
     style E fill:#2563eb,color:#fff
     style L fill:#2563eb,color:#fff
@@ -124,6 +132,7 @@ flowchart TD
     style V fill:#7c3aed,color:#fff
     style D3 fill:#b91c1c,color:#fff
     style W fill:#b91c1c,color:#fff
+    style EP fill:#0f766e,color:#fff
 ```
 
 The local console's **Run Now** action enqueues a persistent scheduled execution; only `platform workflow run` is the direct manual path. Scope acknowledgement closes the review item but does not revive the blocked execution, so the operator must queue a new run or wait for a later cron occurrence.
