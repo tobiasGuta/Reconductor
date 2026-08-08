@@ -18,7 +18,7 @@
       </div>
       <nav class="nav-list">
         <button class="nav-item active" data-view="overview"><span class="nav-glyph">⌂</span>Overview</button>
-        <button class="nav-item" data-view="runs"><span class="nav-glyph">↳</span>Workflow runs</button>
+        <button class="nav-item" data-view="runs"><span class="nav-glyph">↳</span>Runs</button>
         <button class="nav-item" data-view="schedules"><span class="nav-glyph">◷</span>Schedules</button>
         <button class="nav-item" data-view="assets"><span class="nav-glyph">◇</span>Assets</button>
         <button class="nav-item" data-view="changes"><span class="nav-glyph">≠</span>Change inbox <span id="changes-nav-count" class="nav-count hidden">0</span></button>
@@ -99,8 +99,27 @@
         </section>
 
         <section class="view" data-view-panel="runs" aria-labelledby="runs-title">
-          <div class="page-heading"><div><p class="eyebrow">Execution lineage</p><h1 id="runs-title">Workflow runs</h1><p>Inspect live state, step outcomes, retries, and approval pauses.</p></div><div class="live-indicator"><span></span>Polling every 5 seconds</div></div>
-          <div id="runs-list" class="stack-list"></div>
+          <div class="page-heading"><div><p class="eyebrow">Execution lineage</p><h1 id="runs-title">Runs</h1><p>Select scheduled executions and workflow runs without losing operational context.</p></div><div class="live-indicator"><span></span>Snapshot polling every 5 seconds</div></div>
+          <section id="run-workspace" class="run-workspace" aria-labelledby="run-workspace-title">
+            <header id="run-workspace-header" class="run-workspace-header" tabindex="-1">
+              <div><p id="run-workspace-eyebrow" class="eyebrow">Run workspace</p><h2 id="run-workspace-title">Select a run</h2><p id="run-workspace-meta">Choose an execution or workflow run to inspect.</p></div>
+              <div id="run-workspace-actions" class="run-workspace-actions"></div>
+            </header>
+            <div class="run-workspace-grid">
+              <aside class="run-selector-panel" aria-labelledby="run-selector-title">
+                <div class="workspace-panel-heading"><div><p class="eyebrow">Program history</p><h3 id="run-selector-title">Executions and runs</h3></div></div>
+                <div id="runs-list" class="run-selector-list"></div>
+              </aside>
+              <section class="run-canvas" aria-labelledby="run-lane-title">
+                <div class="workspace-panel-heading"><div><p class="eyebrow">Associated lineage</p><h3 id="run-lane-title">Execution lane</h3></div></div>
+                <div id="run-lane" class="run-lane"></div>
+              </section>
+              <aside class="run-inspector-panel" aria-labelledby="run-inspector-title">
+                <div class="workspace-panel-heading"><div><p class="eyebrow">Selected item</p><h3 id="run-inspector-title">Inspector</h3></div></div>
+                <div id="run-inspector" class="run-inspector" aria-live="polite"></div>
+              </aside>
+            </div>
+          </section>
         </section>
 
         <section class="view" data-view-panel="schedules" aria-labelledby="schedules-title">

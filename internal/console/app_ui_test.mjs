@@ -134,8 +134,12 @@ class FakeElement {
       }
     };
     visit(this);
-    if (selector === "[data-execution-id]") return descendants.filter((node) => node.dataset.executionId !== undefined);
-    if (selector === "[data-run-id]") return descendants.filter((node) => node.dataset.runId !== undefined);
+    const dataMatch = selector.match(/^\[data-([a-z-]+)\]$/);
+    if (dataMatch) {
+      const key = dataMatch[1].replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+      return descendants.filter((node) => node.dataset[key] !== undefined);
+    }
+    if (selector.startsWith(".")) return descendants.filter((node) => node.classList.contains(selector.slice(1)));
     if (selector.startsWith("button:not")) return descendants.filter((node) => node.tagName === "BUTTON" && !node.disabled && node.tabIndex !== -1);
     return [];
   }
@@ -171,15 +175,18 @@ class FakeDocument {
 
   querySelector(selector) {
     if (selector.startsWith("#")) return this.byID.get(selector.slice(1)) || null;
+    if (selector.startsWith(".")) return this.createdElements.find((item) => item.classList.contains(selector.slice(1))) || null;
     return null;
   }
 
   querySelectorAll(selector) {
     const roots = [...this.byID.values()];
     const matches = [];
+    const dataMatch = selector.match(/^\[data-([a-z-]+)\]$/);
+    const dataKey = dataMatch ? dataMatch[1].replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()) : "";
     for (const root of roots) {
-      if (selector === "[data-execution-id]" && root.dataset.executionId !== undefined) matches.push(root);
-      if (selector === "[data-run-id]" && root.dataset.runId !== undefined) matches.push(root);
+      if (dataKey && root.dataset[dataKey] !== undefined) matches.push(root);
+      if (selector.startsWith(".") && root.classList.contains(selector.slice(1))) matches.push(root);
       matches.push(...root.querySelectorAll(selector));
     }
     return [...new Set(matches)];
@@ -196,6 +203,7 @@ globalThis.localStorage = {
   getItem() { return ""; },
   setItem() {},
 };
+globalThis.window = { scrollTo() {} };
 globalThis.document = new FakeDocument();
 
 const require = createRequire(import.meta.url);
@@ -206,7 +214,19 @@ function installDocument() {
   document.register("schedule-list");
   document.register("scheduled-execution-list");
   document.register("runs-list");
+  document.register("run-workspace-header");
+  document.register("run-workspace-eyebrow");
+  document.register("run-workspace-title");
+  document.register("run-workspace-meta");
+  document.register("run-workspace-actions");
+  document.register("run-lane");
+  document.register("run-inspector");
   document.register("pending-scope-expansion-list");
+  document.register("test-sidebar", "sidebar");
+  const runNav = document.register("test-run-nav", "nav-item");
+  runNav.dataset.view = "runs";
+  const runsView = document.register("test-runs-view", "view");
+  runsView.dataset.viewPanel = "runs";
   document.register("drawer-backdrop", "backdrop hidden");
   const drawer = document.register("detail-drawer", "detail-drawer");
   drawer.setAttribute("inert", "");
@@ -224,11 +244,13 @@ function installDocument() {
   app.state.data = {
     schedules: [],
     scheduled_executions: [],
+    runs: [],
     pending_scope_expansions: [],
     steps: [],
   };
   app.state.drawer = { returnFocus: null, returnTarget: null };
   app.state.executionDetail = { id: "", status: "idle", data: null, error: "", controller: null };
+  app.state.runWorkspace = { selection: null, item: null, projection: { id: "", status: "idle", data: null, error: "" } };
   return document;
 }
 
@@ -290,6 +312,47 @@ function projection(id, name = "Nightly baseline") {
     change_items: { items: [], total: 0, truncated: false },
     lineage: { issues: [] },
   };
+}
+
+function workflowRun(id, status = "running", objective = `Objective ${id}`) {
+  return {
+    id,
+    task_id: `task-${id}`,
+    objective,
+    workflow_name: "authorized-web-baseline",
+    workflow_version: "1",
+    status,
+    trigger_source: "scheduled",
+    started_at: "2026-08-08T14:00:05Z",
+  };
+}
+
+function workspaceProjection(executionID, workflowRunID, name = "Workspace baseline") {
+  const value = projection(executionID, name);
+  value.execution.task_id = `task-${workflowRunID}`;
+  value.execution.workflow_run_id = workflowRunID;
+  value.task = { id: `task-${workflowRunID}`, objective: `Objective ${workflowRunID}`, status: "running", workflow_definition_id: "definition-1" };
+  value.workflow = {
+    id: workflowRunID,
+    task_id: `task-${workflowRunID}`,
+    workflow_definition_id: "definition-1",
+    definition_name: "Authorized baseline",
+    workflow_version: "1",
+    status: "running",
+    trigger_source: "scheduled",
+    started_at: "2026-08-08T14:00:05Z",
+  };
+  value.steps = [{
+    id: `step-${workflowRunID}`,
+    workflow_run_id: workflowRunID,
+    step_definition_id: "probe",
+    capability: "http.probe",
+    status: "running",
+    attempt_count: 1,
+    approval_state: "not_required",
+    started_at: "2026-08-08T14:01:00Z",
+  }];
+  return value;
 }
 
 function findButtons(root, label) {
@@ -375,6 +438,242 @@ test("drawer focus containment uses the drawer when it has no controls", () => {
   assert.equal(app.containDrawerTab(event, [], null, drawer), true);
   assert.equal(event.prevented, true);
   assert.equal(document.activeElement, drawer);
+});
+
+test("composite run selector merges only authoritative workflow run ids", () => {
+  const runs = [workflowRun("run-1"), workflowRun("run-2", "succeeded")];
+  const linked = execution("execution-1");
+  linked.workflow_run_id = "run-1";
+  const unlinked = execution("execution-2", "pending");
+  unlinked.workflow_run_id = null;
+
+  const entries = app.buildRunSelectorEntries(runs, [linked, unlinked]);
+
+  assert.equal(entries.length, 3);
+  assert.equal(entries.filter((item) => item.executionId === "execution-1").length, 1);
+  assert.equal(entries.find((item) => item.executionId === "execution-1").workflowRunId, "run-1");
+  assert.equal(entries.find((item) => item.executionId === "execution-1").run, runs[0]);
+  assert.ok(entries.find((item) => item.executionId === "execution-2" && item.workflowRunId === ""));
+  assert.ok(entries.find((item) => item.kind === "workflow" && item.workflowRunId === "run-2"));
+  assert.equal(entries.filter((item) => item.workflowRunId === "run-1").length, 1);
+});
+
+test("composite selector and projected header preserve independent scheduler and workflow statuses", async () => {
+  const document = installDocument();
+  const run = workflowRun("run-1", "failed");
+  const scheduled = execution("execution-1", "completed");
+  app.state.data.runs = [run];
+  app.state.data.scheduled_executions = [scheduled];
+  const detail = workspaceProjection("execution-1", "run-1");
+  detail.scheduler.status = "completed";
+  detail.workflow.status = "failed";
+  globalThis.fetch = async () => response(200, detail);
+
+  app.renderRuns();
+  const selector = document.querySelectorAll("[data-run-selection]")[0];
+  assert.match(selector.textContent, /Scheduler: completed/);
+  assert.match(selector.textContent, /Workflow: failed/);
+
+  const [entry] = app.buildRunSelectorEntries(app.state.data.runs, app.state.data.scheduled_executions);
+  await app.selectRunWorkspaceEntry(entry);
+
+  const actions = document.querySelector("#run-workspace-actions");
+  assert.match(actions.textContent, /Scheduler: completed/);
+  assert.match(actions.textContent, /Workflow: failed/);
+});
+
+test("scheduled workspace copy distinguishes idle snapshot state from an in-flight projection", async () => {
+  const document = installDocument();
+  const scheduled = execution("execution-1", "pending");
+  app.state.data.scheduled_executions = [scheduled];
+  let calls = 0;
+  const pending = deferred();
+  globalThis.fetch = () => {
+    calls += 1;
+    return pending.promise;
+  };
+
+  app.renderRuns();
+  assert.equal(app.state.runWorkspace.projection.status, "idle");
+  assert.match(document.querySelector("#run-workspace-meta").textContent, /limited dashboard snapshot detail/);
+  assert.doesNotMatch(document.querySelector("#run-workspace-meta").textContent, /loading coherent/);
+  assert.equal(calls, 0);
+
+  const [entry] = app.buildRunSelectorEntries([], [scheduled]);
+  const selecting = app.selectRunWorkspaceEntry(entry);
+  assert.equal(calls, 1);
+  assert.match(document.querySelector("#run-workspace-meta").textContent, /loading coherent execution observation/);
+  pending.resolve(response(200, workspaceProjection("execution-1", "run-1")));
+  await selecting;
+});
+
+test("snapshot fallback selection remains idle and causes no projection fan-out", () => {
+  const document = installDocument();
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return response(200, workspaceProjection("unexpected", "run-unexpected"));
+  };
+  app.state.data.scheduled_executions = [execution("execution-A", "running")];
+  app.renderRuns();
+  assert.deepEqual(app.state.runWorkspace.selection, { kind: "execution", id: "execution-A" });
+
+  app.state.data.scheduled_executions = [execution("execution-B", "pending")];
+  app.renderRuns();
+
+  assert.deepEqual(app.state.runWorkspace.selection, { kind: "execution", id: "execution-B" });
+  assert.equal(app.state.runWorkspace.projection.status, "idle");
+  assert.equal(calls, 0);
+  assert.match(document.querySelector("#run-workspace-meta").textContent, /limited dashboard snapshot detail/);
+  assert.doesNotMatch(document.querySelector("#run-workspace-meta").textContent, /loading coherent/);
+});
+
+test("workspace selection survives snapshot rerender by stable identity", async () => {
+  const document = installDocument();
+  globalThis.fetch = async () => { throw new Error("unscheduled selection must not fetch"); };
+  app.state.data.runs = [workflowRun("run-1"), workflowRun("run-2", "succeeded")];
+  app.renderRuns();
+  const second = document.querySelectorAll("[data-run-selection]")[1];
+  await second.click();
+  assert.deepEqual(app.state.runWorkspace.selection, { kind: "workflow", id: "run-2" });
+
+  app.state.data.runs = [workflowRun("run-1"), workflowRun("run-2", "succeeded", "Rerendered objective")];
+  app.renderRuns();
+
+  assert.deepEqual(app.state.runWorkspace.selection, { kind: "workflow", id: "run-2" });
+  const selected = document.querySelectorAll("[data-run-selection]").find((item) => item.getAttribute("aria-pressed") === "true");
+  assert.equal(selected.dataset.runSelection, "workflow:run-2");
+  assert.match(selected.textContent, /Rerendered objective/);
+});
+
+test("scheduled workspace selection fetches once while rerender and local selection fetch zero", async () => {
+  installDocument();
+  const run = workflowRun("run-1");
+  const scheduled = execution("execution-1");
+  app.state.data.runs = [run];
+  app.state.data.scheduled_executions = [scheduled];
+  app.state.data.steps = [{ id: "snapshot-step", workflow_run_id: "run-1", step_definition_id: "snapshot", capability: "snapshot", status: "running", attempt_count: 1 }];
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    return response(200, workspaceProjection("execution-1", "run-1"));
+  };
+  app.renderRuns();
+  const [entry] = app.buildRunSelectorEntries(app.state.data.runs, app.state.data.scheduled_executions);
+
+  await app.selectRunWorkspaceEntry(entry);
+  assert.deepEqual(calls, ["/api/v1/scheduled-executions/execution-1"]);
+
+  app.renderRuns();
+  app.selectRunWorkspaceItem("workflow", "run-1");
+  app.selectRunWorkspaceItem("step", "step-run-1");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "step", id: "step-run-1" });
+});
+
+test("late workspace execution A cannot overwrite selected execution B", async () => {
+  const document = installDocument();
+  const runA = workflowRun("run-A");
+  const runB = workflowRun("run-B");
+  const executionA = execution("execution-A");
+  const executionB = execution("execution-B");
+  executionA.workflow_run_id = "run-A";
+  executionB.workflow_run_id = "run-B";
+  app.state.data.runs = [runA, runB];
+  app.state.data.scheduled_executions = [executionA, executionB];
+  const requests = new Map();
+  globalThis.fetch = (url) => {
+    const pending = deferred();
+    requests.set(url, pending);
+    return pending.promise;
+  };
+  const entries = app.buildRunSelectorEntries(app.state.data.runs, app.state.data.scheduled_executions);
+
+  const first = app.selectRunWorkspaceEntry(entries[0]);
+  const second = app.selectRunWorkspaceEntry(entries[1]);
+  requests.get("/api/v1/scheduled-executions/execution-B").resolve(response(200, workspaceProjection("execution-B", "run-B", "Execution B")));
+  await second;
+  requests.get("/api/v1/scheduled-executions/execution-A").resolve(response(200, workspaceProjection("execution-A", "run-A", "Execution A")));
+  await first;
+
+  assert.equal(app.state.runWorkspace.projection.id, "execution-B");
+  assert.equal(document.querySelector("#run-workspace-title").textContent, "Execution B");
+  assert.doesNotMatch(document.querySelector("#run-inspector").textContent, /Execution A/);
+});
+
+test("unscheduled workflow run renders limited detail without projection fetch", async () => {
+  const document = installDocument();
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+  const run = workflowRun("run-only");
+  app.state.data.runs = [run];
+  app.renderRuns();
+  const [entry] = app.buildRunSelectorEntries([run], []);
+
+  await app.selectRunWorkspaceEntry(entry);
+
+  assert.equal(calls, 0);
+  assert.match(document.querySelector("#run-workspace-meta").textContent, /limited dashboard snapshot detail/i);
+  assert.match(document.querySelector("#run-inspector").textContent, /Limited run detail/);
+});
+
+test("Schedules Open workspace selects and focuses the exact execution", async () => {
+  const document = installDocument();
+  const run = workflowRun("run-1");
+  app.state.data.runs = [run];
+  app.state.data.scheduled_executions = [execution("execution-1")];
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    return response(200, workspaceProjection("execution-1", "run-1"));
+  };
+  app.renderRuns();
+  app.renderSchedules();
+
+  const [openWorkspace] = findButtons(document.querySelector("#scheduled-execution-list"), "Open workspace");
+  await openWorkspace.click();
+
+  assert.equal(app.state.view, "runs");
+  assert.deepEqual(app.state.runWorkspace.selection, { kind: "execution", id: "execution-1" });
+  assert.equal(document.activeElement, document.querySelector("#run-workspace-header"));
+  assert.deepEqual(calls, ["/api/v1/scheduled-executions/execution-1"]);
+});
+
+test("Full detail uses the loaded workspace projection without a second fetch", async () => {
+  const document = installDocument();
+  const run = workflowRun("run-1");
+  app.state.data.runs = [run];
+  app.state.data.scheduled_executions = [execution("execution-1")];
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return response(200, workspaceProjection("execution-1", "run-1", "Cached detail"));
+  };
+  const [entry] = app.buildRunSelectorEntries(app.state.data.runs, app.state.data.scheduled_executions);
+  await app.selectRunWorkspaceEntry(entry);
+  const [fullDetail] = findButtons(document.querySelector("#run-workspace-actions"), "Full detail");
+
+  await fullDetail.click();
+
+  assert.equal(calls, 1);
+  assert.equal(document.querySelector("#detail-drawer").getAttribute("aria-hidden"), "false");
+  assert.match(document.querySelector("#drawer-content").textContent, /Cached detail|execution-1/);
+});
+
+test("workspace selector lane and inspector keep server strings text-only", async () => {
+  const document = installDocument();
+  const malicious = `<img src=x onerror="globalThis.compromised=true">`;
+  const run = workflowRun("run-1", "running", malicious);
+  app.state.data.runs = [run];
+  app.state.data.scheduled_executions = [execution("execution-1")];
+  globalThis.fetch = async () => response(200, workspaceProjection("execution-1", "run-1", malicious));
+  const [entry] = app.buildRunSelectorEntries(app.state.data.runs, app.state.data.scheduled_executions);
+
+  await app.selectRunWorkspaceEntry(entry);
+
+  assert.equal(document.querySelector("#run-workspace-title").textContent, malicious);
+  assert.match(document.querySelector("#runs-list").textContent, /<img src=x/);
+  assert.equal(document.createdElements.some((item) => item.tagName === "IMG"), false);
 });
 
 test("scheduled execution detail is explicit and uses the execution id", async () => {
