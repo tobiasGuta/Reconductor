@@ -376,6 +376,7 @@ function activityItem(event) {
 }
 
 const activeWorkspaceStatuses = new Set(["pending", "claimed", "running", "paused", "paused_operator", "paused_for_approval", "awaiting_approval"]);
+const inspectorArtifactPreviewLimit = 3;
 
 function runEntryKey(entry) {
   return entry ? `${entry.kind}:${entry.id}` : "";
@@ -465,6 +466,54 @@ function exactID(left, right) {
 function artifactCountText(count, truncated) {
   if (truncated) return count ? `${count} loaded` : "none in loaded subset";
   return `${count} artifact${count === 1 ? "" : "s"}`;
+}
+
+function projectionCollectionCountText(collection) {
+  const value = collectionValue(collection);
+  return value.truncated ? `${value.total} total · ${value.items.length} loaded` : `${value.total} total`;
+}
+
+function associatedCountText(count, collection) {
+  return collection.truncated ? `${count} loaded` : String(count);
+}
+
+function availableDetails(details) {
+  return details.filter(([, value]) => value != null && value !== "");
+}
+
+function inspectorNotice(role, message) {
+  const notice = element("div", `inspector-notice${role === "alert" ? " error" : ""}`, message);
+  notice.setAttribute("role", role);
+  return notice;
+}
+
+function inspectorArtifactPreview(items, collection) {
+  if (!items.length) return null;
+  const block = element("section", "inspector-artifacts");
+  block.append(element("h5", "", "Visible artifact references"));
+  const list = element("div", "inspector-artifact-list");
+  const shown = items.slice(0, inspectorArtifactPreviewLimit);
+  shown.forEach((artifact) => {
+    const row = element("div", "inspector-artifact-row");
+    const summary = element("div");
+    summary.append(
+      element("strong", "", artifact.type || "Artifact reference"),
+      element("span", "", [artifact.content_type || "Content type not recorded", formatBytes(artifact.size)].join(" · ")),
+    );
+    const facts = [];
+    if (artifact.redaction_state) facts.push(`Redaction: ${artifact.redaction_state}`);
+    if (artifact.created_at) facts.push(`Created ${formatTime(artifact.created_at, true)}`);
+    if (artifact.expires_at) facts.push(`Expires ${formatTime(artifact.expires_at, true)}`);
+    row.append(summary);
+    if (facts.length) row.append(element("small", "", facts.join(" · ")));
+    list.append(row);
+  });
+  block.append(list);
+  const note = [];
+  if (items.length > shown.length) note.push(`${shown.length} shown · ${items.length} loaded`);
+  if (collection.truncated) note.push("projection collection truncated");
+  if (note.length) block.append(element("p", "inspector-artifact-note", note.join(" · ")));
+  return block;
 }
 
 function partitionRunRelationships(entry, projection = null) {
@@ -666,7 +715,8 @@ function renderRunLane(entry, projection, relationships = partitionRunRelationsh
   if (relationships.steps.length) {
     levels.push(element("div", "lane-association", "Associated steps · stable display order, not dependency order"));
     const level = element("div", "lane-level");
-    level.append(element("span", "lane-label", `Workflow steps (${relationships.steps.length})`));
+    const stepLabel = projection ? "Workflow steps" : "Loaded workflow steps";
+    level.append(element("span", "lane-label", `${stepLabel} (${relationships.steps.length})`));
     const list = element("div", "lane-steps");
     relationships.steps.forEach((model, index) => {
       const step = model.step;
@@ -699,7 +749,7 @@ function renderRunLane(entry, projection, relationships = partitionRunRelationsh
   setChildren(lane, ...levels);
 }
 
-function inspectorShell(title, subtitle, status, details, ids = [], counts = []) {
+function inspectorShell(title, subtitle, status, details, ids = [], counts = [], extras = []) {
   const block = element("section");
   const heading = element("div", "inspector-heading");
   const copy = element("div");
@@ -712,13 +762,14 @@ function inspectorShell(title, subtitle, status, details, ids = [], counts = [])
   block.append(list);
   if (counts.length) {
     const countGrid = element("div", "inspector-counts");
-    counts.forEach(([label, value, truncated]) => {
+    counts.forEach(([label, value]) => {
       const item = element("div", "inspector-count");
-      item.append(element("strong", "", value), element("span", "", `${label}${truncated ? " · truncated" : ""}`));
+      item.append(element("strong", "", value), element("span", "", label));
       countGrid.append(item);
     });
     block.append(countGrid);
   }
+  if (extras.length) block.append(...extras.filter(Boolean));
   if (ids.length) {
     const disclosure = element("details", "compact-disclosure");
     disclosure.append(element("summary", "", "Lineage and IDs"));
@@ -740,29 +791,54 @@ function renderRunInspector(entry, projection, relationships = partitionRunRelat
   if (selection.kind === "execution") {
     if (!projection) {
       const execution = entry.execution || {};
+      const projectionState = entry.executionId && state.runWorkspace.projection.id === entry.executionId ? state.runWorkspace.projection : null;
+      const notices = [];
+      if (projectionState?.status === "loading") notices.push(inspectorNotice("status", "Loading the coherent execution observation. Showing limited dashboard snapshot facts."));
+      if (projectionState?.status === "error") notices.push(inspectorNotice("alert", "Coherent execution detail is unavailable. Showing limited dashboard snapshot facts."));
       setChildren(target, inspectorShell(runEntryTitle(entry), "Limited execution detail · dashboard snapshot", execution.status, [
         ["Trigger", execution.trigger_source], ["Planned", formatTime(execution.planned_at, true)], ["Started", formatTime(execution.started_at, true)],
-        ["Completed", formatTime(execution.completed_at, true)], ["Attempts", execution.attempt_count], ["Workflow linked", execution.workflow_run_id ? "Yes" : "No"],
-      ], [["Execution ID", execution.id], ["Workflow run ID", execution.workflow_run_id || "Not linked"]]));
+        ["Completed", formatTime(execution.completed_at, true)], ["Attempts", execution.attempt_count],
+        ["Workflow reference", execution.workflow_run_id ? "Recorded" : "Not recorded"],
+      ], availableDetails([
+        ["Execution ID", execution.id], ["Schedule ID", execution.schedule_id], ["Scope version ID", execution.scope_version_id],
+        ["Task ID", execution.task_id], ["Workflow run ID", execution.workflow_run_id],
+      ]), [], notices));
       return;
     }
     const execution = projection.execution || {};
     const scheduler = projection.scheduler || {};
     const trigger = projection.trigger || {};
+    const task = projection.task || null;
+    const workflow = projection.workflow || null;
     const issues = Array.isArray(projection.lineage?.issues) ? projection.lineage.issues : [];
     const toolRuns = collectionValue(projection.tool_runs);
     const approvals = collectionValue(projection.approvals);
     const artifacts = collectionValue(projection.artifacts);
     const candidates = collectionValue(projection.candidate_findings);
     const changes = collectionValue(projection.change_items);
-    setChildren(target, inspectorShell(projection.current_schedule?.name || `Execution ${shortID(execution.id)}`, `Coherent observation · ${formatTime(projection.observed_at, true)}`, scheduler.status, [
-      ["Trigger", trigger.source], ["Planned", formatTime(trigger.planned_at, true)], ["Started", formatTime(scheduler.started_at, true)],
-      ["Completed", formatTime(scheduler.completed_at, true)], ["Attempts", scheduler.attempt_count], ["Workflow linked", execution.workflow_run_id ? "Yes" : "No"],
-      ["Lineage issues", issues.length],
-    ], [["Execution ID", execution.id], ["Schedule ID", execution.schedule_id], ["Task ID", execution.task_id || "Not linked"], ["Workflow run ID", execution.workflow_run_id || "Not linked"], ["Scope version ID", execution.scope_version_id || "Not linked"]], [
-      ["Tool runs", toolRuns.total, toolRuns.truncated], ["Approvals", approvals.total, approvals.truncated], ["Artifacts", artifacts.total, artifacts.truncated],
-      ["Candidates", candidates.total, candidates.truncated], ["Changes", changes.total, changes.truncated], ["Steps", Array.isArray(projection.steps) ? projection.steps.length : 0, false],
-    ]));
+    const workflowAvailability = execution.workflow_run_id
+      ? (workflow ? "Reference recorded; linked workflow row available" : "Workflow reference recorded; linked workflow details unavailable")
+      : "No workflow reference recorded";
+    const executionCounts = workflow ? [
+      ["Steps", `${Array.isArray(projection.steps) ? projection.steps.length : 0} total`],
+      ["Tool runs", projectionCollectionCountText(toolRuns)], ["Approvals", projectionCollectionCountText(approvals)],
+      ["Visible artifact references", projectionCollectionCountText(artifacts)],
+      ["Unverified candidate references", projectionCollectionCountText(candidates)],
+      ["Observations", `${projection.asset_observations?.total ?? 0} total`],
+      ["Distinct observed assets", projection.asset_observations?.distinct_asset_count ?? 0],
+    ] : [];
+    executionCounts.push(["Change items", projectionCollectionCountText(changes)]);
+    setChildren(target, inspectorShell(projection.current_schedule?.name || `Execution ${shortID(execution.id)}`, `Current schedule · coherent observation ${formatTime(projection.observed_at, true)}`, scheduler.status, availableDetails([
+      ["Observed at", formatTime(projection.observed_at, true)], ["Trigger", trigger.source], ["Planned", formatTime(trigger.planned_at, true)],
+      ["Started", formatTime(scheduler.started_at, true)], ["Completed", formatTime(scheduler.completed_at, true)], ["Attempts", scheduler.attempt_count],
+      ["Lease state", scheduler.lease_state], ["Lease expires", scheduler.lease_expires_at ? formatTime(scheduler.lease_expires_at, true) : null],
+      ["Error classification", scheduler.error_classification], ["Error summary", scheduler.error_summary],
+      ["Task objective", task?.objective], ["Task status", task?.status], ["Workflow status", workflow?.status],
+      ["Workflow linkage", workflowAvailability], ["Lineage diagnostics", issues.length ? issues.length : null],
+    ]), availableDetails([
+      ["Execution ID", execution.id], ["Schedule ID", execution.schedule_id], ["Program ID", execution.program_id],
+      ["Scope version ID", execution.scope_version_id], ["Task ID", execution.task_id], ["Workflow run ID", execution.workflow_run_id],
+    ]), executionCounts));
     return;
   }
   if (selection.kind === "workflow") {
@@ -772,22 +848,51 @@ function renderRunInspector(entry, projection, relationships = partitionRunRelat
       return;
     }
     const task = projection?.task || null;
-    setChildren(target, inspectorShell(workflow.definition_name || workflow.workflow_name || "Workflow run", projection ? "Execution projection" : "Limited run detail · dashboard snapshot", workflow.status, [
-      ["Version", workflow.workflow_version], ["Trigger", workflow.trigger_source], ["Started", formatTime(workflow.started_at, true)],
-      ["Completed", formatTime(workflow.completed_at, true)], ["Task objective", task?.objective || entry.run?.objective], ["Task status", task?.status || "Not available in snapshot"],
-    ], [["Workflow run ID", workflow.id], ["Task ID", workflow.task_id], ["Workflow definition ID", workflow.workflow_definition_id || "Not available in snapshot"]]));
+    if (!projection) {
+      setChildren(target, inspectorShell(workflow.workflow_name || "Workflow run", "Limited run detail · dashboard snapshot", workflow.status, availableDetails([
+        ["Version", workflow.workflow_version], ["Trigger", workflow.trigger_source], ["Started", formatTime(workflow.started_at, true)],
+        ["Completed", formatTime(workflow.completed_at, true)], ["Task objective", entry.run?.objective],
+      ]), availableDetails([["Workflow run ID", workflow.id], ["Task ID", workflow.task_id]])));
+      return;
+    }
+    const toolRuns = collectionValue(projection.tool_runs);
+    const approvals = collectionValue(projection.approvals);
+    const artifacts = collectionValue(projection.artifacts);
+    const candidates = collectionValue(projection.candidate_findings);
+    setChildren(target, inspectorShell(workflow.definition_name || "Workflow run", `Execution projection · current definition context · observed ${formatTime(projection.observed_at, true)}`, workflow.status, availableDetails([
+      ["Stored workflow version", workflow.workflow_version], ["Trigger", workflow.trigger_source], ["Started", formatTime(workflow.started_at, true)],
+      ["Completed", formatTime(workflow.completed_at, true)], ["Task objective", task?.objective], ["Task status", task?.status],
+      ["Previous workflow run", workflow.previous_run_id ? "Reference recorded" : "None recorded"],
+      ["Scheduled execution", entry.executionId ? "Associated" : null],
+    ]), availableDetails([
+      ["Scheduled execution ID", entry.executionId], ["Workflow run ID", workflow.id], ["Workflow definition ID", workflow.workflow_definition_id],
+      ["Task ID", workflow.task_id], ["Previous workflow run ID", workflow.previous_run_id],
+    ]), [
+      ["Steps", `${relationships.steps.length} total`], ["Tool runs", projectionCollectionCountText(toolRuns)],
+      ["Approvals", projectionCollectionCountText(approvals)], ["Visible artifact references", projectionCollectionCountText(artifacts)],
+      ["Unverified candidate references", projectionCollectionCountText(candidates)],
+      ["Observations", `${projection.asset_observations?.total ?? 0} total`],
+      ["Distinct observed assets", projection.asset_observations?.distinct_asset_count ?? 0],
+    ], [inspectorArtifactPreview(relationships.workflowArtifacts, artifacts)]));
     return;
   }
   if (selection.kind === "tool") {
     const model = findRelationshipItem(relationships, "tool", selection.id);
     if (!model) return;
     const tool = model.tool;
+    const artifacts = relationships.artifacts;
+    const artifactCounts = relationships.artifactCollectionAvailable
+      ? [["Visible artifact references", associatedCountText(model.artifacts.length, artifacts)]]
+      : [];
     setChildren(target, inspectorShell(`${tool.provider || "Tool run"}${tool.tool_version ? ` ${tool.tool_version}` : ""}`, "Recorded tool-run facts", null, [
-      ["Provider", tool.provider], ["Tool version", tool.tool_version], ["Capability", tool.capability],
+      ["Provider", tool.provider], ["Tool version", tool.tool_version], ["Capability", tool.capability], ["Step definition", tool.step_definition_id],
       ["Started", formatTime(tool.started_at, true)], ["Completed", tool.completed_at ? formatTime(tool.completed_at, true) : "Not completed at observation"], ["Timed out", boolText(tool.timed_out)],
       ["Exit code", tool.exit_code == null ? "Not recorded" : tool.exit_code], ["Stdout reference", tool.stdout_artifact_id ? "Present" : "Not recorded"],
-      ["Stderr reference", tool.stderr_artifact_id ? "Present" : "Not recorded"], ["Loaded artifact references", artifactCountText(model.artifacts.length, relationships.artifacts.truncated)],
-    ], [["Step run ID", tool.step_run_id], ["Tool run ID", tool.id]]));
+      ["Stderr reference", tool.stderr_artifact_id ? "Present" : "Not recorded"],
+    ], availableDetails([
+      ["Tool run ID", tool.id], ["Step run ID", tool.step_run_id], ["Step definition ID", tool.step_definition_id],
+      ["Workflow run ID", model.step?.workflow_run_id], ["Stdout artifact ID", tool.stdout_artifact_id], ["Stderr artifact ID", tool.stderr_artifact_id],
+    ]), artifactCounts, [relationships.artifactCollectionAvailable ? inspectorArtifactPreview(model.artifacts, artifacts) : null]));
     return;
   }
   if (selection.kind === "approval") {
@@ -795,7 +900,7 @@ function renderRunInspector(entry, projection, relationships = partitionRunRelat
     if (!model) return;
     const approval = model.approval;
     setChildren(target, inspectorShell("Approval", `Requested risk: ${approval.requested_risk_level || "not recorded"}`, approval.decision, [
-      ["Decision", approval.decision], ["Requested risk level", approval.requested_risk_level], ["Reason", approval.reason],
+      ["Decision", approval.decision || "Not recorded"], ["Requested risk level", approval.requested_risk_level || "Not recorded"], ["Reason", approval.reason || "Not recorded"],
       ["Requested", formatTime(approval.requested_at, true)], ["Decided", formatTime(approval.decided_at, true)],
       ["Expiry", formatTime(approval.expires_at, true)], ["Actor", approval.decided_by || "Not recorded"],
     ], [["Approval ID", approval.id], ["Step run ID", approval.step_run_id], ["Task ID", approval.task_id]]));
@@ -804,10 +909,19 @@ function renderRunInspector(entry, projection, relationships = partitionRunRelat
   const model = findRelationshipItem(relationships, "step", selection.id);
   if (!model) return;
   const step = model.step;
+  const artifacts = relationships.artifacts;
+  const childCounts = projection ? [
+    ["Tool runs", associatedCountText(model.toolRuns.length, relationships.toolRuns)],
+    ["Approvals", associatedCountText(model.approvals.length, relationships.approvals)],
+    ["Visible artifact references", associatedCountText(model.artifacts.length, artifacts)],
+  ] : [];
   setChildren(target, inspectorShell(step.step_definition_id || "Workflow step", step.capability || "No capability recorded", step.status, [
     ["Attempt count", step.attempt_count], ["Approval state", step.approval_state], ["Started", formatTime(step.started_at, true)],
     ["Completed", formatTime(step.completed_at, true)], ["Error classification", step.error_classification],
-  ], [["Step run ID", step.id], ["Workflow run ID", step.workflow_run_id], ["Step definition ID", step.step_definition_id]]));
+  ], availableDetails([
+    ["Step run ID", step.id], ["Step definition ID", step.step_definition_id], ["Workflow run ID", step.workflow_run_id],
+    ["Task ID", projection?.workflow?.task_id || projection?.task?.id],
+  ]), childCounts, [projection ? inspectorArtifactPreview(model.artifacts, artifacts) : null]));
 }
 
 function renderRunWorkspace(entry) {
@@ -857,7 +971,25 @@ function renderRunWorkspace(entry) {
   renderRunInspector(entry, projection, relationships);
 }
 
+function runWorkspaceItemKey(item = state.runWorkspace.item) {
+  return item ? `${item.kind}:${item.id}` : "";
+}
+
+function focusRunWorkspaceItem(key = runWorkspaceItemKey()) {
+  if (!key) return false;
+  const control = $$('[data-workspace-item]').find((item) => item.dataset.workspaceItem === key);
+  if (!control) return false;
+  try {
+    control.focus({ preventScroll: true });
+  } catch (_error) {
+    control.focus();
+  }
+  return true;
+}
+
 function renderRuns() {
+  const focusedItemKey = document.activeElement?.dataset?.workspaceItem || "";
+  const selectedItemKey = runWorkspaceItemKey();
   const entries = runWorkspaceEntries();
   const selected = selectedRunEntry(entries);
   if (selected && runEntryKey(selected) !== runEntryKey(state.runWorkspace.selection)) {
@@ -871,20 +1003,16 @@ function renderRuns() {
   }
   renderRunSelector(entries, selected);
   renderRunWorkspace(selected);
+  if (focusedItemKey && !focusRunWorkspaceItem(focusedItemKey) && focusedItemKey === selectedItemKey) {
+    focusRunWorkspaceItem();
+  }
 }
 
 function selectRunWorkspaceItem(kind, id) {
   state.runWorkspace.item = { kind, id: String(id) };
   renderRunWorkspace(selectedRunEntry());
   if (state.runWorkspace.item?.kind !== kind || !exactID(state.runWorkspace.item.id, id)) return;
-  const key = `${kind}:${id}`;
-  const control = $$('[data-workspace-item]').find((item) => item.dataset.workspaceItem === key);
-  if (!control) return;
-  try {
-    control.focus({ preventScroll: true });
-  } catch (_error) {
-    control.focus();
-  }
+  focusRunWorkspaceItem();
 }
 
 async function selectRunWorkspaceEntry(entry, { focus = false } = {}) {

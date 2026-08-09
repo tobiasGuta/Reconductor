@@ -342,6 +342,7 @@ function workspaceProjection(executionID, workflowRunID, name = "Workspace basel
     status: "running",
     trigger_source: "scheduled",
     started_at: "2026-08-08T14:00:05Z",
+    previous_run_id: `previous-${workflowRunID}`,
   };
   const firstStepID = `step-${workflowRunID}`;
   const secondStepID = `step-second-${workflowRunID}`;
@@ -391,10 +392,10 @@ function workspaceProjection(executionID, workflowRunID, name = "Workspace basel
   };
   value.artifacts = {
     items: [
-      { id: `artifact-first-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: workflowRunID, step_run_id: firstStepID, tool_run_id: firstToolID, type: "stdout", content_type: "text/plain", size: 20 },
-      { id: `artifact-stderr-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: workflowRunID, step_run_id: firstStepID, tool_run_id: secondToolID, type: "stderr", content_type: "text/plain", size: 10 },
-      { id: `artifact-other-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: workflowRunID, step_run_id: secondStepID, tool_run_id: otherToolID, type: "result", content_type: "application/json", size: 30 },
-      { id: `artifact-inconsistent-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: "different-workflow", step_run_id: firstStepID, tool_run_id: firstToolID, type: "result", content_type: "application/json", size: 40 },
+      { id: `artifact-first-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: workflowRunID, step_run_id: firstStepID, tool_run_id: firstToolID, type: "stdout", content_type: "text/plain", size: 20, redaction_state: "redacted", created_at: "2026-08-08T14:01:30Z", expires_at: "2026-08-09T14:01:30Z" },
+      { id: `artifact-stderr-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: workflowRunID, step_run_id: firstStepID, tool_run_id: secondToolID, type: "stderr", content_type: "text/plain", size: 10, redaction_state: "redacted", created_at: "2026-08-08T14:01:31Z" },
+      { id: `artifact-other-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: workflowRunID, step_run_id: secondStepID, tool_run_id: otherToolID, type: "result", content_type: "application/json", size: 30, redaction_state: "redacted", created_at: "2026-08-08T14:03:00Z" },
+      { id: `artifact-inconsistent-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: "different-workflow", step_run_id: firstStepID, tool_run_id: firstToolID, type: "result", content_type: "application/json", size: 40, redaction_state: "redacted", created_at: "2026-08-08T14:04:00Z" },
     ],
     total: 7,
     truncated: true,
@@ -429,6 +430,20 @@ function findButtons(root, label) {
   };
   visit(root);
   return found;
+}
+
+function findElements(root, predicate) {
+  const found = [];
+  const visit = (node) => {
+    if (predicate(node)) found.push(node);
+    node.children.forEach(visit);
+  };
+  visit(root);
+  return found;
+}
+
+function findByRole(root, role) {
+  return findElements(root, (node) => node.getAttribute("role") === role);
 }
 
 function response(status, body) {
@@ -668,6 +683,103 @@ test("missing exact workflow or step lineage creates no fabricated child associa
   assert.equal(relationships.unassociatedApprovals.length, detail.approvals.items.length);
 });
 
+test("projected execution inspector shows coherent context, independent statuses, and truthful totals", async () => {
+  const detail = workspaceProjection("execution-context", "run-context");
+  detail.scheduler = {
+    ...detail.scheduler,
+    status: "running",
+    attempt_count: 3,
+    lease_state: "active",
+    lease_owner: "internal-worker-must-stay-full-detail",
+    lease_expires_at: "2026-08-08T15:05:00Z",
+    recovery_protocol_version: 77,
+    error_classification: "provider_unavailable",
+    error_summary: "Safe retry context",
+  };
+  detail.task.objective = "Inspect the authorized target";
+  detail.task.status = "paused";
+  detail.workflow.status = "failed";
+  detail.lineage.issues = ["workflow_task_mismatch", "artifact_lineage_inconsistent"];
+  const document = installProjectedWorkspace(detail);
+  const inspector = document.querySelector("#run-inspector");
+  const text = inspector.textContent;
+
+  assert.match(text, /running/);
+  assert.match(text, /Attempts3/);
+  assert.match(text, /Lease stateactive/);
+  assert.match(text, /Lease expires/);
+  assert.match(text, /Error classificationprovider_unavailable/);
+  assert.match(text, /Error summarySafe retry context/);
+  assert.match(text, /Task objectiveInspect the authorized target/);
+  assert.match(text, /Task statuspaused/);
+  assert.match(text, /Workflow statusfailed/);
+  assert.match(text, /Observed at/);
+  assert.match(text, /Lineage diagnostics2/);
+  assert.doesNotMatch(text, /internal-worker-must-stay-full-detail|Recovery protocol|overall status/i);
+  assert.match(text, /6 total · 4 loadedTool runs/);
+  assert.match(text, /3 total · 2 loadedApprovals/);
+  assert.match(text, /7 total · 4 loadedVisible artifact references/);
+  assert.match(text, /0 totalUnverified candidate references/);
+  assert.match(text, /7 totalObservations/);
+  assert.match(text, /3Distinct observed assets/);
+  assert.match(text, /0 totalChange items/);
+
+  const disclosure = inspector.querySelectorAll(".compact-disclosure")[0];
+  assert.ok(disclosure);
+  assert.equal(findElements(disclosure, (node) => node.tagName === "DETAILS").length, 1);
+  assert.equal(findElements(disclosure, (node) => node.tagName === "SUMMARY")[0].textContent, "Lineage and IDs");
+  assert.match(disclosure.textContent, /Execution IDexecution-context/);
+  assert.match(disclosure.textContent, /Program IDprogram-1/);
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+  await disclosure.click();
+  assert.equal(calls, 0);
+});
+
+test("projected workflow inspector adds workflow context without attributing execution changes", async () => {
+  const detail = workspaceProjection("execution-workflow", "run-workflow");
+  const document = installProjectedWorkspace(detail);
+  await workspaceItem(document, "workflow", "run-workflow").click();
+  const inspector = document.querySelector("#run-inspector");
+  const text = inspector.textContent;
+
+  assert.match(text, /Authorized baseline/);
+  assert.match(text, /Stored workflow version1/);
+  assert.match(text, /Task objectiveObjective run-workflow/);
+  assert.match(text, /Previous workflow runReference recorded/);
+  assert.match(text, /Scheduled executionAssociated/);
+  assert.match(text, /2 totalSteps/);
+  assert.match(text, /6 total · 4 loadedTool runs/);
+  assert.match(text, /7 total · 4 loadedVisible artifact references/);
+  assert.match(text, /7 totalObservations/);
+  assert.doesNotMatch(text, /Change items/);
+  assert.match(text, /Scheduled execution IDexecution-workflow/);
+  assert.match(text, /Previous workflow run IDprevious-run-workflow/);
+});
+
+test("step inspector distinguishes exact child counts from loaded associations", async () => {
+  let detail = workspaceProjection("execution-step-loaded", "run-step-loaded");
+  let document = installProjectedWorkspace(detail);
+  await workspaceItem(document, "step", "step-run-step-loaded").click();
+  let inspector = document.querySelector("#run-inspector");
+  assert.match(inspector.textContent, /2 loadedTool runs/);
+  assert.match(inspector.textContent, /1 loadedApprovals/);
+  assert.match(inspector.textContent, /3 loadedVisible artifact references/);
+
+  detail = workspaceProjection("execution-step-exact", "run-step-exact");
+  for (const collectionName of ["tool_runs", "approvals", "artifacts"]) {
+    detail[collectionName].truncated = false;
+    detail[collectionName].total = detail[collectionName].items.length;
+  }
+  document = installProjectedWorkspace(detail);
+  await workspaceItem(document, "step", "step-run-step-exact").click();
+  inspector = document.querySelector("#run-inspector");
+  assert.match(inspector.textContent, /2Tool runs/);
+  assert.match(inspector.textContent, /1Approvals/);
+  assert.match(inspector.textContent, /3Visible artifact references/);
+  assert.doesNotMatch(inspector.textContent, /loadedTool runs|loadedApprovals|loadedVisible artifact references/);
+});
+
 test("bounded collection and artifact copy distinguishes exact from loaded subsets", () => {
   const document = installProjectedWorkspace(workspaceProjection("execution-1", "run-1"));
   const laneText = document.querySelector("#run-lane").textContent;
@@ -700,6 +812,49 @@ test("ready empty artifact collection preserves truthful zero counts", () => {
   assert.match(workspaceItem(document, "workflow", "run-empty").textContent, /Artifacts: 0 artifacts/);
   assert.match(workspaceItem(document, "step", "step-run-empty").textContent, /Artifacts: 0 artifacts/);
   assert.match(workspaceItem(document, "tool", "tool-first-run-empty").textContent, /Artifacts: 0 artifacts/);
+});
+
+test("artifact metadata preview is capped, text-only, local, and qualified", async () => {
+  const malicious = `<img src=x onerror="globalThis.compromised=true">`;
+  const detail = workspaceProjection("execution-artifacts", "run-artifacts");
+  const stepRunID = "step-run-artifacts";
+  const toolRunID = "tool-first-run-artifacts";
+  detail.artifacts = {
+    items: Array.from({ length: 5 }, (_, index) => ({
+      id: `artifact-preview-${index}`,
+      task_id: "task-run-artifacts",
+      workflow_run_id: "run-artifacts",
+      step_run_id: stepRunID,
+      tool_run_id: toolRunID,
+      type: index === 0 ? malicious : `result-${index}`,
+      content_type: "application/json",
+      size: 1024 + index,
+      redaction_state: "redacted",
+      created_at: "2026-08-08T14:01:30Z",
+      expires_at: "2026-08-09T14:01:30Z",
+    })),
+    total: 9,
+    truncated: true,
+  };
+  const document = installProjectedWorkspace(detail);
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+
+  await workspaceItem(document, "tool", toolRunID).click();
+  const inspector = document.querySelector("#run-inspector");
+  const preview = inspector.querySelectorAll(".inspector-artifacts")[0];
+  assert.equal(preview.querySelectorAll(".inspector-artifact-row").length, 3);
+  assert.match(preview.textContent, /3 shown · 5 loaded/);
+  assert.match(preview.textContent, /projection collection truncated/);
+  assert.match(preview.textContent, /application\/json · 1\.0 KiB/);
+  assert.match(preview.textContent, /Redaction: redacted/);
+  assert.match(preview.textContent, /Created/);
+  assert.match(preview.textContent, /Expires/);
+  assert.match(preview.textContent, /<img src=x/);
+  assert.doesNotMatch(preview.textContent, /artifact-preview-/);
+  assert.equal(document.createdElements.some((item) => item.tagName === "IMG"), false);
+  assert.equal(document.querySelectorAll("[data-workspace-item]").some((item) => item.dataset.workspaceItem.startsWith("artifact:")), false);
+  assert.equal(calls, 0);
 });
 
 test("unassociated loaded records are reported without becoming child nodes", () => {
@@ -737,10 +892,26 @@ test("tool selection is local, restores focus, and renders only recorded tool fa
   assert.match(inspector.textContent, /Exit code0/);
   assert.match(inspector.textContent, /Timed outNo/);
   assert.match(inspector.textContent, /Stdout referencePresent/);
-  assert.match(inspector.textContent, /Loaded artifact references1 loaded/);
+  assert.match(inspector.textContent, /Step definitionprobe/);
+  assert.match(inspector.textContent, /1 loadedVisible artifact references/);
+  assert.match(inspector.textContent, /stdouttext\/plain · 20 B/);
   assert.doesNotMatch(inspector.textContent, /succeeded|failed|running/i);
   assert.match(document.querySelector("#run-lane").textContent, /Not completed at observation/);
   assert.match(document.querySelector("#run-lane").textContent, /Timed out.*Exit 2/);
+});
+
+test("tool inspector uses an exact visible-artifact count when the collection is complete", async () => {
+  const detail = workspaceProjection("execution-tool-exact", "run-tool-exact");
+  detail.artifacts.truncated = false;
+  detail.artifacts.total = detail.artifacts.items.length;
+  const document = installProjectedWorkspace(detail);
+
+  await workspaceItem(document, "tool", "tool-first-run-tool-exact").click();
+
+  const text = document.querySelector("#run-inspector").textContent;
+  assert.match(text, /1Visible artifact references/);
+  assert.doesNotMatch(text, /1 loadedVisible artifact references/);
+  assert.doesNotMatch(text, /succeeded|failed|running/i);
 });
 
 test("approval selection is local and preserves decision separately from step approval state", async () => {
@@ -776,16 +947,70 @@ test("child selection survives rerender while exact id exists and falls back whe
   const detail = workspaceProjection("execution-1", "run-1");
   const document = installProjectedWorkspace(detail);
   await workspaceItem(document, "tool", "tool-other-run-1").click();
+  const original = document.activeElement;
 
   app.state.data.runs = [workflowRun("run-1", "running", "Polling refresh")];
   app.renderRuns();
   assert.deepEqual(app.state.runWorkspace.item, { kind: "tool", id: "tool-other-run-1" });
-  assert.equal(workspaceItem(document, "tool", "tool-other-run-1").getAttribute("aria-pressed"), "true");
+  const current = workspaceItem(document, "tool", "tool-other-run-1");
+  assert.equal(current.getAttribute("aria-pressed"), "true");
+  assert.notEqual(current, original);
+  assert.equal(document.activeElement, current);
+  assert.deepEqual(current.focusOptions, { preventScroll: true });
 
   detail.tool_runs.items = detail.tool_runs.items.filter((item) => item.id !== "tool-other-run-1");
   app.renderRuns();
   assert.deepEqual(app.state.runWorkspace.item, { kind: "execution", id: "execution-1" });
+  const fallback = workspaceItem(document, "execution", "execution-1");
+  assert.equal(document.activeElement, fallback);
+  assert.deepEqual(fallback.focusOptions, { preventScroll: true });
   assert.match(document.querySelector("#run-inspector").textContent, /Execution IDexecution-1/);
+});
+
+test("polling rerender preserves an unselected focused child without changing selection", async () => {
+  const detail = workspaceProjection("execution-focus", "run-focus");
+  const document = installProjectedWorkspace(detail);
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+  await workspaceItem(document, "tool", "tool-first-run-focus").click();
+  const selectedBefore = workspaceItem(document, "tool", "tool-first-run-focus");
+  const focusedBefore = workspaceItem(document, "tool", "tool-other-run-focus");
+  focusedBefore.focus();
+
+  app.renderRuns();
+
+  const selectedAfter = workspaceItem(document, "tool", "tool-first-run-focus");
+  const focusedAfter = workspaceItem(document, "tool", "tool-other-run-focus");
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "tool", id: "tool-first-run-focus" });
+  assert.notEqual(selectedAfter, selectedBefore);
+  assert.notEqual(focusedAfter, focusedBefore);
+  assert.equal(document.activeElement, focusedAfter);
+  assert.notEqual(document.activeElement, selectedAfter);
+  assert.deepEqual(focusedAfter.focusOptions, { preventScroll: true });
+  assert.equal(calls, 0);
+
+  detail.tool_runs.items = detail.tool_runs.items.filter((item) => item.id !== "tool-other-run-focus");
+  app.renderRuns();
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "tool", id: "tool-first-run-focus" });
+  assert.notEqual(document.activeElement, workspaceItem(document, "tool", "tool-first-run-focus"));
+  assert.equal(calls, 0);
+});
+
+test("polling rerender leaves focus outside the relationship lane", async () => {
+  const detail = workspaceProjection("execution-outside-focus", "run-outside-focus");
+  const document = installProjectedWorkspace(detail);
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+  await workspaceItem(document, "tool", "tool-first-run-outside-focus").click();
+  const header = document.querySelector("#run-workspace-header");
+  header.focus();
+
+  app.renderRuns();
+
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "tool", id: "tool-first-run-outside-focus" });
+  assert.equal(document.activeElement, header);
+  assert.notEqual(document.activeElement, workspaceItem(document, "tool", "tool-first-run-outside-focus"));
+  assert.equal(calls, 0);
 });
 
 test("loading clears projected children and workflow-only invalid children fall back to workflow", async () => {
@@ -796,6 +1021,8 @@ test("loading clears projected children and workflow-only invalid children fall 
   app.renderRuns();
   assert.deepEqual(app.state.runWorkspace.item, { kind: "execution", id: "execution-1" });
   assert.match(document.querySelector("#run-lane").textContent, /Loading the coherent execution observation/);
+  assert.equal(findByRole(document.querySelector("#run-inspector"), "status").length, 1);
+  assert.doesNotMatch(document.querySelector("#run-inspector").textContent, /Visible artifact references|Unverified candidate references|Observations0 total/);
   assert.equal(workspaceItem(document, "approval", "approval-run-1"), undefined);
 
   installDocument();
@@ -819,6 +1046,27 @@ test("tool provider version and approval reason remain text-only", async () => {
   await workspaceItem(document, "approval", "approval-run-1").click();
   assert.match(document.querySelector("#run-inspector").textContent, /<img src=x/);
   assert.equal(document.createdElements.some((item) => item.tagName === "IMG"), false);
+});
+
+test("execution inspector distinguishes a recorded workflow reference from unavailable linked details", () => {
+  const detail = workspaceProjection("execution-missing-workflow", "run-missing-workflow");
+  detail.workflow = null;
+  detail.steps = [];
+  const document = installDocument();
+  const scheduled = execution("execution-missing-workflow", "completed");
+  scheduled.workflow_run_id = "run-missing-workflow";
+  app.state.data.scheduled_executions = [scheduled];
+  app.state.runWorkspace.selection = { kind: "execution", id: detail.execution.id };
+  app.state.runWorkspace.item = { kind: "execution", id: detail.execution.id };
+  app.state.runWorkspace.projection = { id: detail.execution.id, status: "ready", data: detail, error: "" };
+
+  app.renderRuns();
+
+  const text = document.querySelector("#run-inspector").textContent;
+  assert.match(text, /Workflow reference recorded; linked workflow details unavailable/);
+  assert.doesNotMatch(text, /No workflow reference recorded/);
+  assert.doesNotMatch(text, /Steps|Tool runs|Approvals|Visible artifact references|Unverified candidate references|Observations|Distinct observed assets/);
+  assert.match(text, /0 totalChange items/);
 });
 
 test("late workspace execution A cannot overwrite selected execution B", async () => {
@@ -868,7 +1116,11 @@ test("unscheduled workflow run renders limited detail without projection fetch",
   assert.match(document.querySelector("#run-inspector").textContent, /Limited run detail/);
   assert.ok(workspaceItem(document, "workflow", "run-only"));
   assert.ok(workspaceItem(document, "step", "step-run-only"));
+  assert.match(document.querySelector("#run-lane").textContent, /Loaded workflow steps \(1\)/);
   assert.doesNotMatch(document.querySelector("#run-lane").textContent, /Artifacts:/);
+  assert.doesNotMatch(document.querySelector("#run-inspector").textContent, /Visible artifact|Candidate|Observations|Scheduled execution/);
+  app.selectRunWorkspaceItem("step", "step-run-only");
+  assert.doesNotMatch(document.querySelector("#run-inspector").textContent, /Tool runs|Approvals|Visible artifact references/);
 });
 
 test("projection error keeps snapshot lineage without claiming zero artifacts", async () => {
@@ -887,6 +1139,7 @@ test("projection error keeps snapshot lineage without claiming zero artifacts", 
   assert.equal(calls, 1);
   assert.equal(app.state.runWorkspace.projection.status, "error");
   assert.match(document.querySelector("#run-workspace-meta").textContent, /temporarily unavailable/i);
+  assert.equal(findByRole(document.querySelector("#run-inspector"), "alert").length, 1);
   assert.ok(workspaceItem(document, "workflow", "run-1"));
   assert.ok(workspaceItem(document, "step", "step-run-1"));
   assert.doesNotMatch(document.querySelector("#run-lane").textContent, /Artifacts:/);
