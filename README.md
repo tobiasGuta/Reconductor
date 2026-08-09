@@ -27,7 +27,7 @@ flowchart TD
     B --> C[Direct manual workflow run<br/>CLI]
     B --> D[Persistent scheduled execution<br/>Cron or Run Now from CLI / local console]
 
-    D --> D1[Materialize or enqueue ScheduledExecution]
+    D --> D1[Materialize or insert pending ScheduledExecution<br/>in PostgreSQL]
     D1 --> D2[Claim execution with a lease]
     D2 --> E
     C --> E
@@ -44,6 +44,12 @@ flowchart TD
     F --> F1[Create or resume Task]
     F1 --> F2[Create or resume WorkflowRun<br/>Attach scheduled lineage atomically when present]
     F2 --> G[Apply policy, scope, rate, and concurrency checks<br/>to each capability execution]
+
+    G -. each ready capability .-> ES[Shared execution service<br/>Provider invocation, artifacts, and durable results]
+    DJ[Explicitly dispatched capability job<br/>Validated scope and policy envelope] --> RS[(Redis Streams<br/>Consumer group, retries, dead letters)]
+    RS --> WK[Distributed worker pool<br/>Stale-claim recovery and bounded retry]
+    WK --> ES
+    ES --> PR[Capability registry<br/>In-process and external providers]
 
     G --> H0{Continuous workflow<br/>with discovery roots?}
     H0 -->|Yes| H1[discover.subdomains<br/>Subfinder]
@@ -94,10 +100,11 @@ flowchart TD
     T -->|Yes| V[Verified finding]
 
     D3 --> W[Researcher reviews and acknowledges scope expansion]
-    W --> X[Queue Run Now or wait for a later cron occurrence]
+    W --> X[Insert a new Run Now execution<br/>or wait for a later cron occurrence]
     X --> D
 
     N --> Y[Persist execution state, artifacts, observations,<br/>change items, findings, and audit events]
+    ES --> Y
     P --> Y
     U --> Y
     V --> Y
@@ -112,17 +119,25 @@ flowchart TD
     EP --> EP2[Execution lineage<br/>Task, WorkflowRun, StepRuns]
     EP --> EP3[Bounded evidence children<br/>ToolRuns, Approvals, non-sensitive Artifacts]
     EP --> EP4[Bounded Candidate Findings<br/>Safe references and current state]
-    EP --> EP5[Lineage diagnostics<br/>Preserve contradictions; never repair]
+    EP --> EP5[Aggregate Asset Observations<br/>Total and distinct asset count]
+    EP --> EP6[Bounded execution Change Items<br/>Classification and opaque evidence references]
+    EP --> EP7[Lineage diagnostics<br/>Preserve contradictions; never repair]
 
-    DB --> Z[Local operator console<br/>Sanitized read models]
-    Z --> Z1[Programs]
-    Z --> Z2[Schedules]
-    Z --> Z3[Scheduled executions]
+    DB -->|Snapshot read models| Z[Loopback-only operator console<br/>Sanitized reads and narrow validated mutations]
+    Z -->|Schedules, approvals, reviews, scope acknowledgements| DB
+    RS -->|Pending and dead-letter metadata| Z
+    Z -->|Explicit dead-letter retry| RS
+    Z --> Z1[Programs and scope posture]
+    Z --> Z2[Schedules and Run Now]
+    Z --> Z3[Runs workspace<br/>Executions, lineage, contextual inspectors]
+    EP --> Z3
     Z --> Z4[Pending scope expansions]
-    Z --> Z5[Change inbox]
-    Z --> Z6[Approvals]
-    Z --> Z7[Candidates and verified findings]
-    Z --> Z8[Audit events]
+    Z --> Z5[Change inbox and review dispositions]
+    Z --> Z6[Approval inbox]
+    Z --> Z7[Assets and observations]
+    Z --> Z8[Candidates, verification records,<br/>and verified findings]
+    Z --> Z9[Sanitized tool metadata and audit events]
+    Z --> Z10[Redis pending and dead-letter recovery]
 
     style A fill:#1f2937,color:#fff
     style E fill:#2563eb,color:#fff
@@ -132,7 +147,10 @@ flowchart TD
     style V fill:#7c3aed,color:#fff
     style D3 fill:#b91c1c,color:#fff
     style W fill:#b91c1c,color:#fff
+    style ES fill:#2563eb,color:#fff
+    style RS fill:#b45309,color:#fff
     style EP fill:#0f766e,color:#fff
+    style Z fill:#0f766e,color:#fff
 ```
 
 The local console's **Run Now** action enqueues a persistent scheduled execution; only `platform workflow run` is the direct manual path. Scope acknowledgement closes the review item but does not revive the blocked execution, so the operator must queue a new run or wait for a later cron occurrence.
