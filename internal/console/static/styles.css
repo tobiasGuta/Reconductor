@@ -208,6 +208,33 @@ input[type="search"] { width: 230px; padding: 0 12px; }
 .lane-collection-notice, .lane-unavailable, .lane-unassociated { padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; background: rgba(16,27,24,.72); color: var(--muted); font-size: 9px; line-height: 1.5; }
 .lane-unassociated { border-color: var(--line-strong); }
 .lane-unassociated p { margin: 5px 0 0; overflow-wrap: anywhere; }
+.execution-changes { min-width: 0; margin-top: 6px; padding-top: 16px; display: grid; gap: 11px; border-top: 1px solid var(--line-strong); }
+.execution-changes h4, .change-count-group h5 { margin: 0; }
+.execution-changes h4 { font-size: 12px; }
+.execution-changes-unavailable, .change-collection-note { margin: 0; color: var(--quiet); font-size: 9px; line-height: 1.5; }
+.change-collection-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.change-summary-item { padding: 9px; border: 1px solid var(--line); border-radius: 7px; background: rgba(16,27,24,.72); }
+.change-summary-item strong, .change-summary-item span { display: block; }
+.change-summary-item strong { font-size: 13px; }
+.change-summary-item span { margin-top: 3px; color: var(--quiet); font-size: 8px; letter-spacing: .05em; text-transform: uppercase; }
+.change-count-groups { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.change-count-group { min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg-deep); }
+.change-count-group h5 { overflow-wrap: anywhere; color: var(--muted); font-size: 8px; line-height: 1.4; text-transform: uppercase; }
+.change-count-chips { margin-top: 7px; display: flex; flex-wrap: wrap; gap: 5px; }
+.change-count-chip { min-width: 0; padding: 4px 6px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 8px; }
+.change-count-chip strong { overflow-wrap: anywhere; font-weight: 600; }
+.change-count-chip span { color: var(--quiet); }
+.change-count-empty { color: var(--quiet); font-size: 8px; }
+.change-row-list { display: grid; gap: 6px; }
+.change-row { width: 100%; min-width: 0; padding: 9px 10px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: rgba(16,27,24,.82); text-align: left; cursor: pointer; }
+.change-row:hover { border-color: var(--muted); background: var(--surface-raised); }
+.change-row[aria-pressed="true"] { border-color: var(--green); box-shadow: 0 0 0 2px rgba(101,215,163,.12); }
+.change-row-copy { min-width: 0; }
+.change-row-copy strong, .change-row-copy small { display: block; overflow-wrap: anywhere; }
+.change-row-copy strong { font-size: 9px; }
+.change-row-copy small { margin-top: 3px; color: var(--quiet); font-size: 8px; line-height: 1.45; }
+.change-expansion-control { justify-self: start; padding: 7px 9px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--muted); background: transparent; font-size: 9px; cursor: pointer; }
+.change-expansion-control:hover { color: var(--text); background: var(--surface-raised); }
 .run-inspector { min-height: 180px; padding: 17px; }
 .run-inspector > section, .inspector-heading > div, .inspector-artifacts, .inspector-artifact-row > div { min-width: 0; }
 .inspector-heading { margin-bottom: 13px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
@@ -365,6 +392,7 @@ input[type="search"] { width: 230px; padding: 0 12px; }
   .run-selector-list { max-height: 250px; }
   .run-canvas { min-height: 420px; overflow-x: auto; }
   .run-lane { min-width: 520px; }
+  .change-count-groups { grid-template-columns: 1fr; }
   .run-inspector-panel { border-top: 1px solid var(--line); }
   .inspector-details { grid-template-columns: 1fr; }
   .inspector-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -372,6 +400,8 @@ input[type="search"] { width: 230px; padding: 0 12px; }
 
 @media (max-width: 420px) {
   .run-lane { min-width: 340px; padding: 17px; }
+  .change-collection-summary { grid-template-columns: 1fr; }
+  .change-row { align-items: flex-start; }
   .lane-steps { grid-template-columns: 1fr; }
   .lane-children { margin-left: 5px; padding-left: 8px; }
   .lane-child-node { display: grid; grid-template-columns: 1fr; gap: 7px; }

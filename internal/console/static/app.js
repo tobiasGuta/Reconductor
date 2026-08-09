@@ -21,6 +21,7 @@ const state = {
   runWorkspace: {
     selection: null,
     item: null,
+    expandedChangeExecutionID: "",
     projection: { id: "", status: "idle", data: null, error: "" },
   },
 };
@@ -377,6 +378,7 @@ function activityItem(event) {
 
 const activeWorkspaceStatuses = new Set(["pending", "claimed", "running", "paused", "paused_operator", "paused_for_approval", "awaiting_approval"]);
 const inspectorArtifactPreviewLimit = 3;
+const initialChangeRowLimit = 16;
 
 function runEntryKey(entry) {
   return entry ? `${entry.kind}:${entry.id}` : "";
@@ -431,6 +433,7 @@ function setRunWorkspaceSelection(entry) {
     cancelExecutionDetail();
     resetRunWorkspaceProjection();
     state.runWorkspace.item = null;
+    state.runWorkspace.expandedChangeExecutionID = "";
   }
   state.runWorkspace.selection = entry ? { kind: entry.kind, id: entry.id } : null;
   if (!state.runWorkspace.item) {
@@ -576,16 +579,21 @@ function findRelationshipItem(relationships, kind, id) {
   return null;
 }
 
+function findProjectedChange(projection, id) {
+  return collectionValue(projection?.change_items).items.find((item) => exactID(item.id, id)) || null;
+}
+
 function fallbackRunWorkspaceItem(entry) {
   return entry ? { kind: entry.executionId ? "execution" : "workflow", id: entry.executionId || entry.workflowRunId } : null;
 }
 
-function resolveRunWorkspaceItem(entry, relationships) {
+function resolveRunWorkspaceItem(entry, relationships, projection = null) {
   const selection = state.runWorkspace.item;
   let available = false;
   if (selection?.kind === "execution") available = Boolean(entry?.executionId && exactID(selection.id, entry.executionId));
   else if (selection?.kind === "workflow") available = Boolean(relationships.workflow && exactID(selection.id, relationships.workflow.id));
   else if (["step", "tool", "approval"].includes(selection?.kind)) available = Boolean(findRelationshipItem(relationships, selection.kind, selection.id));
+  else if (selection?.kind === "change") available = Boolean(findProjectedChange(projection, selection.id));
   if (!available) state.runWorkspace.item = fallbackRunWorkspaceItem(entry);
   return state.runWorkspace.item;
 }
@@ -681,6 +689,89 @@ function unassociatedRecordText(count, singular) {
   return `${count} loaded ${singular}${count === 1 ? "" : "s"} could not be associated with an available step`;
 }
 
+function groupedChangeCounts(items, field) {
+  const groups = new Map();
+  items.forEach((item) => {
+    const value = String(item?.[field] || "Not recorded");
+    groups.set(value, (groups.get(value) || 0) + 1);
+  });
+  return [...groups.entries()];
+}
+
+function changeCountGroup(items, field, label, truncated) {
+  const block = element("section", "change-count-group");
+  block.append(element("h5", "", `${truncated ? "Loaded changes" : "Execution changes"} by ${label}`));
+  const counts = element("div", "change-count-chips");
+  groupedChangeCounts(items, field).forEach(([value, count]) => {
+    const chip = element("span", "change-count-chip");
+    chip.append(element("strong", "", value.replaceAll("_", " ")), element("span", "", String(count)));
+    counts.append(chip);
+  });
+  if (!counts.children.length) counts.append(element("span", "change-count-empty", "No loaded values"));
+  block.append(counts);
+  return block;
+}
+
+function renderExecutionChanges(entry, projection) {
+  const block = element("section", "execution-changes");
+  block.append(element("h4", "", "Execution changes"));
+  if (!projection) {
+    block.append(element("p", "execution-changes-unavailable", "Change collection unavailable without a coherent execution projection."));
+    return block;
+  }
+  const changes = collectionValue(projection.change_items);
+  const loaded = changes.items.length;
+  const summary = element("div", "change-collection-summary");
+  [["Exact total", changes.total], ["Loaded", loaded], ["Truncated", changes.truncated ? "Yes" : "No"]].forEach(([label, value]) => {
+    const item = element("div", "change-summary-item");
+    item.append(element("strong", "", String(value)), element("span", "", label));
+    summary.append(item);
+  });
+  block.append(summary, element("p", "change-collection-note", changes.truncated
+    ? `${loaded} of ${changes.total} changes loaded. Grouped counts cover the loaded subset only.`
+    : `${loaded} of ${changes.total} changes loaded. The execution collection is complete.`));
+  const groups = element("div", "change-count-groups");
+  groups.append(
+    changeCountGroup(changes.items, "kind", "kind", changes.truncated),
+    changeCountGroup(changes.items, "entity_type", "entity type", changes.truncated),
+    changeCountGroup(changes.items, "priority", "priority", changes.truncated),
+  );
+  block.append(groups);
+  if (!loaded) {
+    block.append(empty("No change items are linked to this execution."));
+    return block;
+  }
+  const expanded = exactID(state.runWorkspace.expandedChangeExecutionID, entry.executionId);
+  const visible = expanded ? changes.items : changes.items.slice(0, initialChangeRowLimit);
+  const list = element("div", "change-row-list");
+  visible.forEach((item) => {
+    const button = element("button", "change-row");
+    button.type = "button";
+    button.dataset.workspaceItem = `change:${item.id}`;
+    button.setAttribute("aria-pressed", String(state.runWorkspace.item?.kind === "change" && exactID(state.runWorkspace.item.id, item.id)));
+    const copy = element("span", "change-row-copy");
+    copy.append(
+      element("strong", "", `${item.kind || "Change"} · ${item.entity_type || "entity"}`),
+      element("small", "", `Observed ${formatTime(item.observed_at, true)} · Source capabilities: ${Array.isArray(item.source_capabilities) ? item.source_capabilities.length : 0}`),
+    );
+    button.append(copy, statusBadge(item.priority || "unknown"));
+    button.addEventListener("click", () => selectRunWorkspaceItem("change", item.id));
+    list.append(button);
+  });
+  block.append(list);
+  if (loaded > initialChangeRowLimit) {
+    const toggle = element("button", "change-expansion-control", expanded
+      ? `Show first ${initialChangeRowLimit} changes`
+      : `Show all ${loaded} loaded changes`);
+    toggle.type = "button";
+    toggle.dataset.workspaceControl = `change-expansion:${entry.executionId}`;
+    toggle.setAttribute("aria-expanded", String(expanded));
+    toggle.addEventListener("click", () => toggleExecutionChanges(entry.executionId));
+    block.append(toggle);
+  }
+  return block;
+}
+
 function renderRunLane(entry, projection, relationships = partitionRunRelationships(entry, projection)) {
   const lane = $("#run-lane");
   if (!entry) {
@@ -745,6 +836,7 @@ function renderRunLane(entry, projection, relationships = partitionRunRelationsh
     unassociated.forEach((message) => level.append(element("p", "", message)));
     levels.push(level);
   }
+  if (entry.executionId) levels.push(renderExecutionChanges(entry, projection));
   if (!levels.length) levels.push(empty("No associated workflow lineage is available yet."));
   setChildren(lane, ...levels);
 }
@@ -784,7 +876,7 @@ function inspectorShell(title, subtitle, status, details, ids = [], counts = [],
 function renderRunInspector(entry, projection, relationships = partitionRunRelationships(entry, projection)) {
   const target = $("#run-inspector");
   if (!entry || !state.runWorkspace.item) {
-    setChildren(target, empty("Select an execution, workflow, step, tool run, or approval."));
+    setChildren(target, empty("Select an execution, workflow, step, tool run, approval, or change."));
     return;
   }
   const selection = state.runWorkspace.item;
@@ -876,6 +968,21 @@ function renderRunInspector(entry, projection, relationships = partitionRunRelat
     ], [inspectorArtifactPreview(relationships.workflowArtifacts, artifacts)]));
     return;
   }
+  if (selection.kind === "change") {
+    const change = findProjectedChange(projection, selection.id);
+    if (!change) return;
+    const sources = Array.isArray(change.source_capabilities) ? change.source_capabilities : [];
+    const evidence = Array.isArray(change.evidence_artifact_ids) ? change.evidence_artifact_ids : [];
+    setChildren(target, inspectorShell(`${change.kind || "Change"} · ${change.entity_type || "entity"}`, "Recorded execution change metadata", change.priority, [
+      ["Kind", change.kind || "Not recorded"], ["Entity type", change.entity_type || "Not recorded"],
+      ["Priority", change.priority || "Not recorded"], ["Source capabilities", sources.length ? sources.join(", ") : "None recorded"],
+      ["Observed", formatTime(change.observed_at, true)], ["Created", formatTime(change.created_at, true)],
+    ], [
+      ["Change ID", change.id], ["Program ID", change.program_id], ["Workflow run ID", change.workflow_run_id],
+      ["Scheduled execution ID", change.scheduled_execution_id], ["Evidence artifact IDs", evidence.length ? evidence.join(", ") : "None recorded"],
+    ]));
+    return;
+  }
   if (selection.kind === "tool") {
     const model = findRelationshipItem(relationships, "tool", selection.id);
     if (!model) return;
@@ -927,7 +1034,7 @@ function renderRunInspector(entry, projection, relationships = partitionRunRelat
 function renderRunWorkspace(entry) {
   const projection = currentRunProjection(entry);
   const relationships = partitionRunRelationships(entry, projection);
-  resolveRunWorkspaceItem(entry, relationships);
+  resolveRunWorkspaceItem(entry, relationships, projection);
   const actions = $("#run-workspace-actions");
   if (!entry) {
     $("#run-workspace-eyebrow").textContent = "Run workspace";
@@ -975,9 +1082,17 @@ function runWorkspaceItemKey(item = state.runWorkspace.item) {
   return item ? `${item.kind}:${item.id}` : "";
 }
 
-function focusRunWorkspaceItem(key = runWorkspaceItemKey()) {
+function runWorkspaceFocusKey(item = document.activeElement) {
+  if (item?.dataset?.workspaceItem) return `item:${item.dataset.workspaceItem}`;
+  if (item?.dataset?.workspaceControl) return `control:${item.dataset.workspaceControl}`;
+  return "";
+}
+
+function focusRunWorkspaceControl(key) {
   if (!key) return false;
-  const control = $$('[data-workspace-item]').find((item) => item.dataset.workspaceItem === key);
+  const [kind, value] = key.split(/:(.*)/s);
+  const controls = kind === "item" ? $$('[data-workspace-item]') : $$('[data-workspace-control]');
+  const control = controls.find((item) => (kind === "item" ? item.dataset.workspaceItem : item.dataset.workspaceControl) === value);
   if (!control) return false;
   try {
     control.focus({ preventScroll: true });
@@ -987,23 +1102,35 @@ function focusRunWorkspaceItem(key = runWorkspaceItemKey()) {
   return true;
 }
 
+function focusRunWorkspaceItem(key = runWorkspaceItemKey()) {
+  return focusRunWorkspaceControl(key ? `item:${key}` : "");
+}
+
+function toggleExecutionChanges(executionID) {
+  state.runWorkspace.expandedChangeExecutionID = exactID(state.runWorkspace.expandedChangeExecutionID, executionID) ? "" : String(executionID);
+  renderRunWorkspace(selectedRunEntry());
+  focusRunWorkspaceControl(`control:change-expansion:${executionID}`);
+}
+
 function renderRuns() {
-  const focusedItemKey = document.activeElement?.dataset?.workspaceItem || "";
+  const focusedControlKey = runWorkspaceFocusKey();
   const selectedItemKey = runWorkspaceItemKey();
   const entries = runWorkspaceEntries();
   const selected = selectedRunEntry(entries);
   if (selected && runEntryKey(selected) !== runEntryKey(state.runWorkspace.selection)) {
     state.runWorkspace.selection = { kind: selected.kind, id: selected.id };
     state.runWorkspace.item = { kind: selected.executionId ? "execution" : "workflow", id: selected.executionId || selected.workflowRunId };
+    state.runWorkspace.expandedChangeExecutionID = "";
     if (state.runWorkspace.projection.id !== selected.executionId) resetRunWorkspaceProjection();
   } else if (!selected) {
     state.runWorkspace.selection = null;
     state.runWorkspace.item = null;
+    state.runWorkspace.expandedChangeExecutionID = "";
     resetRunWorkspaceProjection();
   }
   renderRunSelector(entries, selected);
   renderRunWorkspace(selected);
-  if (focusedItemKey && !focusRunWorkspaceItem(focusedItemKey) && focusedItemKey === selectedItemKey) {
+  if (focusedControlKey && !focusRunWorkspaceControl(focusedControlKey) && focusedControlKey === `item:${selectedItemKey}`) {
     focusRunWorkspaceItem();
   }
 }

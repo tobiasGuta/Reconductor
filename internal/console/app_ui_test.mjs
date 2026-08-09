@@ -251,7 +251,7 @@ function installDocument() {
   };
   app.state.drawer = { returnFocus: null, returnTarget: null };
   app.state.executionDetail = { id: "", status: "idle", data: null, error: "", controller: null };
-  app.state.runWorkspace = { selection: null, item: null, projection: { id: "", status: "idle", data: null, error: "" } };
+  app.state.runWorkspace = { selection: null, item: null, expandedChangeExecutionID: "", projection: { id: "", status: "idle", data: null, error: "" } };
   return document;
 }
 
@@ -403,6 +403,23 @@ function workspaceProjection(executionID, workflowRunID, name = "Workspace basel
   return value;
 }
 
+function projectedChange(index, overrides = {}) {
+  return {
+    id: `change-${index}`,
+    program_id: "program-1",
+    workflow_run_id: "run-changes",
+    scheduled_execution_id: "execution-changes",
+    kind: index % 2 ? "modified" : "added",
+    entity_type: index % 3 ? "endpoint" : "asset",
+    priority: ["high", "medium", "low"][index % 3],
+    source_capabilities: index % 2 ? ["http.probe"] : ["dns.collect", "http.probe"],
+    evidence_artifact_ids: [`evidence-${index}`],
+    observed_at: `2026-08-08T14:${String(index).padStart(2, "0")}:00Z`,
+    created_at: `2026-08-08T15:${String(index).padStart(2, "0")}:00Z`,
+    ...overrides,
+  };
+}
+
 function installProjectedWorkspace(detail) {
   const document = installDocument();
   const run = workflowRun(detail.workflow.id, detail.workflow.status, detail.task.objective);
@@ -420,6 +437,10 @@ function installProjectedWorkspace(detail) {
 function workspaceItem(document, kind, id) {
   const key = `${kind}:${id}`;
   return document.querySelectorAll("[data-workspace-item]").find((item) => item.dataset.workspaceItem === key);
+}
+
+function workspaceControl(document, key) {
+  return document.querySelectorAll("[data-workspace-control]").find((item) => item.dataset.workspaceControl === key);
 }
 
 function findButtons(root, label) {
@@ -802,6 +823,214 @@ test("bounded collection and artifact copy distinguishes exact from loaded subse
   assert.match(exactText, /Artifacts: 3 artifacts/);
   assert.match(exactText, /Artifacts: 1 artifact/);
   assert.doesNotMatch(exactText, /Artifacts: \d+ loaded/);
+});
+
+test("complete projected changes show exact counts, stable groups, projection order, and a truthful empty state", () => {
+  let detail = workspaceProjection("execution-changes", "run-changes");
+  detail.change_items = { items: Array.from({ length: 18 }, (_, index) => projectedChange(index)), total: 18, truncated: false };
+  let document = installProjectedWorkspace(detail);
+  let lane = document.querySelector("#run-lane");
+  let rows = document.querySelectorAll("[data-workspace-item]").filter((item) => item.dataset.workspaceItem.startsWith("change:"));
+
+  assert.match(lane.textContent, /18Exact total18LoadedNoTruncated/);
+  assert.match(lane.textContent, /18 of 18 changes loaded\. The execution collection is complete\./);
+  assert.match(lane.textContent, /Execution changes by kind/);
+  assert.match(lane.textContent, /Execution changes by entity type/);
+  assert.match(lane.textContent, /Execution changes by priority/);
+  assert.doesNotMatch(lane.textContent, /Loaded changes by/);
+  assert.equal(rows.length, 16);
+  assert.deepEqual(rows.map((item) => item.dataset.workspaceItem), Array.from({ length: 16 }, (_, index) => `change:change-${index}`));
+  assert.ok(findButtons(lane, "Show all 18 loaded changes")[0]);
+
+  detail = workspaceProjection("execution-empty-changes", "run-empty-changes");
+  detail.change_items = { items: [], total: 0, truncated: false };
+  document = installProjectedWorkspace(detail);
+  lane = document.querySelector("#run-lane");
+  assert.match(lane.textContent, /0Exact total0LoadedNoTruncated/);
+  assert.match(lane.textContent, /No change items are linked to this execution/);
+  assert.doesNotMatch(lane.textContent, /unavailable/i);
+});
+
+test("truncated change presentation qualifies loaded groups and expands locally with stable focus", async () => {
+  const detail = workspaceProjection("execution-changes", "run-changes");
+  detail.change_items = { items: Array.from({ length: 20 }, (_, index) => projectedChange(index)), total: 57, truncated: true };
+  const document = installProjectedWorkspace(detail);
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+  let lane = document.querySelector("#run-lane");
+
+  assert.match(lane.textContent, /57Exact total20LoadedYesTruncated/);
+  assert.match(lane.textContent, /20 of 57 changes loaded\. Grouped counts cover the loaded subset only\./);
+  assert.match(lane.textContent, /Loaded changes by kind/);
+  assert.match(lane.textContent, /Loaded changes by entity type/);
+  assert.match(lane.textContent, /Loaded changes by priority/);
+  assert.equal(document.querySelectorAll("[data-workspace-item]").filter((item) => item.dataset.workspaceItem.startsWith("change:")).length, 16);
+
+  const original = workspaceControl(document, "change-expansion:execution-changes");
+  await original.click();
+  let current = workspaceControl(document, "change-expansion:execution-changes");
+  assert.equal(calls, 0);
+  assert.notEqual(current, original);
+  assert.equal(current.textContent, "Show first 16 changes");
+  assert.equal(current.getAttribute("aria-expanded"), "true");
+  assert.equal(document.activeElement, current);
+  assert.deepEqual(current.focusOptions, { preventScroll: true });
+  assert.equal(document.querySelectorAll("[data-workspace-item]").filter((item) => item.dataset.workspaceItem.startsWith("change:")).length, 20);
+
+  const focusedBeforePoll = current;
+  app.renderRuns();
+  current = workspaceControl(document, "change-expansion:execution-changes");
+  assert.notEqual(current, focusedBeforePoll);
+  assert.equal(document.activeElement, current);
+  assert.deepEqual(current.focusOptions, { preventScroll: true });
+  assert.equal(calls, 0);
+
+  await current.click();
+  lane = document.querySelector("#run-lane");
+  assert.equal(findButtons(lane, "Show all 20 loaded changes").length, 1);
+  assert.equal(calls, 0);
+
+  await findButtons(lane, "Show all 20 loaded changes")[0].click();
+  const second = workspaceProjection("execution-second", "run-second");
+  second.change_items = { items: Array.from({ length: 18 }, (_, index) => projectedChange(index, {
+    id: `second-change-${index}`,
+    workflow_run_id: "run-second",
+    scheduled_execution_id: "execution-second",
+  })), total: 18, truncated: false };
+  app.state.data.runs.push(workflowRun("run-second"));
+  const secondExecution = execution("execution-second");
+  secondExecution.workflow_run_id = "run-second";
+  app.state.data.scheduled_executions.push(secondExecution);
+  globalThis.fetch = async () => { calls += 1; return response(200, second); };
+  const secondEntry = app.buildRunSelectorEntries(app.state.data.runs, app.state.data.scheduled_executions)
+    .find((entry) => entry.executionId === "execution-second");
+
+  await app.selectRunWorkspaceEntry(secondEntry);
+
+  assert.equal(calls, 1, "switching executions performs only its required projection fetch");
+  assert.equal(app.state.runWorkspace.expandedChangeExecutionID, "");
+  assert.equal(findButtons(document.querySelector("#run-lane"), "Show all 18 loaded changes").length, 1);
+  assert.equal(workspaceItem(document, "change", "second-change-16"), undefined);
+});
+
+test("change selection is local, projection-scoped, and exposes only recorded change metadata", async () => {
+  const malicious = `<img src=x onerror="globalThis.compromised=true">`;
+  const detail = workspaceProjection("execution-changes", "run-changes");
+  detail.change_items = { items: [projectedChange(0, {
+    id: "change-selected",
+    kind: malicious,
+    entity_type: "endpoint",
+    priority: "high",
+    title: "Inbox title must not be used",
+    safe_summary: "Inbox summary must not be used",
+    disposition: "approved",
+    review_note: "Review control must not be used",
+    evidence_artifact_ids: ["evidence-one", "evidence-two"],
+  })], total: 1, truncated: false };
+  const document = installProjectedWorkspace(detail);
+  app.state.data.change_items = [{ id: "snapshot-only-change", kind: "snapshot sentinel" }];
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+  const original = workspaceItem(document, "change", "change-selected");
+
+  await original.click();
+
+  const current = workspaceItem(document, "change", "change-selected");
+  const inspector = document.querySelector("#run-inspector");
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "change", id: "change-selected" });
+  assert.equal(calls, 0);
+  assert.notEqual(current, original);
+  assert.equal(document.activeElement, current);
+  assert.deepEqual(current.focusOptions, { preventScroll: true });
+  assert.equal(current.getAttribute("aria-pressed"), "true");
+  assert.match(inspector.textContent, /Recorded execution change metadata/);
+  assert.match(inspector.textContent, /Kind<img src=x/);
+  assert.match(inspector.textContent, /Entity typeendpoint/);
+  assert.match(inspector.textContent, /Priorityhigh/);
+  assert.match(inspector.textContent, /Source capabilitiesdns\.collect, http\.probe/);
+  assert.match(inspector.textContent, /Observed/);
+  assert.match(inspector.textContent, /Created/);
+  assert.match(inspector.textContent, /Change IDchange-selected/);
+  assert.match(inspector.textContent, /Program IDprogram-1/);
+  assert.match(inspector.textContent, /Workflow run IDrun-changes/);
+  assert.match(inspector.textContent, /Scheduled execution IDexecution-changes/);
+  assert.match(inspector.textContent, /Evidence artifact IDsevidence-one, evidence-two/);
+  assert.equal(inspector.querySelectorAll(".compact-disclosure").length, 1);
+  assert.doesNotMatch(inspector.textContent, /Inbox title|Inbox summary|Review control|disposition|review/i);
+  assert.doesNotMatch(document.querySelector("#run-lane").textContent, /snapshot sentinel|snapshot-only-change/);
+  assert.equal(document.createdElements.some((item) => item.tagName === "IMG"), false);
+
+  const [fullDetail] = findButtons(document.querySelector("#run-workspace-actions"), "Full detail");
+  await fullDetail.click();
+  assert.equal(calls, 0);
+  assert.match(document.querySelector("#drawer-content").textContent, /change-selected/);
+});
+
+test("selected change and independently focused change survive polling rerender by exact logical ID", async () => {
+  const detail = workspaceProjection("execution-change-focus", "run-change-focus");
+  detail.change_items = { items: [
+    projectedChange(0, { id: "change-selected-focus", workflow_run_id: "run-change-focus", scheduled_execution_id: "execution-change-focus" }),
+    projectedChange(1, { id: "change-unselected-focus", workflow_run_id: "run-change-focus", scheduled_execution_id: "execution-change-focus" }),
+  ], total: 2, truncated: false };
+  const document = installProjectedWorkspace(detail);
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+  await workspaceItem(document, "change", "change-selected-focus").click();
+  const selectedBefore = workspaceItem(document, "change", "change-selected-focus");
+  const focusedBefore = workspaceItem(document, "change", "change-unselected-focus");
+  focusedBefore.focus();
+
+  app.renderRuns();
+
+  const selectedAfter = workspaceItem(document, "change", "change-selected-focus");
+  const focusedAfter = workspaceItem(document, "change", "change-unselected-focus");
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "change", id: "change-selected-focus" });
+  assert.equal(selectedAfter.getAttribute("aria-pressed"), "true");
+  assert.notEqual(selectedAfter, selectedBefore);
+  assert.notEqual(focusedAfter, focusedBefore);
+  assert.equal(document.activeElement, focusedAfter);
+  assert.notEqual(document.activeElement, selectedAfter);
+  assert.deepEqual(focusedAfter.focusOptions, { preventScroll: true });
+  assert.equal(calls, 0);
+});
+
+test("direct execution changes render without workflow lineage and disappear selection falls back", async () => {
+  const detail = workspaceProjection("execution-direct", "run-direct");
+  detail.execution.workflow_run_id = "";
+  detail.workflow = null;
+  detail.steps = [];
+  detail.change_items = { items: [projectedChange(1, { id: "change-direct", workflow_run_id: "", scheduled_execution_id: "execution-direct" })], total: 1, truncated: false };
+  const document = installDocument();
+  const scheduled = execution("execution-direct", "completed");
+  scheduled.workflow_run_id = "";
+  app.state.data.scheduled_executions = [scheduled];
+  app.state.runWorkspace.selection = { kind: "execution", id: "execution-direct" };
+  app.state.runWorkspace.item = { kind: "execution", id: "execution-direct" };
+  app.state.runWorkspace.projection = { id: "execution-direct", status: "ready", data: detail, error: "" };
+  app.renderRuns();
+
+  assert.match(document.querySelector("#run-lane").textContent, /Associated workflow lineage is unavailable/);
+  assert.ok(workspaceItem(document, "change", "change-direct"));
+  await workspaceItem(document, "change", "change-direct").click();
+  detail.change_items = { items: [], total: 0, truncated: false };
+  app.renderRuns();
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "execution", id: "execution-direct" });
+  assert.equal(document.activeElement, workspaceItem(document, "execution", "execution-direct"));
+});
+
+test("missing projection never turns snapshot changes into execution changes or a false zero", () => {
+  const document = installDocument();
+  app.state.data.scheduled_executions = [execution("execution-unavailable")];
+  app.state.data.change_items = [{ id: "snapshot-change", kind: "snapshot sentinel" }];
+  app.state.runWorkspace.selection = { kind: "execution", id: "execution-unavailable" };
+  app.state.runWorkspace.item = { kind: "execution", id: "execution-unavailable" };
+  app.state.runWorkspace.projection = { id: "execution-unavailable", status: "error", data: null, error: "temporarily unavailable" };
+  app.renderRuns();
+
+  const laneText = document.querySelector("#run-lane").textContent;
+  assert.match(laneText, /Change collection unavailable without a coherent execution projection/);
+  assert.doesNotMatch(laneText, /No change items|Exact total0|snapshot sentinel|snapshot-change/);
+  assert.equal(document.querySelectorAll("[data-workspace-item]").some((item) => item.dataset.workspaceItem.startsWith("change:")), false);
 });
 
 test("ready empty artifact collection preserves truthful zero counts", () => {
