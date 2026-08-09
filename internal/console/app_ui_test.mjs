@@ -115,7 +115,8 @@ class FakeElement {
     await Promise.all((this.listeners.get("click") || []).map((listener) => listener(event)));
   }
 
-  focus() {
+  focus(options) {
+    this.focusOptions = options;
     this.ownerDocument.activeElement = this;
   }
 
@@ -342,17 +343,82 @@ function workspaceProjection(executionID, workflowRunID, name = "Workspace basel
     trigger_source: "scheduled",
     started_at: "2026-08-08T14:00:05Z",
   };
-  value.steps = [{
-    id: `step-${workflowRunID}`,
-    workflow_run_id: workflowRunID,
-    step_definition_id: "probe",
-    capability: "http.probe",
-    status: "running",
-    attempt_count: 1,
-    approval_state: "not_required",
-    started_at: "2026-08-08T14:01:00Z",
-  }];
+  const firstStepID = `step-${workflowRunID}`;
+  const secondStepID = `step-second-${workflowRunID}`;
+  const firstToolID = `tool-first-${workflowRunID}`;
+  const secondToolID = `tool-second-${workflowRunID}`;
+  const otherToolID = `tool-other-${workflowRunID}`;
+  value.steps = [
+    {
+      id: firstStepID,
+      workflow_run_id: workflowRunID,
+      step_definition_id: "probe",
+      capability: "http.probe",
+      status: "running",
+      attempt_count: 1,
+      approval_state: "pending",
+      started_at: "2026-08-08T14:01:00Z",
+    },
+    {
+      id: secondStepID,
+      workflow_run_id: workflowRunID,
+      step_definition_id: "collect",
+      capability: "dns.collect",
+      status: "succeeded",
+      attempt_count: 1,
+      approval_state: "not_required",
+      started_at: "2026-08-08T14:02:00Z",
+      completed_at: "2026-08-08T14:03:00Z",
+    },
+  ];
+  value.tool_runs = {
+    items: [
+      { id: firstToolID, step_run_id: firstStepID, step_definition_id: "probe", capability: "http.probe", provider: "httpx", tool_version: "1.6.1", started_at: "2026-08-08T14:01:00Z", completed_at: "2026-08-08T14:01:30Z", exit_code: 0, timed_out: false, stdout_artifact_id: `artifact-first-${workflowRunID}` },
+      { id: secondToolID, step_run_id: firstStepID, step_definition_id: "probe", capability: "http.probe", provider: "httpx", tool_version: "1.6.1", started_at: "2026-08-08T14:01:31Z", timed_out: false, stderr_artifact_id: `artifact-stderr-${workflowRunID}` },
+      { id: otherToolID, step_run_id: secondStepID, step_definition_id: "collect", capability: "dns.collect", provider: "dnsx", tool_version: "1.2.2", started_at: "2026-08-08T14:02:00Z", completed_at: "2026-08-08T14:03:00Z", exit_code: 2, timed_out: true },
+      { id: `tool-unassociated-${workflowRunID}`, step_run_id: `missing-step-${workflowRunID}`, step_definition_id: "probe", capability: "http.probe", provider: "fuzzy-provider-must-not-nest", tool_version: "9", started_at: "2026-08-08T14:04:00Z", timed_out: false },
+    ],
+    total: 6,
+    truncated: true,
+  };
+  value.approvals = {
+    items: [
+      { id: `approval-${workflowRunID}`, step_run_id: firstStepID, task_id: `task-${workflowRunID}`, requested_risk_level: "moderate", reason: "Operator confirmation", requested_at: "2026-08-08T14:00:30Z", decision: "approved", decided_by: "operator-one", decided_at: "2026-08-08T14:00:45Z", expires_at: "2026-08-09T14:00:30Z" },
+      { id: `approval-unassociated-${workflowRunID}`, step_run_id: `missing-step-${workflowRunID}`, task_id: `task-${workflowRunID}`, requested_risk_level: "moderate", reason: "Fuzzy approval must not nest", requested_at: "2026-08-08T14:04:00Z", decision: "pending" },
+    ],
+    total: 3,
+    truncated: true,
+  };
+  value.artifacts = {
+    items: [
+      { id: `artifact-first-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: workflowRunID, step_run_id: firstStepID, tool_run_id: firstToolID, type: "stdout", content_type: "text/plain", size: 20 },
+      { id: `artifact-stderr-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: workflowRunID, step_run_id: firstStepID, tool_run_id: secondToolID, type: "stderr", content_type: "text/plain", size: 10 },
+      { id: `artifact-other-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: workflowRunID, step_run_id: secondStepID, tool_run_id: otherToolID, type: "result", content_type: "application/json", size: 30 },
+      { id: `artifact-inconsistent-${workflowRunID}`, task_id: `task-${workflowRunID}`, workflow_run_id: "different-workflow", step_run_id: firstStepID, tool_run_id: firstToolID, type: "result", content_type: "application/json", size: 40 },
+    ],
+    total: 7,
+    truncated: true,
+  };
   return value;
+}
+
+function installProjectedWorkspace(detail) {
+  const document = installDocument();
+  const run = workflowRun(detail.workflow.id, detail.workflow.status, detail.task.objective);
+  const scheduled = execution(detail.execution.id, detail.scheduler.status);
+  scheduled.workflow_run_id = detail.workflow.id;
+  app.state.data.runs = [run];
+  app.state.data.scheduled_executions = [scheduled];
+  app.state.runWorkspace.selection = { kind: "execution", id: detail.execution.id };
+  app.state.runWorkspace.item = { kind: "execution", id: detail.execution.id };
+  app.state.runWorkspace.projection = { id: detail.execution.id, status: "ready", data: detail, error: "" };
+  app.renderRuns();
+  return document;
+}
+
+function workspaceItem(document, kind, id) {
+  const key = `${kind}:${id}`;
+  return document.querySelectorAll("[data-workspace-item]").find((item) => item.dataset.workspaceItem === key);
 }
 
 function findButtons(root, label) {
@@ -571,6 +637,190 @@ test("scheduled workspace selection fetches once while rerender and local select
   assert.deepEqual(app.state.runWorkspace.item, { kind: "step", id: "step-run-1" });
 });
 
+test("relationship partitioning uses exact workflow, step, tool, approval, and artifact ids", () => {
+  installDocument();
+  const detail = workspaceProjection("execution-1", "run-1");
+  const [entry] = app.buildRunSelectorEntries([workflowRun("run-1")], [execution("execution-1")]);
+  const relationships = app.partitionRunRelationships(entry, detail);
+
+  assert.equal(relationships.workflow.id, "run-1");
+  assert.equal(relationships.steps.length, 2);
+  assert.deepEqual(relationships.steps[0].toolRuns.map((item) => item.tool.id), ["tool-first-run-1", "tool-second-run-1"]);
+  assert.deepEqual(relationships.steps[1].toolRuns.map((item) => item.tool.id), ["tool-other-run-1"]);
+  assert.deepEqual(relationships.steps[0].approvals.map((item) => item.id), ["approval-run-1"]);
+  assert.equal(relationships.steps[1].approvals.length, 0);
+  assert.deepEqual(relationships.unassociatedToolRuns.map((item) => item.id), ["tool-unassociated-run-1"]);
+  assert.deepEqual(relationships.unassociatedApprovals.map((item) => item.id), ["approval-unassociated-run-1"]);
+  assert.deepEqual(relationships.steps[0].toolRuns[0].artifacts.map((item) => item.id), ["artifact-first-run-1"]);
+  assert.equal(relationships.workflowArtifacts.some((item) => item.id === "artifact-inconsistent-run-1"), false);
+});
+
+test("missing exact workflow or step lineage creates no fabricated child association", () => {
+  installDocument();
+  const detail = workspaceProjection("execution-1", "run-1");
+  detail.execution.workflow_run_id = "missing-workflow";
+  const [entry] = app.buildRunSelectorEntries([workflowRun("run-1")], [execution("execution-1")]);
+  const relationships = app.partitionRunRelationships(entry, detail);
+
+  assert.equal(relationships.workflow, null);
+  assert.equal(relationships.steps.length, 0);
+  assert.equal(relationships.unassociatedToolRuns.length, detail.tool_runs.items.length);
+  assert.equal(relationships.unassociatedApprovals.length, detail.approvals.items.length);
+});
+
+test("bounded collection and artifact copy distinguishes exact from loaded subsets", () => {
+  const document = installProjectedWorkspace(workspaceProjection("execution-1", "run-1"));
+  const laneText = document.querySelector("#run-lane").textContent;
+
+  assert.match(laneText, /Tool runs: 4 shown of 6/);
+  assert.match(laneText, /Approvals: 2 shown of 3/);
+  assert.match(laneText, /Artifacts: 3 loaded/);
+  assert.match(laneText, /Artifacts: 1 loaded/);
+  assert.equal(app.artifactCountText(2, false), "2 artifacts");
+  assert.equal(app.artifactCountText(0, false), "0 artifacts");
+  assert.equal(app.artifactCountText(2, true), "2 loaded");
+  assert.equal(app.artifactCountText(0, true), "none in loaded subset");
+  assert.doesNotMatch(laneText, /0 artifacts/);
+
+  const exactDetail = workspaceProjection("execution-exact", "run-exact");
+  exactDetail.artifacts.truncated = false;
+  exactDetail.artifacts.total = exactDetail.artifacts.items.length;
+  const exactDocument = installProjectedWorkspace(exactDetail);
+  const exactText = exactDocument.querySelector("#run-lane").textContent;
+  assert.match(exactText, /Artifacts: 3 artifacts/);
+  assert.match(exactText, /Artifacts: 1 artifact/);
+  assert.doesNotMatch(exactText, /Artifacts: \d+ loaded/);
+});
+
+test("ready empty artifact collection preserves truthful zero counts", () => {
+  const detail = workspaceProjection("execution-empty", "run-empty");
+  detail.artifacts = { items: [], total: 0, truncated: false };
+  const document = installProjectedWorkspace(detail);
+
+  assert.match(workspaceItem(document, "workflow", "run-empty").textContent, /Artifacts: 0 artifacts/);
+  assert.match(workspaceItem(document, "step", "step-run-empty").textContent, /Artifacts: 0 artifacts/);
+  assert.match(workspaceItem(document, "tool", "tool-first-run-empty").textContent, /Artifacts: 0 artifacts/);
+});
+
+test("unassociated loaded records are reported without becoming child nodes", () => {
+  const document = installProjectedWorkspace(workspaceProjection("execution-1", "run-1"));
+  const lane = document.querySelector("#run-lane");
+
+  assert.match(lane.textContent, /1 loaded tool run could not be associated with an available step/);
+  assert.match(lane.textContent, /1 loaded approval could not be associated with an available step/);
+  assert.equal(workspaceItem(document, "tool", "tool-unassociated-run-1"), undefined);
+  assert.equal(workspaceItem(document, "approval", "approval-unassociated-run-1"), undefined);
+  assert.doesNotMatch(lane.textContent, /fuzzy-provider-must-not-nest|Fuzzy approval must not nest/);
+});
+
+test("tool selection is local, restores focus, and renders only recorded tool facts", async () => {
+  const document = installProjectedWorkspace(workspaceProjection("execution-1", "run-1"));
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+  const original = workspaceItem(document, "tool", "tool-first-run-1");
+
+  await original.click();
+
+  const current = workspaceItem(document, "tool", "tool-first-run-1");
+  const inspector = document.querySelector("#run-inspector");
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "tool", id: "tool-first-run-1" });
+  assert.equal(calls, 0);
+  assert.notEqual(current, original);
+  assert.equal(document.activeElement, current);
+  assert.deepEqual(current.focusOptions, { preventScroll: true });
+  assert.notEqual(document.activeElement, inspector);
+  assert.equal(current.getAttribute("aria-pressed"), "true");
+  assert.match(inspector.textContent, /httpx 1\.6\.1/);
+  assert.match(inspector.textContent, /http\.probe/);
+  assert.match(inspector.textContent, /Started/);
+  assert.match(inspector.textContent, /Completed/);
+  assert.match(inspector.textContent, /Exit code0/);
+  assert.match(inspector.textContent, /Timed outNo/);
+  assert.match(inspector.textContent, /Stdout referencePresent/);
+  assert.match(inspector.textContent, /Loaded artifact references1 loaded/);
+  assert.doesNotMatch(inspector.textContent, /succeeded|failed|running/i);
+  assert.match(document.querySelector("#run-lane").textContent, /Not completed at observation/);
+  assert.match(document.querySelector("#run-lane").textContent, /Timed out.*Exit 2/);
+});
+
+test("approval selection is local and preserves decision separately from step approval state", async () => {
+  const document = installProjectedWorkspace(workspaceProjection("execution-1", "run-1"));
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+  const original = workspaceItem(document, "approval", "approval-run-1");
+
+  await original.click();
+
+  const current = workspaceItem(document, "approval", "approval-run-1");
+  const inspector = document.querySelector("#run-inspector");
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "approval", id: "approval-run-1" });
+  assert.equal(calls, 0);
+  assert.equal(document.activeElement, current);
+  assert.notEqual(current, original);
+  assert.notEqual(document.activeElement, inspector);
+  assert.equal(current.getAttribute("aria-pressed"), "true");
+  assert.match(inspector.textContent, /Decisionapproved/);
+  assert.match(inspector.textContent, /Requested risk levelmoderate/);
+  assert.match(inspector.textContent, /Operator confirmation/);
+  assert.match(inspector.textContent, /Actoroperator-one/);
+  assert.match(inspector.textContent, /Requested/);
+  assert.match(inspector.textContent, /Decided/);
+  assert.match(inspector.textContent, /Expiry/);
+  assert.match(inspector.textContent, /Approval IDapproval-run-1/);
+  assert.match(inspector.textContent, /Step run IDstep-run-1/);
+  assert.match(inspector.textContent, /Task IDtask-run-1/);
+  assert.doesNotMatch(inspector.textContent, /Approval statepending/);
+});
+
+test("child selection survives rerender while exact id exists and falls back when it disappears", async () => {
+  const detail = workspaceProjection("execution-1", "run-1");
+  const document = installProjectedWorkspace(detail);
+  await workspaceItem(document, "tool", "tool-other-run-1").click();
+
+  app.state.data.runs = [workflowRun("run-1", "running", "Polling refresh")];
+  app.renderRuns();
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "tool", id: "tool-other-run-1" });
+  assert.equal(workspaceItem(document, "tool", "tool-other-run-1").getAttribute("aria-pressed"), "true");
+
+  detail.tool_runs.items = detail.tool_runs.items.filter((item) => item.id !== "tool-other-run-1");
+  app.renderRuns();
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "execution", id: "execution-1" });
+  assert.match(document.querySelector("#run-inspector").textContent, /Execution IDexecution-1/);
+});
+
+test("loading clears projected children and workflow-only invalid children fall back to workflow", async () => {
+  const detail = workspaceProjection("execution-1", "run-1");
+  const document = installProjectedWorkspace(detail);
+  await workspaceItem(document, "approval", "approval-run-1").click();
+  app.state.runWorkspace.projection = { id: "execution-1", status: "loading", data: null, error: "" };
+  app.renderRuns();
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "execution", id: "execution-1" });
+  assert.match(document.querySelector("#run-lane").textContent, /Loading the coherent execution observation/);
+  assert.equal(workspaceItem(document, "approval", "approval-run-1"), undefined);
+
+  installDocument();
+  app.state.data.runs = [workflowRun("run-only")];
+  app.state.runWorkspace.selection = { kind: "workflow", id: "run-only" };
+  app.state.runWorkspace.item = { kind: "tool", id: "missing-tool" };
+  app.renderRuns();
+  assert.deepEqual(app.state.runWorkspace.item, { kind: "workflow", id: "run-only" });
+});
+
+test("tool provider version and approval reason remain text-only", async () => {
+  const malicious = `<img src=x onerror="globalThis.compromised=true">`;
+  const detail = workspaceProjection("execution-1", "run-1");
+  detail.tool_runs.items[0].provider = malicious;
+  detail.tool_runs.items[0].tool_version = malicious;
+  detail.approvals.items[0].reason = malicious;
+  const document = installProjectedWorkspace(detail);
+
+  await workspaceItem(document, "tool", "tool-first-run-1").click();
+  assert.match(document.querySelector("#run-inspector").textContent, /<img src=x/);
+  await workspaceItem(document, "approval", "approval-run-1").click();
+  assert.match(document.querySelector("#run-inspector").textContent, /<img src=x/);
+  assert.equal(document.createdElements.some((item) => item.tagName === "IMG"), false);
+});
+
 test("late workspace execution A cannot overwrite selected execution B", async () => {
   const document = installDocument();
   const runA = workflowRun("run-A");
@@ -607,6 +857,7 @@ test("unscheduled workflow run renders limited detail without projection fetch",
   globalThis.fetch = async () => { calls += 1; return response(500, {}); };
   const run = workflowRun("run-only");
   app.state.data.runs = [run];
+  app.state.data.steps = [{ id: "step-run-only", workflow_run_id: "run-only", step_definition_id: "snapshot", capability: "snapshot", status: "running", attempt_count: 1 }];
   app.renderRuns();
   const [entry] = app.buildRunSelectorEntries([run], []);
 
@@ -615,6 +866,30 @@ test("unscheduled workflow run renders limited detail without projection fetch",
   assert.equal(calls, 0);
   assert.match(document.querySelector("#run-workspace-meta").textContent, /limited dashboard snapshot detail/i);
   assert.match(document.querySelector("#run-inspector").textContent, /Limited run detail/);
+  assert.ok(workspaceItem(document, "workflow", "run-only"));
+  assert.ok(workspaceItem(document, "step", "step-run-only"));
+  assert.doesNotMatch(document.querySelector("#run-lane").textContent, /Artifacts:/);
+});
+
+test("projection error keeps snapshot lineage without claiming zero artifacts", async () => {
+  const document = installDocument();
+  const run = workflowRun("run-1");
+  const scheduled = execution("execution-1");
+  app.state.data.runs = [run];
+  app.state.data.scheduled_executions = [scheduled];
+  app.state.data.steps = [{ id: "step-run-1", workflow_run_id: "run-1", step_definition_id: "snapshot", capability: "snapshot", status: "running", attempt_count: 1 }];
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return response(500, {}); };
+  const [entry] = app.buildRunSelectorEntries(app.state.data.runs, app.state.data.scheduled_executions);
+
+  await app.selectRunWorkspaceEntry(entry);
+
+  assert.equal(calls, 1);
+  assert.equal(app.state.runWorkspace.projection.status, "error");
+  assert.match(document.querySelector("#run-workspace-meta").textContent, /temporarily unavailable/i);
+  assert.ok(workspaceItem(document, "workflow", "run-1"));
+  assert.ok(workspaceItem(document, "step", "step-run-1"));
+  assert.doesNotMatch(document.querySelector("#run-lane").textContent, /Artifacts:/);
 });
 
 test("Schedules Open workspace selects and focuses the exact execution", async () => {

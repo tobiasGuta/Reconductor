@@ -195,10 +195,19 @@ input[type="search"] { width: 230px; padding: 0 12px; }
 .lane-node:hover { border-color: var(--muted); background: var(--surface-raised); }
 .lane-node[aria-pressed="true"] { border-color: var(--green); box-shadow: 0 0 0 2px rgba(101,215,163,.12); }
 .lane-node strong, .lane-node small { display: block; }
-.lane-node strong { font-size: 11px; }
+.lane-node > span { min-width: 0; }
+.lane-node strong { overflow-wrap: anywhere; font-size: 11px; }
 .lane-node small { margin-top: 4px; color: var(--quiet); font-size: 9px; }
 .lane-steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 9px; }
-.lane-steps .lane-node { min-height: 82px; align-items: flex-start; }
+.lane-step-branch { min-width: 0; display: grid; align-content: start; gap: 8px; }
+.lane-step-branch > .lane-node { min-height: 82px; align-items: flex-start; }
+.lane-children { margin-left: 12px; padding-left: 11px; display: grid; gap: 7px; border-left: 1px solid var(--line-strong); }
+.lane-child-node { min-height: 68px; padding: 10px 11px; align-items: flex-start; flex-wrap: wrap; }
+.lane-child-facts { margin-left: auto; text-align: right; }
+.lane-child-facts small { overflow-wrap: anywhere; }
+.lane-collection-notice, .lane-unavailable, .lane-unassociated { padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; background: rgba(16,27,24,.72); color: var(--muted); font-size: 9px; line-height: 1.5; }
+.lane-unassociated { border-color: var(--line-strong); }
+.lane-unassociated p { margin: 5px 0 0; overflow-wrap: anywhere; }
 .run-inspector { min-height: 180px; padding: 17px; }
 .inspector-heading { margin-bottom: 13px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .inspector-heading h4 { margin: 0 0 4px; font-size: 13px; }
@@ -346,6 +355,14 @@ input[type="search"] { width: 230px; padding: 0 12px; }
   .run-lane { min-width: 520px; }
   .run-inspector-panel { border-top: 1px solid var(--line); }
   .inspector-details { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 420px) {
+  .run-lane { min-width: 340px; padding: 17px; }
+  .lane-steps { grid-template-columns: 1fr; }
+  .lane-children { margin-left: 5px; padding-left: 8px; }
+  .lane-child-node { display: grid; grid-template-columns: 1fr; gap: 7px; }
+  .lane-child-facts { margin-left: 0; text-align: left; }
 }
 
 @media (prefers-reduced-motion: reduce) {
