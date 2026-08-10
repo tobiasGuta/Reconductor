@@ -10,6 +10,7 @@ const state = {
   drawer: {
     returnFocus: null,
     returnTarget: null,
+    scrollLock: { locked: false, x: 0, y: 0 },
   },
   executionDetail: {
     id: "",
@@ -121,7 +122,8 @@ function showView(name, { focusWorkspace = false } = {}) {
   $$(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === name));
   $$(".view").forEach((item) => item.classList.toggle("active", item.dataset.viewPanel === name));
   $(".sidebar").classList.remove("open");
-  window.scrollTo({ top: 0, behavior: "smooth" });
+  const reduceMotion = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  window.scrollTo({ top: 0, behavior: reduceMotion ? "auto" : "smooth" });
   if (name === "runs") return activateRunWorkspace({ focus: focusWorkspace });
 }
 
@@ -1346,9 +1348,41 @@ function openRunDrawer(run, opener = null) {
   $("#detail-drawer").setAttribute("aria-busy", "false");
 }
 
+function lockDrawerScroll() {
+  if (state.drawer.scrollLock?.locked) return;
+  const x = Number.isFinite(window.scrollX) ? window.scrollX : 0;
+  const y = Number.isFinite(window.scrollY) ? window.scrollY : 0;
+  state.drawer.scrollLock = { locked: true, x, y };
+  document.documentElement.classList.add("detail-drawer-open");
+  document.body.classList.add("detail-drawer-open");
+  void document.documentElement.offsetHeight;
+  window.scrollTo(x, y);
+}
+
+function preserveDrawerScrollPosition() {
+  const lock = state.drawer.scrollLock;
+  if (!lock?.locked || (window.scrollX === lock.x && window.scrollY === lock.y)) return;
+  window.scrollTo(lock.x, lock.y);
+}
+
+function preventDrawerBackgroundScroll(event) {
+  if (!state.drawer.scrollLock?.locked) return;
+  event.preventDefault();
+  preserveDrawerScrollPosition();
+}
+
+function unlockDrawerScroll() {
+  const lock = state.drawer.scrollLock;
+  document.documentElement.classList.remove("detail-drawer-open");
+  document.body.classList.remove("detail-drawer-open");
+  state.drawer.scrollLock = { locked: false, x: 0, y: 0 };
+  if (lock?.locked) window.scrollTo(lock.x, lock.y);
+}
+
 function openDrawer({ eyebrow, title, returnFocus = null, returnTarget = null }) {
   state.drawer.returnFocus = returnFocus;
   state.drawer.returnTarget = returnTarget;
+  lockDrawerScroll();
   $("#drawer-eyebrow").textContent = eyebrow;
   $("#drawer-title").textContent = title;
   $("#drawer-backdrop").classList.remove("hidden");
@@ -1374,6 +1408,7 @@ function cancelExecutionDetail() {
 function closeDrawer() {
   const returnTarget = state.drawer.returnTarget;
   const returnFocus = state.drawer.returnFocus;
+  unlockDrawerScroll();
   cancelExecutionDetail();
   $("#drawer-backdrop").classList.add("hidden");
   const drawer = $("#detail-drawer");
@@ -1385,8 +1420,8 @@ function closeDrawer() {
     ? $$(returnTarget.selector).find((item) => item.dataset[returnTarget.datasetKey] === returnTarget.id)
     : null;
   const target = currentReturnTarget || returnFocus;
-  state.drawer = { returnFocus: null, returnTarget: null };
-  if (target && typeof target.focus === "function") target.focus();
+  state.drawer = { returnFocus: null, returnTarget: null, scrollLock: { locked: false, x: 0, y: 0 } };
+  if (target && typeof target.focus === "function") target.focus({ preventScroll: true });
 }
 
 function renderAssets() {
@@ -1966,6 +2001,9 @@ function bindEvents() {
   $("#show-low-priority").addEventListener("change", renderChangeInbox);
   $("#drawer-close").addEventListener("click", closeDrawer);
   $("#drawer-backdrop").addEventListener("click", closeDrawer);
+  $("#drawer-backdrop").addEventListener("wheel", preventDrawerBackgroundScroll, { passive: false });
+  $("#drawer-backdrop").addEventListener("touchmove", preventDrawerBackgroundScroll, { passive: false });
+  window.addEventListener("scroll", preserveDrawerScrollPosition, { passive: true });
   $("#mobile-menu").addEventListener("click", () => $(".sidebar").classList.toggle("open"));
   $("#modal-cancel").addEventListener("click", closeModal);
   $("#action-modal").addEventListener("click", (event) => { if (event.target === $("#action-modal")) closeModal(); });
@@ -1997,16 +2035,18 @@ function bindEvents() {
       toast(error.message, true);
     }
   });
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      if (!$("#action-modal").classList.contains("hidden")) closeModal();
-      else if ($("#detail-drawer").classList.contains("open")) closeDrawer();
-      return;
-    }
-    const drawer = $("#detail-drawer");
-    if (event.key !== "Tab" || !drawer.classList.contains("open")) return;
-    containDrawerTab(event, drawerTabbableElements(drawer), document.activeElement, drawer);
-  });
+  document.addEventListener("keydown", handleDocumentKeydown);
+}
+
+function handleDocumentKeydown(event) {
+  if (event.key === "Escape") {
+    if (!$("#action-modal").classList.contains("hidden")) closeModal();
+    else if ($("#detail-drawer").classList.contains("open")) closeDrawer();
+    return;
+  }
+  const drawer = $("#detail-drawer");
+  if (event.key !== "Tab" || !drawer.classList.contains("open")) return;
+  containDrawerTab(event, drawerTabbableElements(drawer), document.activeElement, drawer);
 }
 
 if (typeof module !== "undefined" && module.exports) {
@@ -2014,6 +2054,7 @@ if (typeof module !== "undefined" && module.exports) {
     artifactCountText,
     buildRunSelectorEntries,
     containDrawerTab,
+    handleDocumentKeydown,
     partitionRunRelationships,
     state,
     closeDrawer,

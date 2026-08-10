@@ -152,6 +152,8 @@ class FakeDocument {
     this.activeElement = null;
     this.listeners = new Map();
     this.createdElements = [];
+    this.documentElement = new FakeElement("html", this);
+    this.body = new FakeElement("body", this);
   }
 
   createElement(tagName) {
@@ -204,7 +206,20 @@ globalThis.localStorage = {
   getItem() { return ""; },
   setItem() {},
 };
-globalThis.window = { scrollTo() {} };
+globalThis.window = {
+  scrollX: 0,
+  scrollY: 0,
+  scrollTo(x, y) {
+    if (typeof x === "object") {
+      this.scrollX = Number(x.left || 0);
+      this.scrollY = Number(x.top || 0);
+      return;
+    }
+    this.scrollX = Number(x || 0);
+    this.scrollY = Number(y || 0);
+  },
+  matchMedia() { return { matches: false }; },
+};
 globalThis.document = new FakeDocument();
 
 const require = createRequire(import.meta.url);
@@ -212,6 +227,18 @@ const app = require("./static/app.js");
 
 function installDocument() {
   const document = new FakeDocument();
+  globalThis.window.scrollX = 0;
+  globalThis.window.scrollY = 0;
+  globalThis.window.scrollTo = function scrollTo(x, y) {
+    if (typeof x === "object") {
+      this.scrollX = Number(x.left || 0);
+      this.scrollY = Number(x.top || 0);
+      return;
+    }
+    this.scrollX = Number(x || 0);
+    this.scrollY = Number(y || 0);
+  };
+  globalThis.window.matchMedia = () => ({ matches: false });
   document.register("schedule-list");
   document.register("scheduled-execution-list");
   document.register("runs-list");
@@ -249,7 +276,7 @@ function installDocument() {
     pending_scope_expansions: [],
     steps: [],
   };
-  app.state.drawer = { returnFocus: null, returnTarget: null };
+  app.state.drawer = { returnFocus: null, returnTarget: null, scrollLock: { locked: false, x: 0, y: 0 } };
   app.state.executionDetail = { id: "", status: "idle", data: null, error: "", controller: null };
   app.state.runWorkspace = { selection: null, item: null, expandedChangeExecutionID: "", projection: { id: "", status: "idle", data: null, error: "" } };
   return document;
@@ -1396,6 +1423,31 @@ test("Schedules Open workspace selects and focuses the exact execution", async (
   assert.deepEqual(calls, ["/api/v1/scheduled-executions/execution-1"]);
 });
 
+test("Runs view scrolling honors normal and reduced motion preferences", async () => {
+  installDocument();
+  app.state.data.runs = [workflowRun("run-1")];
+  app.state.data.scheduled_executions = [execution("execution-1")];
+  const behaviors = [];
+  let reduceMotion = false;
+  let fetchCalls = 0;
+  globalThis.window.matchMedia = (query) => {
+    assert.equal(query, "(prefers-reduced-motion: reduce)");
+    return { matches: reduceMotion };
+  };
+  globalThis.window.scrollTo = (options) => behaviors.push(options.behavior);
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return response(200, workspaceProjection("execution-1", "run-1"));
+  };
+
+  await app.openExecutionWorkspace("execution-1");
+  reduceMotion = true;
+  await app.openExecutionWorkspace("execution-1");
+
+  assert.deepEqual(behaviors, ["smooth", "auto"]);
+  assert.equal(fetchCalls, 1, "motion preference does not change projection request behavior");
+});
+
 test("Full detail uses the loaded workspace projection without a second fetch", async () => {
   const document = installDocument();
   const run = workflowRun("run-1");
@@ -1409,12 +1461,87 @@ test("Full detail uses the loaded workspace projection without a second fetch", 
   const [entry] = app.buildRunSelectorEntries(app.state.data.runs, app.state.data.scheduled_executions);
   await app.selectRunWorkspaceEntry(entry);
   const [fullDetail] = findButtons(document.querySelector("#run-workspace-actions"), "Full detail");
+  window.scrollX = 19;
+  window.scrollY = 360;
 
   await fullDetail.click();
 
   assert.equal(calls, 1);
   assert.equal(document.querySelector("#detail-drawer").getAttribute("aria-hidden"), "false");
+  assert.equal(document.documentElement.classList.contains("detail-drawer-open"), true);
+  assert.equal(document.body.classList.contains("detail-drawer-open"), true);
   assert.match(document.querySelector("#drawer-content").textContent, /Cached detail|execution-1/);
+
+  window.scrollX = 91;
+  window.scrollY = 910;
+  app.closeDrawer();
+
+  assert.equal(document.documentElement.classList.contains("detail-drawer-open"), false);
+  assert.equal(document.body.classList.contains("detail-drawer-open"), false);
+  assert.equal(window.scrollX, 19);
+  assert.equal(window.scrollY, 360);
+  assert.equal(document.activeElement, fullDetail);
+  assert.deepEqual(fullDetail.focusOptions, { preventScroll: true });
+});
+
+test("Escape closes Full detail and removes the background scroll lock", async () => {
+  const document = installDocument();
+  app.state.data.scheduled_executions = [execution("execution-1")];
+  app.renderSchedules();
+  const [returnTarget] = findButtons(document.querySelector("#scheduled-execution-list"), "View details");
+  window.scrollX = 13;
+  window.scrollY = 275;
+  globalThis.fetch = async () => response(200, projection("execution-1"));
+
+  await returnTarget.click();
+  assert.equal(document.documentElement.classList.contains("detail-drawer-open"), true);
+  assert.equal(document.body.classList.contains("detail-drawer-open"), true);
+  assert.deepEqual(app.state.drawer.scrollLock, { locked: true, x: 13, y: 275 });
+
+  window.scrollX = 88;
+  window.scrollY = 880;
+  app.handleDocumentKeydown({ key: "Escape" });
+
+  assert.equal(document.querySelector("#detail-drawer").getAttribute("aria-hidden"), "true");
+  assert.equal(document.documentElement.classList.contains("detail-drawer-open"), false);
+  assert.equal(document.body.classList.contains("detail-drawer-open"), false);
+  assert.deepEqual(app.state.drawer.scrollLock, { locked: false, x: 0, y: 0 });
+  assert.equal(window.scrollX, 13);
+  assert.equal(window.scrollY, 275);
+  assert.equal(document.activeElement, returnTarget);
+  assert.deepEqual(returnTarget.focusOptions, { preventScroll: true });
+});
+
+test("shared drawer scroll lock preserves the first open position and captures a fresh reopen position", () => {
+  const document = installDocument();
+  const run = workflowRun("run-1");
+  window.scrollX = 17;
+  window.scrollY = 310;
+
+  app.openRunDrawer(run);
+  window.scrollX = 90;
+  window.scrollY = 900;
+  app.openRunDrawer(run);
+  assert.equal(document.documentElement.classList.contains("detail-drawer-open"), true);
+  assert.equal(document.body.classList.contains("detail-drawer-open"), true);
+  assert.deepEqual(app.state.drawer.scrollLock, { locked: true, x: 17, y: 310 });
+
+  app.closeDrawer();
+  assert.equal(document.documentElement.classList.contains("detail-drawer-open"), false);
+  assert.equal(document.body.classList.contains("detail-drawer-open"), false);
+  assert.equal(window.scrollX, 17);
+  assert.equal(window.scrollY, 310);
+  assert.deepEqual(app.state.drawer.scrollLock, { locked: false, x: 0, y: 0 });
+
+  window.scrollX = 23;
+  window.scrollY = 640;
+  app.openRunDrawer(run);
+  assert.equal(document.documentElement.classList.contains("detail-drawer-open"), true);
+  assert.equal(document.body.classList.contains("detail-drawer-open"), true);
+  assert.deepEqual(app.state.drawer.scrollLock, { locked: true, x: 23, y: 640 });
+  app.closeDrawer();
+  assert.equal(window.scrollX, 23);
+  assert.equal(window.scrollY, 640);
 });
 
 test("workspace selector lane and inspector keep server strings text-only", async () => {
@@ -1614,14 +1741,21 @@ test("workflow detail restores focus to the current rerendered run card", () => 
   app.state.data.runs = [run];
   app.renderRuns();
   const firstCard = document.querySelector("#runs-list").children[0];
+  window.scrollX = 29;
+  window.scrollY = 540;
 
   app.openRunDrawer(run, firstCard);
   app.renderRuns();
   const currentCard = document.querySelector("#runs-list").children[0];
   assert.notEqual(currentCard, firstCard);
+  window.scrollX = 77;
+  window.scrollY = 770;
   app.closeDrawer();
 
   assert.equal(document.activeElement, currentCard);
+  assert.deepEqual(currentCard.focusOptions, { preventScroll: true });
+  assert.equal(window.scrollX, 29);
+  assert.equal(window.scrollY, 540);
   assert.equal(document.querySelector("#detail-drawer").inert, true);
   assert.equal(document.querySelector("#detail-drawer").getAttribute("aria-hidden"), "true");
 });
