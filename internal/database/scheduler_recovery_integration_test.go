@@ -38,6 +38,93 @@ type recoveryTestFixture struct {
 	approval  *domain.ID
 }
 
+func TestStructuredRecoveryProvenance(t *testing.T) {
+	t.Run("stale attempt remains exact after reclaim", func(t *testing.T) {
+		env := newRecoveryTestEnvironment(t, "structured-recovery-reclaim")
+		schedule := createIntegrationSchedule(t, env.ctx, env.store, env.programID, "structured-recovery-reclaim")
+		execution := enqueueAndClaim(t, env.ctx, env.store, schedule.ID, "stale-owner", time.Minute)
+		expireRecoveryLease(t, env, execution.ID, 1)
+		reconcileRecovery(t, env)
+		assertRecoveryAuditProvenance(t, env, execution.ID, "scheduled_execution_stale_claim_recovered", intPointer(execution.AttemptCount), nil)
+
+		reclaimed, _, ok, err := env.store.ClaimPendingScheduledExecution(env.ctx, "replacement-owner", time.Minute)
+		if err != nil || !ok || reclaimed.ID != execution.ID {
+			t.Fatalf("reclaim=%#v ok=%v err=%v", reclaimed, ok, err)
+		}
+		if reclaimed.AttemptCount != execution.AttemptCount+1 {
+			t.Fatalf("reclaimed attempt=%d want=%d", reclaimed.AttemptCount, execution.AttemptCount+1)
+		}
+		assertRecoveryAuditProvenance(t, env, execution.ID, "scheduled_execution_stale_claim_recovered", intPointer(execution.AttemptCount), nil)
+	})
+
+	t.Run("legacy zero attempt remains partial and inconsistent", func(t *testing.T) {
+		env := newRecoveryTestEnvironment(t, "structured-recovery-legacy")
+		schedule := createIntegrationSchedule(t, env.ctx, env.store, env.programID, "structured-recovery-legacy")
+		execution, err := env.store.EnqueueRunNow(env.ctx, schedule.ID, "integration")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := env.store.Pool.Exec(env.ctx, `UPDATE scheduled_executions SET status='claimed',attempt_count=0,lease_owner='legacy-owner',lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, execution.ID); err != nil {
+			t.Fatal(err)
+		}
+		reconcileRecovery(t, env)
+		assertRecoveryAuditProvenance(t, env, execution.ID, "scheduled_execution_lineage_inconsistent", nil, nil)
+		assertManualReviewAudit(t, env, execution.ID, "scheduled_execution_lineage_inconsistent")
+	})
+
+	t.Run("running recovery preserves exact attempt scope on root and child events", func(t *testing.T) {
+		env := newRecoveryTestEnvironment(t, "structured-recovery-scope")
+		var scopeVersionID domain.ID
+		if err := env.store.Pool.QueryRow(env.ctx, `SELECT id FROM scope_versions WHERE program_id=$1 ORDER BY created_at DESC LIMIT 1`, env.programID).Scan(&scopeVersionID); err != nil {
+			t.Fatal(err)
+		}
+		schedule := createIntegrationSchedule(t, env.ctx, env.store, env.programID, "structured-recovery-scope")
+		execution := enqueueAndClaim(t, env.ctx, env.store, schedule.ID, "structured-recovery-scope-owner", time.Minute)
+		task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "structured-recovery-scope")
+		if err := env.store.MarkScheduledExecutionTaskCreated(env.ctx, execution.ID, task.ID, "structured-recovery-scope-owner", execution.AttemptCount); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		runID, stepID := domain.NewID(), domain.NewID()
+		state := &workflow.State{
+			Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: env.definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)},
+			Steps: map[string]*workflow.StepState{"active": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "active", Capability: "test.active", Status: domain.StepRunning, AttemptCount: 1, Input: json.RawMessage(`{}`), StartedAt: &now, IdempotencyKey: "structured-recovery-scope-active", ApprovalState: "not_required"}}},
+		}
+		fencedCtx := WithScheduledExecutionFence(env.ctx, ScheduledExecutionFence{ExecutionID: execution.ID, LeaseOwner: "structured-recovery-scope-owner", Attempt: execution.AttemptCount})
+		if err := env.store.saveWorkflowState(fencedCtx, state, func(lifecycleCtx context.Context, state *workflow.State) error {
+			return env.store.MarkScheduledExecutionRunning(lifecycleCtx, execution.ID, task.ID, state.Run.ID, &scopeVersionID, "structured-recovery-scope-owner", execution.AttemptCount)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		expireRecoveryLease(t, env, execution.ID, 1)
+		reconcileRecovery(t, env)
+		for _, event := range []string{"scheduled_task_reconciled", "scheduled_workflow_reconciled", "scheduled_step_reconciled", "scheduled_execution_lineage_interrupted"} {
+			assertRecoveryAuditProvenance(t, env, execution.ID, event, intPointer(execution.AttemptCount), &scopeVersionID)
+		}
+	})
+
+	t.Run("audit rejection rolls back recovered state and child events", func(t *testing.T) {
+		env := newRecoveryTestEnvironment(t, "structured-recovery-rollback")
+		fixture := createRecoveryFixture(t, env, "structured-recovery-rollback", nil, domain.TaskRunning, nil)
+		expireRecoveryLease(t, env, fixture.execution.ID, 1)
+		if _, err := env.store.Pool.Exec(env.ctx, `CREATE FUNCTION reject_test_recovery_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.event_type='scheduled_execution_lineage_interrupted' THEN RAISE EXCEPTION 'synthetic recovery audit rejection'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_test_recovery_audit BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION reject_test_recovery_audit()`); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if _, err := env.store.Pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS reject_test_recovery_audit ON audit_events; DROP FUNCTION IF EXISTS reject_test_recovery_audit()`); err != nil {
+				t.Errorf("drop recovery rejection trigger: %v", err)
+			}
+		})
+		if err := env.store.reconcileStaleScheduledExecutions(env.ctx, 1); err == nil {
+			t.Fatal("synthetic recovery audit rejection did not fail transaction")
+		}
+		assertExpiredActiveRecoveryLease(t, env, fixture.execution.ID)
+		assertTaskRecoveryStatus(t, env, fixture.task.ID, domain.TaskRunning)
+		assertRecoveryAuditCount(t, env, fixture.execution.ID, "scheduled_task_reconciled", 0)
+		assertRecoveryAuditCount(t, env, fixture.execution.ID, "scheduled_execution_lineage_interrupted", 0)
+	})
+}
+
 func TestStaleScheduledExecutionReconciliationScenariosAThroughE(t *testing.T) {
 	t.Run("A safe versioned claim is requeued once and reclaimable", func(t *testing.T) {
 		env := newRecoveryTestEnvironment(t, "scenario-a")
@@ -1170,11 +1257,24 @@ func sameRecoveryID(left, right *domain.ID) bool {
 func assertRecoveryAuditCount(t *testing.T, env recoveryTestEnvironment, executionID domain.ID, event string, want int) {
 	t.Helper()
 	var got int
-	if err := env.store.Pool.QueryRow(env.ctx, `SELECT count(*) FROM audit_events WHERE event_type=$1 AND details->>'scheduled_execution_id'=$2`, event, executionID).Scan(&got); err != nil {
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT count(*) FROM audit_events WHERE event_type=$1 AND scheduled_execution_id=$2`, event, executionID).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
 	if got != want {
 		t.Fatalf("audit %s count=%d want=%d", event, got, want)
+	}
+}
+
+func assertRecoveryAuditProvenance(t *testing.T, env recoveryTestEnvironment, executionID domain.ID, event string, wantAttempt *int, wantScope *domain.ID) {
+	t.Helper()
+	var gotExecution domain.ID
+	var gotAttempt *int
+	var gotScope *domain.ID
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT scheduled_execution_id,scheduler_attempt,scope_version_id FROM audit_events WHERE event_type=$1 AND scheduled_execution_id=$2 ORDER BY occurred_at DESC,id DESC LIMIT 1`, event, executionID).Scan(&gotExecution, &gotAttempt, &gotScope); err != nil {
+		t.Fatal(err)
+	}
+	if gotExecution != executionID || !sameInt(gotAttempt, wantAttempt) || !sameRecoveryID(gotScope, wantScope) {
+		t.Fatalf("recovery audit %s execution=%s attempt=%v scope=%v want execution=%s attempt=%v scope=%v", event, gotExecution, gotAttempt, gotScope, executionID, wantAttempt, wantScope)
 	}
 }
 
@@ -1272,7 +1372,7 @@ func assertScenarioHClosed(t *testing.T, env recoveryTestEnvironment, fixture re
 func recoveryAuditRecord(t *testing.T, env recoveryTestEnvironment, executionID domain.ID, event string) map[string]any {
 	t.Helper()
 	var raw json.RawMessage
-	if err := env.store.Pool.QueryRow(env.ctx, `SELECT details FROM audit_events WHERE event_type=$1 AND details->>'scheduled_execution_id'=$2 ORDER BY occurred_at DESC LIMIT 1`, event, executionID).Scan(&raw); err != nil {
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT details FROM audit_events WHERE event_type=$1 AND scheduled_execution_id=$2 ORDER BY occurred_at DESC,id DESC LIMIT 1`, event, executionID).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	var details map[string]any

@@ -585,6 +585,7 @@ func applyStaleLineageReconciliation(ctx context.Context, tx pgx.Tx, entry stale
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&recoveredAt); err != nil {
 		return err
 	}
+	provenance := recoverySchedulerAuditProvenance(entry.item)
 	base := recoveryAuditDetails(entry, lineage, plan)
 	auditTaskID := entry.item.TaskID
 	if auditTaskID != nil && containsRecoveryID(lineage.missingTaskIDs, *auditTaskID) {
@@ -622,7 +623,7 @@ func applyStaleLineageReconciliation(ctx context.Context, tx pgx.Tx, entry stale
 			if plan.eligibleWorkflow && lineage.workflow != nil && lineage.workflow.taskID == task.id {
 				taskWorkflowRunID = &lineage.workflow.id
 			}
-			if err := auditRecoveryRow(ctx, tx, "scheduled_task_reconciled", entry.programID, &task.id, taskWorkflowRunID, nil, nil, "", "", "scheduled task reconciled after lease expiry", details); err != nil {
+			if err := auditRecoveryRow(ctx, tx, provenance, "scheduled_task_reconciled", entry.programID, &task.id, taskWorkflowRunID, nil, nil, "", "", "scheduled task reconciled after lease expiry", details); err != nil {
 				return err
 			}
 		}
@@ -644,7 +645,7 @@ func applyStaleLineageReconciliation(ctx context.Context, tx pgx.Tx, entry stale
 		}
 		lineage.workflow.status, lineage.workflow.completedAt = *plan.workflowStatus, completedAt
 		details := recoveryChangeDetails(base, previous, lineage.workflow.status)
-		if err := auditRecoveryRow(ctx, tx, "scheduled_workflow_reconciled", entry.programID, &lineage.workflow.taskID, &lineage.workflow.id, nil, nil, "", "", "scheduled workflow reconciled after lease expiry", details); err != nil {
+		if err := auditRecoveryRow(ctx, tx, provenance, "scheduled_workflow_reconciled", entry.programID, &lineage.workflow.taskID, &lineage.workflow.id, nil, nil, "", "", "scheduled workflow reconciled after lease expiry", details); err != nil {
 			return err
 		}
 	}
@@ -677,7 +678,7 @@ func applyStaleLineageReconciliation(ctx context.Context, tx pgx.Tx, entry stale
 		}
 		step.status = target
 		details := recoveryChangeDetails(base, previous, target)
-		if err := auditRecoveryRow(ctx, tx, "scheduled_step_reconciled", entry.programID, &lineage.workflow.taskID, &lineage.workflow.id, &step.id, nil, step.capability, "", "scheduled workflow step reconciled after lease expiry", details); err != nil {
+		if err := auditRecoveryRow(ctx, tx, provenance, "scheduled_step_reconciled", entry.programID, &lineage.workflow.taskID, &lineage.workflow.id, &step.id, nil, step.capability, "", "scheduled workflow step reconciled after lease expiry", details); err != nil {
 			return err
 		}
 	}
@@ -698,7 +699,7 @@ func applyStaleLineageReconciliation(ctx context.Context, tx pgx.Tx, entry stale
 			}
 			tool.completedAt = &recoveredAt
 			details := recoveryChangeDetails(base, "incomplete", "interrupted")
-			if err := auditRecoveryRow(ctx, tx, "scheduled_tool_run_interrupted", entry.programID, &lineage.workflow.taskID, &lineage.workflow.id, &tool.stepRunID, &tool.id, tool.capability, tool.provider, "incomplete tool run closed after scheduler lease expiry", details); err != nil {
+			if err := auditRecoveryRow(ctx, tx, provenance, "scheduled_tool_run_interrupted", entry.programID, &lineage.workflow.taskID, &lineage.workflow.id, &tool.stepRunID, &tool.id, tool.capability, tool.provider, "incomplete tool run closed after scheduler lease expiry", details); err != nil {
 				return err
 			}
 		}
@@ -719,7 +720,7 @@ func applyStaleLineageReconciliation(ctx context.Context, tx pgx.Tx, entry stale
 			approval.decision = "expired"
 			details := recoveryChangeDetails(base, "pending", "expired")
 			details["approval_id"] = approval.id
-			if err := auditRecoveryRow(ctx, tx, "scheduled_approval_reconciled", entry.programID, &approval.taskID, &lineage.workflow.id, &approval.requestID, nil, "", "", "pending approval expired during scheduler reconciliation", details); err != nil {
+			if err := auditRecoveryRow(ctx, tx, provenance, "scheduled_approval_reconciled", entry.programID, &approval.taskID, &lineage.workflow.id, &approval.requestID, nil, "", "", "pending approval expired during scheduler reconciliation", details); err != nil {
 				return err
 			}
 		}
@@ -750,7 +751,7 @@ func applyStaleLineageReconciliation(ctx context.Context, tx pgx.Tx, entry stale
 	auditItem := entry.item
 	auditItem.TaskID = auditTaskID
 	auditItem.WorkflowRunID = auditWorkflowRunID
-	return auditExecution(ctx, tx, plan.eventType, "scheduler", entry.programID, auditItem, plan.eventMessage, base)
+	return auditScheduledExecution(ctx, tx, provenance.classification, plan.eventType, "scheduler", entry.programID, auditItem, provenance.schedulerAttempt, provenance.scopeVersionID, plan.eventMessage, base)
 }
 
 func recoveryAuditDetails(entry staleRecoveryEntry, lineage staleLineage, plan staleReconciliation) map[string]any {
@@ -863,10 +864,24 @@ func recoveryChangeDetails(base map[string]any, previous, next any) map[string]a
 	return details
 }
 
-func auditRecoveryRow(ctx context.Context, tx pgx.Tx, event string, programID domain.ID, taskID, workflowRunID, stepRunID, toolRunID *domain.ID, capability, provider, message string, details map[string]any) error {
-	_, err := tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,tool_run_id,capability,provider,safe_message,details)
-		VALUES($1,$2,'scheduler','scheduler',$3,$4,$5,$6,$7,$8,$9,$10,$11)`, domain.NewID(), event, taskID, programID, workflowRunID, stepRunID, toolRunID, nullIfEmpty(capability), nullIfEmpty(provider), message, mustJSON(details))
-	return err
+func auditRecoveryRow(ctx context.Context, tx pgx.Tx, provenance schedulerAuditProvenance, event string, programID domain.ID, taskID, workflowRunID, stepRunID, toolRunID *domain.ID, capability, provider, message string, details map[string]any) error {
+	return writeSchedulerAudit(ctx, tx, schedulerAuditRecord{
+		classification:       provenance.classification,
+		eventType:            event,
+		actor:                "scheduler",
+		programID:            programID,
+		scheduledExecutionID: provenance.scheduledExecutionID,
+		schedulerAttempt:     provenance.schedulerAttempt,
+		scopeVersionID:       provenance.scopeVersionID,
+		taskID:               taskID,
+		workflowRunID:        workflowRunID,
+		stepRunID:            stepRunID,
+		toolRunID:            toolRunID,
+		capability:           capability,
+		provider:             provider,
+		safeMessage:          message,
+		details:              details,
+	})
 }
 
 func recoveryStepTarget(status domain.StepStatus, mode recoveryStepMode) (domain.StepStatus, bool) {
