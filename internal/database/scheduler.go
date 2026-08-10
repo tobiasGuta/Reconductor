@@ -133,7 +133,7 @@ func (s *Store) EnqueueRunNow(ctx context.Context, scheduleID domain.ID, actor s
 	if _, err := tx.Exec(ctx, `INSERT INTO scheduled_executions(id,schedule_id,planned_at,trigger_source,status,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, item.ID, item.ScheduleID, item.PlannedAt, item.TriggerSource, item.Status, item.CreatedAt, item.UpdatedAt); err != nil {
 		return domain.ScheduledExecution{}, err
 	}
-	if err := auditExecution(ctx, tx, "scheduled_execution_planned", actor, programID, item, "run now execution queued", nil); err != nil {
+	if err := auditScheduledExecution(ctx, tx, schedulerAuditExecutionBoundNonAttempt, "scheduled_execution_planned", actor, programID, item, nil, nil, "run now execution queued", nil); err != nil {
 		return domain.ScheduledExecution{}, err
 	}
 	return item, tx.Commit(ctx)
@@ -189,7 +189,7 @@ func (s *Store) MaterializeDueSchedule(ctx context.Context, scheduleID domain.ID
 		if _, err := tx.Exec(ctx, `UPDATE schedules SET next_run_at=$2,updated_at=now() WHERE id=$1`, due.id, nextRunAt); err != nil {
 			return nil, err
 		}
-		if err := auditExecution(ctx, tx, eventType, "scheduler", due.programID, item, message, nil); err != nil {
+		if err := auditScheduledExecution(ctx, tx, schedulerAuditExecutionBoundNonAttempt, eventType, "scheduler", due.programID, item, nil, nil, message, nil); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
@@ -242,7 +242,7 @@ func (s *Store) ClaimPendingScheduledExecution(ctx context.Context, owner string
 	if err != nil {
 		return domain.ScheduledExecution{}, domain.Schedule{}, false, err
 	}
-	if err := auditExecution(ctx, tx, "scheduled_execution_claimed", owner, sched.ProgramID, item, "scheduled execution claimed", nil); err != nil {
+	if err := auditScheduledExecution(ctx, tx, schedulerAuditAttemptBound, "scheduled_execution_claimed", owner, sched.ProgramID, item, exactSchedulerAttempt(item.AttemptCount), nil, "scheduled execution claimed", nil); err != nil {
 		return domain.ScheduledExecution{}, domain.Schedule{}, false, err
 	}
 	return item, sched, true, tx.Commit(ctx)
@@ -351,7 +351,7 @@ func (s *Store) MarkScheduledExecutionBlocked(ctx context.Context, id domain.ID,
 	}
 	item.Status, item.ScopeVersionID, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = domain.ScheduledExecutionBlockedScopeChange, &scopeVersionID, "scope_change", "unacknowledged scope expansion blocked scheduled execution", &now, now
 	item.LeaseOwner, item.LeaseExpiresAt = "", nil
-	if err := auditExecution(ctx, tx, "scheduled_execution_blocked_scope_change", owner, programID, item, "scheduled execution blocked by scope expansion", nil); err != nil {
+	if err := auditScheduledExecution(ctx, tx, schedulerAuditAttemptBound, "scheduled_execution_blocked_scope_change", owner, programID, item, exactSchedulerAttempt(attempt), &scopeVersionID, "scheduled execution blocked by scope expansion", nil); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -374,6 +374,13 @@ func (s *Store) markScheduledExecution(ctx context.Context, id domain.ID, status
 	if !containsExecutionStatus(allowed, item.Status) || !validLease {
 		return invalidScheduledExecutionTransition(item, status)
 	}
+	// Running is the only source status whose scope was assigned by this exact
+	// fenced attempt. A claimed row may retain an earlier attempt's scope after
+	// administrative resume, so claimed terminal transitions record NULL.
+	var scopeVersionID *domain.ID
+	if item.Status == domain.ScheduledExecutionRunning {
+		scopeVersionID = item.ScopeVersionID
+	}
 	now := time.Now().UTC()
 	completedAt := item.CompletedAt
 	if containsExecutionStatus([]domain.ScheduledExecutionStatus{domain.ScheduledExecutionCompleted, domain.ScheduledExecutionFailed, domain.ScheduledExecutionCancelled, domain.ScheduledExecutionApprovalRejected, domain.ScheduledExecutionInterrupted}, status) {
@@ -388,7 +395,7 @@ func (s *Store) markScheduledExecution(ctx context.Context, id domain.ID, status
 	}
 	item.Status, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = status, class, summary, completedAt, now
 	item.LeaseOwner, item.LeaseExpiresAt = "", nil
-	if err := auditExecution(ctx, tx, event, owner, programID, item, message, nil); err != nil {
+	if err := auditScheduledExecution(ctx, tx, schedulerAuditAttemptBound, event, owner, programID, item, exactSchedulerAttempt(attempt), scopeVersionID, message, nil); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -496,7 +503,7 @@ func markScheduledExecutionTaskCreated(ctx context.Context, tx pgx.Tx, id, taskI
 		return err
 	}
 	item.TaskID, item.UpdatedAt = &taskID, updatedAt
-	return auditExecution(ctx, tx, "scheduled_execution_task_linked", owner, programID, item, "scheduled execution task linked", nil)
+	return auditScheduledExecution(ctx, tx, schedulerAuditAttemptBound, "scheduled_execution_task_linked", owner, programID, item, exactSchedulerAttempt(attempt), nil, "scheduled execution task linked", nil)
 }
 
 func rejectLockedScheduledExecutionForApproval(ctx context.Context, tx pgx.Tx, item domain.ScheduledExecution, programID domain.ID, actor string) error {
@@ -524,7 +531,7 @@ func rejectLockedScheduledExecutionForApproval(ctx context.Context, tx pgx.Tx, i
 	}
 	item.Status, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = domain.ScheduledExecutionApprovalRejected, "approval_rejected", "moderate step approval was rejected", &now, now
 	item.LeaseOwner, item.LeaseExpiresAt = "", nil
-	return auditExecution(ctx, tx, "scheduled_execution_approval_rejected", actor, programID, item, "scheduled execution approval rejected", nil)
+	return auditScheduledExecution(ctx, tx, schedulerAuditExecutionBoundNonAttempt, "scheduled_execution_approval_rejected", actor, programID, item, nil, nil, "scheduled execution approval rejected", nil)
 }
 
 func markScheduledExecutionRunning(ctx context.Context, tx pgx.Tx, id, taskID, workflowRunID domain.ID, scopeVersionID *domain.ID, owner string, attempt int) error {
@@ -570,7 +577,7 @@ func markScheduledExecutionRunning(ctx context.Context, tx pgx.Tx, id, taskID, w
 		return err
 	}
 	item.Status, item.TaskID, item.WorkflowRunID, item.ScopeVersionID, item.StartedAt, item.UpdatedAt = domain.ScheduledExecutionRunning, &taskID, &workflowRunID, scopeVersionID, &now, now
-	if err := auditExecution(ctx, tx, "scheduled_execution_started", owner, programID, item, "scheduled execution started", nil); err != nil {
+	if err := auditScheduledExecution(ctx, tx, schedulerAuditAttemptBound, "scheduled_execution_started", owner, programID, item, exactSchedulerAttempt(attempt), scopeVersionID, "scheduled execution started", nil); err != nil {
 		return err
 	}
 	return nil
@@ -620,7 +627,7 @@ func skipOverlappingPendingExecutions(ctx context.Context, tx pgx.Tx) error {
 		}
 		item := entry.item
 		item.Status, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = domain.ScheduledExecutionSkippedOverlap, "overlap", "same schedule already has an active execution", &now, now
-		if err := auditExecution(ctx, tx, "scheduled_execution_skipped_overlap", "scheduler", entry.programID, item, "scheduled execution skipped because another execution is active", nil); err != nil {
+		if err := auditScheduledExecution(ctx, tx, schedulerAuditExecutionBoundNonAttempt, "scheduled_execution_skipped_overlap", "scheduler", entry.programID, item, nil, nil, "scheduled execution skipped because another execution is active", nil); err != nil {
 			return err
 		}
 	}
@@ -672,7 +679,7 @@ func (s *Store) RequestScheduledExecutionResume(ctx context.Context, id domain.I
 				return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionApprovalRejected)
 			}
 			item.Status, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = domain.ScheduledExecutionApprovalRejected, "approval_rejected", "moderate step approval was rejected", &now, now
-			if err := auditExecution(ctx, tx, "scheduled_execution_approval_rejected", actor, programID, item, "scheduled execution approval rejected", nil); err != nil {
+			if err := auditScheduledExecution(ctx, tx, schedulerAuditExecutionBoundNonAttempt, "scheduled_execution_approval_rejected", actor, programID, item, nil, nil, "scheduled execution approval rejected", nil); err != nil {
 				return err
 			}
 			if err := tx.Commit(ctx); err != nil {
@@ -705,7 +712,7 @@ func (s *Store) RequestScheduledExecutionResume(ctx context.Context, id domain.I
 		return invalidScheduledExecutionTransition(item, domain.ScheduledExecutionPending)
 	}
 	item.Status, item.TriggerSource, item.ErrorClassification, item.ErrorSummary, item.CompletedAt, item.UpdatedAt = domain.ScheduledExecutionPending, domain.ScheduleTriggerResume, "", "", nil, now
-	if err := auditExecution(ctx, tx, "scheduled_execution_resume_requested", actor, programID, item, "scheduled execution resume requested", nil); err != nil {
+	if err := auditScheduledExecution(ctx, tx, schedulerAuditExecutionBoundNonAttempt, "scheduled_execution_resume_requested", actor, programID, item, nil, nil, "scheduled execution resume requested", nil); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -867,14 +874,6 @@ func validDisposition(value domain.ChangeReviewDisposition) bool {
 
 func auditSchedule(ctx context.Context, tx pgx.Tx, event, actor string, programID, scheduleID domain.ID, message string, details any) error {
 	_, err := tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,program_id,safe_message,details) VALUES($1,$2,'scheduler',$3,$4,$5,$6)`, domain.NewID(), event, actor, programID, message, mustJSON(map[string]any{"schedule_id": scheduleID, "details": details}))
-	return err
-}
-
-func auditExecution(ctx context.Context, tx pgx.Tx, event, actor string, programID domain.ID, item domain.ScheduledExecution, message string, details any) error {
-	if details == nil {
-		details = map[string]any{"scheduled_execution_id": item.ID, "schedule_id": item.ScheduleID, "status": item.Status, "trigger_source": item.TriggerSource}
-	}
-	_, err := tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,program_id,task_id,workflow_run_id,safe_message,details) VALUES($1,$2,'scheduler',$3,$4,$5,$6,$7,$8)`, domain.NewID(), event, actor, programID, item.TaskID, item.WorkflowRunID, message, mustJSON(details))
 	return err
 }
 
