@@ -17,6 +17,27 @@ import (
 
 type e2eCap struct{ name string }
 
+type workflowProvenanceRecorder struct{}
+
+func (workflowProvenanceRecorder) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
+	return domain.NewID(), nil
+}
+func (workflowProvenanceRecorder) RecordProviderInvocationStarted(context.Context, capability.ProviderInvocationStartRecord) (domain.ID, error) {
+	return domain.NewID(), nil
+}
+func (workflowProvenanceRecorder) RecordProviderInvocationTerminal(context.Context, capability.ProviderInvocationTerminalRecord) error {
+	return nil
+}
+
+type provenanceRegistryExecutor struct{ registry *capability.Registry }
+
+func (e provenanceRegistryExecutor) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
+	recorder := workflowProvenanceRecorder{}
+	req.DecisionRecorder = recorder
+	req.InvocationRecorder = recorder
+	return e.registry.Execute(ctx, req)
+}
+
 func (c e2eCap) Manifest() capability.Manifest {
 	return capability.Manifest{Name: c.name, Version: "1", Risk: map[bool]policy.Risk{true: policy.Moderate, false: policy.Low}[c.name == "scan.nuclei"], ApprovalRequired: c.name == "scan.nuclei", Idempotent: true, RetrySafe: true}
 }
@@ -117,7 +138,7 @@ func TestContinuousWebReconEndToEndStateMachine(t *testing.T) {
 		t.Fatal(err)
 	}
 	definition := ContinuousWebRecon(plan, false)
-	engine := workflow.Engine{Registry: registry, Executor: registry, Policy: policy.Policy{AllowedCapabilities: registry.Names()}, Scope: sc, Approval: func(context.Context, workflow.Step, policy.Risk) (bool, error) { return true, nil }}
+	engine := workflow.Engine{Registry: registry, Executor: provenanceRegistryExecutor{registry: registry}, Policy: policy.Policy{AllowedCapabilities: registry.Names()}, Scope: sc, Approval: func(context.Context, workflow.Step, policy.Risk) (bool, error) { return true, nil }}
 	state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), WorkflowDefinitionID: definition.ID, RequestedBy: "test"}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +172,7 @@ func TestContinuousWebReconProducesBriefBeforeNucleiApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	definition := ContinuousWebRecon(plan, false)
-	engine := workflow.Engine{Registry: registry, Executor: registry, Policy: policy.Policy{AllowedCapabilities: registry.Names()}, Scope: sc}
+	engine := workflow.Engine{Registry: registry, Executor: provenanceRegistryExecutor{registry: registry}, Policy: policy.Policy{AllowedCapabilities: registry.Names()}, Scope: sc}
 	state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), WorkflowDefinitionID: definition.ID, RequestedBy: "test"}, nil)
 	if err != nil {
 		t.Fatal(err)

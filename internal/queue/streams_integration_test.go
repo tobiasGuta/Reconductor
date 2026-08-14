@@ -35,18 +35,28 @@ func TestRedisStreamsDeliveryRecoveryAndDeadLetter(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := Job{ID: domain.NewID(), Action: domain.ActionRequest{ID: domain.NewID(), IdempotencyKey: "integration-key"}}
-	if _, err := first.Enqueue(ctx, job); err != nil {
+	messageID, err := first.Enqueue(ctx, job)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if messageID == string(job.ID) || messageID == string(job.Action.ID) {
+		t.Fatalf("Redis message identity collapsed into durable identity: message=%s job=%s action=%s", messageID, job.ID, job.Action.ID)
 	}
 	deliveries, err := first.Read(ctx, time.Second, 1)
 	if err != nil || len(deliveries) != 1 {
 		t.Fatalf("read: %v %#v", err, deliveries)
+	}
+	if deliveries[0].MessageID != messageID || deliveries[0].Job.ID != job.ID || deliveries[0].Job.Action.ID != job.Action.ID {
+		t.Fatalf("initial delivery identity changed: %#v", deliveries[0])
 	}
 	second := NewWithNames(client, group, "second", 0, time.Millisecond, names)
 	time.Sleep(5 * time.Millisecond)
 	claimed, err := second.ClaimStale(ctx, time.Millisecond, 1)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim: %v %#v", err, claimed)
+	}
+	if claimed[0].MessageID != messageID || claimed[0].Job.ID != job.ID || claimed[0].Job.Action.ID != job.Action.ID {
+		t.Fatalf("redelivery identity changed: %#v", claimed[0])
 	}
 	if err := second.Fail(ctx, claimed[0].MessageID, claimed[0].Job, "permanent", false); err != nil {
 		t.Fatal(err)

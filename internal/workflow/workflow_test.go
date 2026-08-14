@@ -42,6 +42,34 @@ type memoryPersist struct {
 	saves int
 }
 
+type workflowTestRecorder struct{}
+
+func (workflowTestRecorder) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
+	return domain.NewID(), nil
+}
+func (workflowTestRecorder) RecordProviderInvocationStarted(context.Context, capability.ProviderInvocationStartRecord) (domain.ID, error) {
+	return domain.NewID(), nil
+}
+func (workflowTestRecorder) RecordProviderInvocationTerminal(context.Context, capability.ProviderInvocationTerminalRecord) error {
+	return nil
+}
+
+type testRegistryExecutor struct {
+	registry *capability.Registry
+	mu       sync.Mutex
+	requests []capability.Request
+}
+
+func (e *testRegistryExecutor) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
+	e.mu.Lock()
+	e.requests = append(e.requests, req)
+	e.mu.Unlock()
+	recorder := workflowTestRecorder{}
+	req.DecisionRecorder = recorder
+	req.InvocationRecorder = recorder
+	return e.registry.Execute(ctx, req)
+}
+
 func (p *memoryPersist) Save(context.Context, *State) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -140,7 +168,8 @@ func TestRetryIdempotencyAndResume(t *testing.T) {
 	calls := 0
 	r := registryFor(t, testCap{"x", &calls, true})
 	persist := &memoryPersist{}
-	engine := Engine{Registry: r, Executor: r, Persister: persist, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
+	executor := &testRegistryExecutor{registry: r}
+	engine := Engine{Registry: r, Executor: executor, Persister: persist, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
 	def := Definition{ID: domain.NewID(), Name: "w", Version: "1", Steps: []Step{{ID: "a", Capability: "x", Input: json.RawMessage(`{"target":"x"}`), Retry: RetryPolicy{MaxAttempts: 2, BaseDelay: time.Millisecond}}}}
 	task := domain.Task{ID: domain.NewID(), WorkflowDefinitionID: def.ID, RequestedBy: "cli"}
 	state, err := engine.Run(context.Background(), def, nil, task, nil)
@@ -164,6 +193,73 @@ func TestRetryIdempotencyAndResume(t *testing.T) {
 	if persist.saves < 3 {
 		t.Fatal("state was not persisted across transitions")
 	}
+	if len(executor.requests) != 2 || executor.requests[0].Action.StepAttempt != 1 || executor.requests[1].Action.StepAttempt != 2 || executor.requests[0].Action.ID == executor.requests[1].Action.ID || executor.requests[0].Action.IdempotencyKey != executor.requests[1].Action.IdempotencyKey {
+		t.Fatalf("retry action provenance=%#v", executor.requests)
+	}
+}
+
+type degradedRetryExecutor struct{ calls int }
+
+func (e *degradedRetryExecutor) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+	e.calls++
+	result := capability.Result{
+		Action:             domain.ActionResult{RequestID: req.Action.ID},
+		TerminalAuditError: errors.New("database host and internal detail must not persist"),
+	}
+	if e.calls == 1 {
+		result.Action.Status = "failed"
+		result.Action.Error = &domain.StructuredError{Classification: "provider_error", Message: "safe provider failure", Retryable: true}
+		return result, errors.New("temporary provider failure")
+	}
+	result.Action.Status = "succeeded"
+	result.Action.Summary = "provider truth"
+	result.Action.Output = json.RawMessage(`{"lines":[]}`)
+	return result, nil
+}
+
+func TestWorkflowPreservesSafeTerminalAuditDegradationForEveryAttempt(t *testing.T) {
+	registryCalls := 0
+	registry := registryFor(t, testCap{"x", &registryCalls, false})
+	executor := &degradedRetryExecutor{}
+	engine := Engine{Registry: registry, Executor: executor, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
+	definition := Definition{ID: domain.NewID(), Name: "terminal-audit-degradation", Version: "1", Steps: []Step{{ID: "a", Capability: "x", Input: json.RawMessage(`{}`), Retry: RetryPolicy{MaxAttempts: 2, BaseDelay: time.Millisecond}}}}
+	state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), WorkflowDefinitionID: definition.ID}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executor.calls != 2 || state.Steps["a"].Run.Status != domain.StepSucceeded {
+		t.Fatalf("provider truth or retry changed: calls=%d step=%#v", executor.calls, state.Steps["a"].Run)
+	}
+	degradations := 0
+	for _, event := range state.Events {
+		if event.Type != providerTerminalAuditDegradedEvent {
+			continue
+		}
+		degradations++
+		if event.StepID != "a" || event.Message != providerTerminalAuditDegradedMessage || strings.Contains(event.Message, "database host") || strings.Contains(event.Message, "internal detail") {
+			t.Fatalf("unsafe or misattributed degradation event: %#v", event)
+		}
+	}
+	if degradations != 2 {
+		t.Fatalf("degradation events=%d want one for each of two attempts: %#v", degradations, state.Events)
+	}
+}
+
+func TestActionRequestStepAttemptJSONCompatibility(t *testing.T) {
+	var legacy domain.ActionRequest
+	if err := json.Unmarshal([]byte(`{"id":"00000000-0000-4000-8000-000000000001","capability":"x"}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.StepAttempt != 0 {
+		t.Fatalf("legacy step attempt=%d want unknown zero", legacy.StepAttempt)
+	}
+	encoded, err := json.Marshal(domain.ActionRequest{ID: legacy.ID, Capability: "x", StepAttempt: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"step_attempt":2`) {
+		t.Fatalf("positive step attempt missing from JSON: %s", encoded)
+	}
 }
 func TestApprovalPause(t *testing.T) {
 	calls := 0
@@ -182,7 +278,8 @@ func TestResumeAfterFileBackedRestart(t *testing.T) {
 	calls := 0
 	r := registryFor(t, testCap{"x", &calls, false})
 	store := FileStore{Root: t.TempDir()}
-	engine := Engine{Registry: r, Executor: r, Persister: store, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
+	executor := &testRegistryExecutor{registry: r}
+	engine := Engine{Registry: r, Executor: executor, Persister: store, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
 	def := Definition{ID: domain.NewID(), Name: "w", Version: "1", Steps: []Step{{ID: "a", Capability: "x", Input: json.RawMessage(`{}`)}}}
 	task := domain.Task{ID: domain.NewID()}
 	state, err := engine.Run(context.Background(), def, nil, task, nil)
@@ -193,7 +290,7 @@ func TestResumeAfterFileBackedRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restarted := Engine{Registry: r, Executor: r, Persister: store, Policy: engine.Policy, Scope: allScope{}}
+	restarted := Engine{Registry: r, Executor: executor, Persister: store, Policy: engine.Policy, Scope: allScope{}}
 	if _, err := restarted.Run(context.Background(), def, loaded, task, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +617,7 @@ func TestExecuteStepUsesResolvedDefaultProvider(t *testing.T) {
 func TestApprovalPauseAllowsIndependentSafeBranchAndResumes(t *testing.T) {
 	calls := 0
 	registry := registryFor(t, testCap{"x", &calls, false})
-	engine := Engine{Registry: registry, Executor: registry, MaxParallel: 2, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
+	engine := Engine{Registry: registry, Executor: &testRegistryExecutor{registry: registry}, MaxParallel: 2, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
 	definition := Definition{ID: domain.NewID(), Name: "approval-branches", Version: "1", Steps: []Step{
 		{ID: "gated", Capability: "x", ApprovalRequired: true, Input: json.RawMessage(`{}`)},
 		{ID: "safe", Capability: "x", Input: json.RawMessage(`{}`)},

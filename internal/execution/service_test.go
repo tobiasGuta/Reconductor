@@ -30,14 +30,43 @@ func (failingRunner) Run(context.Context, string, []string, []byte) ([]byte, []b
 func (failingRunner) Version(context.Context, string, []string) (string, error) { return "test-1", nil }
 
 type capturedStore struct {
-	called    bool
-	step      domain.StepRun
-	tool      *domain.ToolRun
-	artifacts []domain.Artifact
-	result    domain.ActionResult
-	err       error
-	previous  []string
-	loadedFor string
+	called      bool
+	step        domain.StepRun
+	tool        *domain.ToolRun
+	artifacts   []domain.Artifact
+	result      domain.ActionResult
+	err         error
+	previous    []string
+	loadedFor   string
+	policyID    domain.ID
+	startID     domain.ID
+	start       capability.ProviderInvocationStartRecord
+	terminal    capability.ProviderInvocationTerminalRecord
+	startErr    error
+	terminalErr error
+}
+
+func (s *capturedStore) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
+	if s.policyID == "" {
+		s.policyID = domain.NewID()
+	}
+	return s.policyID, nil
+}
+
+func (s *capturedStore) RecordProviderInvocationStarted(_ context.Context, record capability.ProviderInvocationStartRecord) (domain.ID, error) {
+	s.start = record
+	if s.startErr != nil {
+		return "", s.startErr
+	}
+	if s.startID == "" {
+		s.startID = domain.NewID()
+	}
+	return s.startID, nil
+}
+
+func (s *capturedStore) RecordProviderInvocationTerminal(_ context.Context, record capability.ProviderInvocationTerminalRecord) error {
+	s.terminal = record
+	return s.terminalErr
 }
 
 func (s *capturedStore) PreviousObservationValues(_ context.Context, _ domain.ID, _ domain.ID, capabilityName string) ([]string, error) {
@@ -130,6 +159,51 @@ func (c *inputCaptureCapability) Execute(_ context.Context, req capability.Reque
 	return capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Output: json.RawMessage(`{"endpoints":[],"classifications":[],"interesting_endpoints":[],"relationships":[]}`)}}, nil
 }
 
+type spoofedToolProvenanceCapability struct{ bogusAttemptID domain.ID }
+
+func (*spoofedToolProvenanceCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "test.spoofed-tool-provenance", Version: "1", Risk: policy.Low}
+}
+func (*spoofedToolProvenanceCapability) Validate(context.Context, capability.Request) error {
+	return nil
+}
+func (c *spoofedToolProvenanceCapability) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+	now := time.Now().UTC()
+	return capability.Result{
+		Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded"},
+		ToolRun: &domain.ToolRun{
+			ID:                domain.NewID(),
+			StepRunID:         req.Action.StepRunID,
+			Capability:        req.Action.Capability,
+			Provider:          "spoofing-provider",
+			StartedAt:         now,
+			ProviderAttemptID: &c.bogusAttemptID,
+		},
+	}, nil
+}
+
+func TestExecutionOverwritesProviderSuppliedToolRunAttemptIdentity(t *testing.T) {
+	registry := capability.NewRegistry()
+	bogusAttemptID := domain.NewID()
+	provider := &spoofedToolProvenanceCapability{bogusAttemptID: bogusAttemptID}
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{}
+	req := capability.Request{
+		Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: provider.Manifest().Name, Input: json.RawMessage(`{}`)},
+		Policy: policy.Policy{AllowedCapabilities: []string{provider.Manifest().Name}},
+		Scope:  allowedScope{},
+	}
+	result, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProviderAttemptID == nil || store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != *result.ProviderAttemptID || *store.tool.ProviderAttemptID != store.startID || *store.tool.ProviderAttemptID == bogusAttemptID {
+		t.Fatalf("tool provenance was not reclaimed: result=%#v tool=%#v start=%s bogus=%s", result, store.tool, store.startID, bogusAttemptID)
+	}
+}
+
 func TestClassifyExecutionLoadsPriorProbeEvidence(t *testing.T) {
 	registry := capability.NewRegistry()
 	classifier := &inputCaptureCapability{}
@@ -156,6 +230,9 @@ func TestClassifyExecutionLoadsPriorProbeEvidence(t *testing.T) {
 	}
 	if store.loadedFor != "probe.http" || len(captured.History) != 1 || captured.History[0]["status_code"] != float64(401) {
 		t.Fatalf("loaded_for=%q input=%s", store.loadedFor, classifier.input)
+	}
+	if store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != store.startID {
+		t.Fatalf("platform-synthesized provider ToolRun lost attempt identity: tool=%#v start=%s", store.tool, store.startID)
 	}
 }
 
@@ -368,6 +445,9 @@ func TestFailedProviderAttemptPersistsToolStepArtifactsAndOriginalError(t *testi
 	if store.tool == nil || store.tool.ExitCode == nil || *store.tool.ExitCode != 1 || store.tool.StepRunID != stepID {
 		t.Fatalf("failed tool not persisted: %#v", store.tool)
 	}
+	if store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != store.startID {
+		t.Fatalf("provider-supplied ToolRun lost attempt identity: tool=%#v start=%s", store.tool, store.startID)
+	}
 	if store.result.Status != "failed" || result.Action.Error == nil {
 		t.Fatalf("failed action result not persisted: %#v", store.result)
 	}
@@ -391,6 +471,45 @@ func TestFailedProviderAttemptPersistsToolStepArtifactsAndOriginalError(t *testi
 	}
 	if !stderrSeen || !normalizedSeen || len(store.artifacts) < 2 {
 		t.Fatalf("failure artifacts missing: requests=%#v persisted=%#v", artifacts.requests, store.artifacts)
+	}
+}
+
+func TestNoProviderStartFailurePersistsPlatformToolWithoutAttempt(t *testing.T) {
+	registry := capability.NewRegistry()
+	provider := &inputCaptureCapability{}
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	startCause := errors.New("provider start unavailable")
+	store := &capturedStore{startErr: startCause}
+	req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "classify.endpoint", Input: json.RawMessage(`{"historical_observations":[]}`)}, Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}}, Scope: allowedScope{}}
+	result, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req)
+	if !errors.Is(err, startCause) {
+		t.Fatalf("start failure not returned: %v", err)
+	}
+	if provider.input != nil {
+		t.Fatalf("provider callback ran with input %s", provider.input)
+	}
+	if result.ProviderAttemptID != nil || store.tool == nil || store.tool.ProviderAttemptID != nil || store.step.Status != domain.StepFailed {
+		t.Fatalf("no-provider persistence result=%#v tool=%#v step=%#v", result, store.tool, store.step)
+	}
+}
+
+func TestTerminalAuditDegradationDoesNotChangePersistedProviderSuccess(t *testing.T) {
+	registry := capability.NewRegistry()
+	provider := &inputCaptureCapability{}
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	terminalCause := errors.New("terminal audit unavailable")
+	store := &capturedStore{terminalErr: terminalCause}
+	req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "classify.endpoint", Input: json.RawMessage(`{"historical_observations":[]}`)}, Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}}, Scope: allowedScope{}}
+	result, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req)
+	if err != nil {
+		t.Fatalf("terminal audit degradation changed provider success: %v", err)
+	}
+	if !errors.Is(result.TerminalAuditError, terminalCause) || result.ProviderAttemptID == nil || store.step.Status != domain.StepSucceeded || store.result.Status != "succeeded" || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != *result.ProviderAttemptID {
+		t.Fatalf("degraded result=%#v step=%#v persisted=%#v tool=%#v", result, store.step, store.result, store.tool)
 	}
 }
 

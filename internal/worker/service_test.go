@@ -1,18 +1,24 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"net"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/execution"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
+	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
 )
 
 type workerCaptureCapability struct {
@@ -33,12 +39,35 @@ func (c *workerCaptureCapability) Execute(_ context.Context, req capability.Requ
 }
 
 type workerStore struct {
-	previous  []string
-	loadedFor string
-	step      domain.StepRun
-	tool      *domain.ToolRun
-	artifacts []domain.Artifact
-	result    domain.ActionResult
+	previous    []string
+	loadedFor   string
+	step        domain.StepRun
+	tool        *domain.ToolRun
+	artifacts   []domain.Artifact
+	result      domain.ActionResult
+	policyID    domain.ID
+	startID     domain.ID
+	startIDs    []domain.ID
+	start       capability.ProviderInvocationStartRecord
+	terminal    capability.ProviderInvocationTerminalRecord
+	terminalErr error
+}
+
+func (s *workerStore) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
+	if s.policyID == "" {
+		s.policyID = domain.NewID()
+	}
+	return s.policyID, nil
+}
+func (s *workerStore) RecordProviderInvocationStarted(_ context.Context, record capability.ProviderInvocationStartRecord) (domain.ID, error) {
+	s.start = record
+	s.startID = domain.NewID()
+	s.startIDs = append(s.startIDs, s.startID)
+	return s.startID, nil
+}
+func (s *workerStore) RecordProviderInvocationTerminal(_ context.Context, record capability.ProviderInvocationTerminalRecord) error {
+	s.terminal = record
+	return s.terminalErr
 }
 
 func (*workerStore) AlreadySucceeded(context.Context, string) (bool, error) { return false, nil }
@@ -105,7 +134,8 @@ func TestWorkerExecutionUsesSharedPipelineForHistoryAndArtifacts(t *testing.T) {
 	programID, taskID, runID, stepID := domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID()
 	input := json.RawMessage(`{"active":[],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan"}`)
 	service := &Service{Registry: registry, Results: store, Artifacts: artifacts}
-	delivery := queue.Delivery{Job: queue.Job{ProgramID: programID, Action: domain.ActionRequest{ID: domain.NewID(), TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "classify.endpoint", Input: input, IdempotencyKey: "job"}, Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}, ArtifactRetention: time.Hour}}}
+	jobID, actionID := domain.NewID(), domain.NewID()
+	delivery := queue.Delivery{MessageID: "redis-message-1", Job: queue.Job{ID: jobID, ProgramID: programID, Action: domain.ActionRequest{ID: actionID, TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "classify.endpoint", Input: input, IdempotencyKey: "job"}, Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}, ArtifactRetention: time.Hour}}}
 
 	result, err := service.executeJob(context.Background(), delivery, "platform", workerScope{}, nil)
 	if err != nil {
@@ -113,6 +143,9 @@ func TestWorkerExecutionUsesSharedPipelineForHistoryAndArtifacts(t *testing.T) {
 	}
 	if result.Action.Status != "succeeded" || store.step.Status != domain.StepSucceeded {
 		t.Fatalf("result=%#v step=%#v", result.Action, store.step)
+	}
+	if store.start.QueueJobID == nil || *store.start.QueueJobID != jobID || store.start.ActionRequestID != actionID || string(jobID) == delivery.MessageID {
+		t.Fatalf("queued provenance start=%#v message_id=%q", store.start, delivery.MessageID)
 	}
 	var captured struct {
 		History []map[string]any `json:"historical_observations"`
@@ -178,7 +211,7 @@ func TestLocalAndWorkerExecutionPipelineParityForSuccessAndRetryableFailure(t *t
 			workerStore, workerArtifacts := &workerStore{}, &workerArtifacts{}
 			localReq := capability.Request{Action: parityAction(taskID, runID, domain.NewID()), Provider: "resolved-provider", Policy: policy.Policy{AllowedCapabilities: []string{"parity.cap"}, ArtifactRetention: time.Hour}, Scope: workerScope{}}
 			localResult, localErr := (execution.Service{Registry: registry, Store: localStore, Artifacts: localArtifacts, ProgramID: programID}).Execute(context.Background(), localReq)
-			workerDelivery := queue.Delivery{Job: queue.Job{ProgramID: programID, Action: parityAction(taskID, runID, domain.NewID()), Policy: policy.Policy{AllowedCapabilities: []string{"parity.cap"}, ArtifactRetention: time.Hour}}}
+			workerDelivery := queue.Delivery{Job: queue.Job{ID: domain.NewID(), ProgramID: programID, Action: parityAction(taskID, runID, domain.NewID()), Policy: policy.Policy{AllowedCapabilities: []string{"parity.cap"}, ArtifactRetention: time.Hour}}}
 			workerResult, workerErr := (&Service{Registry: registry, Results: workerStore, Artifacts: workerArtifacts}).executeJob(context.Background(), workerDelivery, "resolved-provider", workerScope{}, nil)
 			if (localErr == nil) != (workerErr == nil) {
 				t.Fatalf("local err=%v worker err=%v", localErr, workerErr)
@@ -192,9 +225,91 @@ func TestLocalAndWorkerExecutionPipelineParityForSuccessAndRetryableFailure(t *t
 			if localStore.tool.Provider != "resolved-provider" || workerStore.tool.Provider != "resolved-provider" {
 				t.Fatalf("provider attribution local=%#v worker=%#v", localStore.tool, workerStore.tool)
 			}
+			if localStore.start.QueueJobID != nil || workerStore.start.QueueJobID == nil || *workerStore.start.QueueJobID != workerDelivery.Job.ID {
+				t.Fatalf("queue provenance local=%#v worker=%#v", localStore.start.QueueJobID, workerStore.start.QueueJobID)
+			}
 			assertArtifactRoles(t, "local", localStore, localArtifacts)
 			assertArtifactRoles(t, "worker", workerStore, workerArtifacts)
 		})
+	}
+}
+
+func TestWorkerRedeliveryRetainsJobAndActionButCreatesNewProviderAttempt(t *testing.T) {
+	registry := capability.NewRegistry()
+	if err := registry.Register(parityCapability{}); err != nil {
+		t.Fatal(err)
+	}
+	store := &workerStore{}
+	jobID, actionID := domain.NewID(), domain.NewID()
+	delivery := queue.Delivery{MessageID: "redis-delivery-a", Job: queue.Job{ID: jobID, ProgramID: domain.NewID(), Action: parityAction(domain.NewID(), domain.NewID(), domain.NewID()), Policy: policy.Policy{AllowedCapabilities: []string{"parity.cap"}}}}
+	delivery.Job.Action.ID = actionID
+	service := &Service{Registry: registry, Results: store, Artifacts: &workerArtifacts{}}
+	first, err := service.executeJob(context.Background(), delivery, "resolved-provider", workerScope{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery.MessageID = "redis-delivery-b"
+	second, err := service.executeJob(context.Background(), delivery, "resolved-provider", workerScope{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ProviderAttemptID == nil || second.ProviderAttemptID == nil || *first.ProviderAttemptID == *second.ProviderAttemptID {
+		t.Fatalf("provider attempts first=%v second=%v", first.ProviderAttemptID, second.ProviderAttemptID)
+	}
+	if len(store.startIDs) != 2 || store.start.QueueJobID == nil || *store.start.QueueJobID != jobID || store.start.ActionRequestID != actionID {
+		t.Fatalf("redelivery provenance starts=%#v last=%#v", store.startIDs, store.start)
+	}
+}
+
+func TestWorkerTerminalAuditWarningDoesNotLogInternalError(t *testing.T) {
+	const internalMarker = "SECRET_INTERNAL_DATABASE_DETAIL"
+	registry := capability.NewRegistry()
+	if err := registry.Register(parityCapability{}); err != nil {
+		t.Fatal(err)
+	}
+	store := &workerStore{terminalErr: errors.New(internalMarker)}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	client := redis.NewClient(&redis.Options{
+		Dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("synthetic queue unavailable")
+		},
+		MaxRetries: -1,
+	})
+	t.Cleanup(func() { _ = client.Close() })
+	delivery := queue.Delivery{
+		MessageID: "terminal-audit-log-test",
+		Job: queue.Job{
+			ID:            domain.NewID(),
+			ProgramID:     domain.NewID(),
+			Action:        parityAction(domain.NewID(), domain.NewID(), domain.NewID()),
+			Policy:        policy.Policy{AllowedCapabilities: []string{"parity.cap"}},
+			ScopeIncludes: []platformscope.Rule{{Protocol: "^https$", Host: `^x\.test$`, Port: "^443$", File: "^/.*", Enabled: true}},
+		},
+	}
+	service := &Service{
+		Queue:        queue.New(client, "terminal-audit-log-test", "worker", 0, time.Millisecond),
+		Registry:     registry,
+		Results:      store,
+		Artifacts:    &workerArtifacts{},
+		Logger:       logger,
+		LeaseTimeout: time.Hour,
+	}
+	if err := service.handle(context.Background(), delivery); err == nil {
+		t.Fatal("expected synthetic queue failure after warning")
+	}
+	output := logs.String()
+	if !strings.Contains(output, "provider invocation terminal audit failed") {
+		t.Fatalf("safe degradation warning missing: %s", output)
+	}
+	if store.startID == "" || !strings.Contains(output, string(store.startID)) {
+		t.Fatalf("safe provider attempt identity missing: start=%s output=%s", store.startID, output)
+	}
+	if strings.Contains(output, internalMarker) || strings.Contains(output, store.terminalErr.Error()) {
+		t.Fatalf("terminal audit error leaked into worker log: %s", output)
+	}
+	if store.step.Status != domain.StepSucceeded || store.result.Status != "succeeded" {
+		t.Fatalf("terminal audit degradation changed provider truth: step=%#v result=%#v", store.step, store.result)
 	}
 }
 

@@ -59,6 +59,12 @@ type Event struct {
 	StepID  string    `json:"step_id,omitempty"`
 	Message string    `json:"message"`
 }
+
+const (
+	providerTerminalAuditDegradedEvent   = "provider_terminal_audit_degraded"
+	providerTerminalAuditDegradedMessage = "provider terminal audit persistence degraded"
+)
+
 type Executor interface {
 	Execute(context.Context, capability.Request) (capability.Result, error)
 }
@@ -518,6 +524,9 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 			outcome := &outcomes[index]
 			ss := outcome.State
 			state.Steps[outcome.Definition.ID] = &ss
+			for range outcome.TerminalAuditDegradations {
+				e.event(state, providerTerminalAuditDegradedEvent, outcome.Definition.ID, providerTerminalAuditDegradedMessage)
+			}
 			if outcome.Err == nil {
 				ss.Run.Status = domain.StepSucceeded
 				ss.Run.Output = outcome.Result.Action.Output
@@ -572,11 +581,12 @@ type stepPlan struct {
 }
 
 type stepOutcome struct {
-	Definition     Step
-	State          StepState
-	Result         capability.Result
-	Err            error
-	PrimaryFailure bool
+	Definition                Step
+	State                     StepState
+	Result                    capability.Result
+	Err                       error
+	PrimaryFailure            bool
+	TerminalAuditDegradations int
 }
 
 func (e *Engine) executeWave(ctx context.Context, task domain.Task, runID domain.ID, plans []stepPlan) []stepOutcome {
@@ -618,7 +628,7 @@ func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain
 	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		outcome.State.Run.AttemptCount = attempt
-		action := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: outcome.State.Run.ID, RequestedBy: "workflow", Capability: plan.Definition.Capability, Reason: "deterministic workflow step " + plan.Definition.ID, Input: plan.Input, IdempotencyKey: outcome.State.Run.IdempotencyKey}
+		action := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: outcome.State.Run.ID, RequestedBy: "workflow", Capability: plan.Definition.Capability, Reason: "deterministic workflow step " + plan.Definition.ID, Input: plan.Input, IdempotencyKey: outcome.State.Run.IdempotencyKey, StepAttempt: attempt}
 		attemptCtx := ctx
 		cancelAttempt := func() {}
 		if plan.Definition.Timeout > 0 {
@@ -626,6 +636,9 @@ func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain
 		}
 		outcome.Result, outcome.Err = e.Executor.Execute(attemptCtx, capability.Request{Action: action, Provider: plan.Provider, Approved: plan.Approved, Policy: policy.ParallelShare(e.Policy, plan.ParallelShare), Scope: e.Scope})
 		cancelAttempt()
+		if outcome.Result.TerminalAuditError != nil {
+			outcome.TerminalAuditDegradations++
+		}
 
 		if outcome.Err != nil && ctx.Err() != nil {
 			outcome.Err = context.Cause(ctx)
