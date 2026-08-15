@@ -1,4 +1,4 @@
-ARG GO_IMAGE=golang:1.25.7-alpine
+ARG GO_IMAGE=golang:1.25.13-alpine
 ARG PROVIDER_GO_IMAGE=golang:1.26-alpine
 ARG NUCLEI_IMAGE=projectdiscovery/nuclei:v3.10.0
 ARG NUCLEI_VERSION=v3.10.0

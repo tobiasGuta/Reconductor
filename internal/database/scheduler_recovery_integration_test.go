@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
@@ -660,10 +661,14 @@ func TestStaleScheduledExecutionReconciliationIdempotencyConcurrencyAndLeaseSafe
 		expireRecoveryLease(t, env, second.execution.ID, 1)
 
 		installRecoveryTaskAdvisoryBarrier(t, env)
-		releaseFirst := holdRecoveryTaskAdvisoryLock(t, env, first.task.ID)
+		observer := openRecoveryTaskObserver(t, env)
+		firstHolderPID, releaseFirst := holdRecoveryTaskAdvisoryLock(t, env, first.task.ID)
 		defer releaseFirst()
-		releaseSecond := holdRecoveryTaskAdvisoryLock(t, env, second.task.ID)
+		secondHolderPID, releaseSecond := holdRecoveryTaskAdvisoryLock(t, env, second.task.ID)
 		defer releaseSecond()
+		if firstHolderPID == secondHolderPID {
+			t.Fatalf("advisory locks share holder backend %d", firstHolderPID)
+		}
 		workerCtx, cancel := context.WithTimeout(env.ctx, 8*time.Second)
 		defer cancel()
 		start := make(chan struct{})
@@ -679,7 +684,7 @@ func TestStaleScheduledExecutionReconciliationIdempotencyConcurrencyAndLeaseSafe
 			}()
 		}
 		close(start)
-		waitForRecoveryTaskWaiters(t, workerCtx, env, 2)
+		waitForRecoveryTaskWaiters(t, workerCtx, observer, []int32{firstHolderPID, secondHolderPID})
 		releaseFirst()
 		releaseSecond()
 		for range 2 {
@@ -975,14 +980,28 @@ func installRecoveryTaskAdvisoryBarrier(t *testing.T, env recoveryTestEnvironmen
 	})
 }
 
-func holdRecoveryTaskAdvisoryLock(t *testing.T, env recoveryTestEnvironment, taskID domain.ID) func() {
+func openRecoveryTaskObserver(t *testing.T, env recoveryTestEnvironment) *pgx.Conn {
+	t.Helper()
+	conn, err := pgx.ConnectConfig(env.ctx, env.store.Pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Errorf("close recovery task observer: %v", err)
+		}
+	})
+	return conn
+}
+
+func holdRecoveryTaskAdvisoryLock(t *testing.T, env recoveryTestEnvironment, taskID domain.ID) (int32, func()) {
 	t.Helper()
 	conn, err := env.store.Pool.Acquire(env.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var key int32
-	if err := conn.QueryRow(env.ctx, `SELECT hashtext($1::text)`, taskID).Scan(&key); err != nil {
+	var key, holderPID int32
+	if err := conn.QueryRow(env.ctx, `SELECT hashtext($1::text),pg_backend_pid()`, taskID).Scan(&key, &holderPID); err != nil {
 		conn.Release()
 		t.Fatal(err)
 	}
@@ -991,7 +1010,7 @@ func holdRecoveryTaskAdvisoryLock(t *testing.T, env recoveryTestEnvironment, tas
 		t.Fatal(err)
 	}
 	released := false
-	return func() {
+	return holderPID, func() {
 		if released {
 			return
 		}
@@ -1003,25 +1022,26 @@ func holdRecoveryTaskAdvisoryLock(t *testing.T, env recoveryTestEnvironment, tas
 	}
 }
 
-func waitForRecoveryTaskWaiters(t *testing.T, ctx context.Context, env recoveryTestEnvironment, want int) {
+func waitForRecoveryTaskWaiters(t *testing.T, ctx context.Context, observer *pgx.Conn, holderPIDs []int32) {
 	t.Helper()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		var count int
-		if err := env.store.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE datname=current_database()
-			  AND wait_event_type='Lock'
-			  AND position('UPDATE tasks' in query)>0`).Scan(&count); err != nil {
+		if err := observer.QueryRow(ctx, `SELECT count(DISTINCT blocker_pid)
+			FROM pg_stat_activity activity
+			CROSS JOIN LATERAL unnest(pg_blocking_pids(activity.pid)) AS blockers(blocker_pid)
+			WHERE activity.datname=current_database()
+			  AND blocker_pid=ANY($1::int[])`, holderPIDs).Scan(&count); err != nil {
 			t.Fatal(err)
 		}
-		if count >= want {
+		if count == len(holderPIDs) {
 			return
 		}
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
-			t.Fatalf("saw %d of %d concurrently blocked recovery workers: %v", count, want, ctx.Err())
+			t.Fatalf("saw waiters for %d of %d advisory-lock holders: %v", count, len(holderPIDs), ctx.Err())
 		}
 	}
 }
