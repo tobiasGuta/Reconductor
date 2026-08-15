@@ -45,6 +45,8 @@ type workerStore struct {
 	tool        *domain.ToolRun
 	artifacts   []domain.Artifact
 	result      domain.ActionResult
+	admission   *capability.ResultAdmissionProvenance
+	admissions  []*capability.ResultAdmissionProvenance
 	policyID    domain.ID
 	startID     domain.ID
 	startIDs    []domain.ID
@@ -75,11 +77,13 @@ func (s *workerStore) PreviousObservationValues(_ context.Context, _ domain.ID, 
 	s.loadedFor = capabilityName
 	return append([]string(nil), s.previous...), nil
 }
-func (s *workerStore) PersistResult(_ context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult) error {
+func (s *workerStore) PersistResult(_ context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) error {
 	s.step = step
 	s.tool = tool
 	s.artifacts = append([]domain.Artifact(nil), artifacts...)
 	s.result = result
+	s.admission = admission
+	s.admissions = append(s.admissions, admission)
 	return nil
 }
 
@@ -97,7 +101,8 @@ type workerScope struct{}
 func (workerScope) Allows(string) bool { return true }
 
 type parityCapability struct {
-	fail bool
+	fail             bool
+	claimedAttemptID *domain.ID
 }
 
 func (parityCapability) Manifest() capability.Manifest {
@@ -108,6 +113,10 @@ func (c parityCapability) Execute(_ context.Context, req capability.Request) (ca
 	now := time.Now().UTC()
 	exitCode := 0
 	tool := &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: req.Provider, ToolVersion: "test", SanitizedArguments: json.RawMessage(`{"safe":true}`), ExecutionEnvironment: json.RawMessage(`{"kind":"test"}`), StartedAt: now, CompletedAt: &now, ExitCode: &exitCode}
+	if c.claimedAttemptID != nil {
+		claimed := *c.claimedAttemptID
+		tool.ProviderAttemptID = &claimed
+	}
 	result := capability.Result{
 		Action:    domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "parity ok", Output: json.RawMessage(`{"lines":["https://x.test/"]}`)},
 		ToolRun:   tool,
@@ -236,7 +245,8 @@ func TestLocalAndWorkerExecutionPipelineParityForSuccessAndRetryableFailure(t *t
 
 func TestWorkerRedeliveryRetainsJobAndActionButCreatesNewProviderAttempt(t *testing.T) {
 	registry := capability.NewRegistry()
-	if err := registry.Register(parityCapability{}); err != nil {
+	provider := &parityCapability{}
+	if err := registry.Register(provider); err != nil {
 		t.Fatal(err)
 	}
 	store := &workerStore{}
@@ -248,6 +258,7 @@ func TestWorkerRedeliveryRetainsJobAndActionButCreatesNewProviderAttempt(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	provider.claimedAttemptID = first.ProviderAttemptID
 	delivery.MessageID = "redis-delivery-b"
 	second, err := service.executeJob(context.Background(), delivery, "resolved-provider", workerScope{}, nil)
 	if err != nil {
@@ -258,6 +269,12 @@ func TestWorkerRedeliveryRetainsJobAndActionButCreatesNewProviderAttempt(t *test
 	}
 	if len(store.startIDs) != 2 || store.start.QueueJobID == nil || *store.start.QueueJobID != jobID || store.start.ActionRequestID != actionID {
 		t.Fatalf("redelivery provenance starts=%#v last=%#v", store.startIDs, store.start)
+	}
+	if len(store.admissions) != 2 || store.admissions[0] == nil || store.admissions[1] == nil || store.admissions[0].ProviderAttemptID != *first.ProviderAttemptID || store.admissions[1].ProviderAttemptID != *second.ProviderAttemptID || store.admissions[0].ActionRequestID != actionID || store.admissions[1].ActionRequestID != actionID || store.admissions[0].QueueJobID == nil || store.admissions[1].QueueJobID == nil || *store.admissions[0].QueueJobID != jobID || *store.admissions[1].QueueJobID != jobID {
+		t.Fatalf("redelivery admissions=%#v first=%#v second=%#v", store.admissions, first.ProviderAttemptID, second.ProviderAttemptID)
+	}
+	if store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != *second.ProviderAttemptID || *store.tool.ProviderAttemptID == *first.ProviderAttemptID {
+		t.Fatalf("P1 was not displaced by exact redelivery P2: tool=%#v first=%v second=%v", store.tool, first.ProviderAttemptID, second.ProviderAttemptID)
 	}
 }
 

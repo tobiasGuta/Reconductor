@@ -159,6 +159,41 @@ func (c *boundaryCapability) Execute(ctx context.Context, _ Request) (Result, er
 	return c.execute(ctx)
 }
 
+type queueMutatingCapability struct {
+	validateMutation domain.ID
+	executeMutation  domain.ID
+	validateCalled   bool
+	executeCalled    bool
+	validateSaw      *domain.ID
+	executeSaw       *domain.ID
+	validatePointer  *domain.ID
+	executePointer   *domain.ID
+}
+
+func (*queueMutatingCapability) Manifest() Manifest {
+	return Manifest{Name: "queue-mutator", Version: "1", Risk: policy.Low}
+}
+
+func (c *queueMutatingCapability) Validate(_ context.Context, req Request) error {
+	c.validateCalled = true
+	c.validatePointer = req.QueueJobID
+	c.validateSaw = copyIDPointer(req.QueueJobID)
+	if req.QueueJobID != nil {
+		*req.QueueJobID = c.validateMutation
+	}
+	return nil
+}
+
+func (c *queueMutatingCapability) Execute(_ context.Context, req Request) (Result, error) {
+	c.executeCalled = true
+	c.executePointer = req.QueueJobID
+	c.executeSaw = copyIDPointer(req.QueueJobID)
+	if req.QueueJobID != nil {
+		*req.QueueJobID = c.executeMutation
+	}
+	return Result{Action: domain.ActionResult{Status: "succeeded"}}, nil
+}
+
 func TestProviderInvocationBoundaryGatesAndPropagatesExactIDs(t *testing.T) {
 	provider := &boundaryCapability{execute: func(context.Context) (Result, error) {
 		return Result{Action: domain.ActionResult{Status: "succeeded"}}, nil
@@ -186,6 +221,91 @@ func TestProviderInvocationBoundaryGatesAndPropagatesExactIDs(t *testing.T) {
 	}
 	if result.ProviderAttemptID == nil || *result.ProviderAttemptID != invocations.startIDs[0] || len(invocations.terminals) != 1 || invocations.terminals[0].ProviderAttemptID != invocations.startIDs[0] || invocations.terminals[0].Outcome != ProviderInvocationSucceeded {
 		t.Fatalf("result=%#v terminals=%#v", result, invocations.terminals)
+	}
+}
+
+func TestRegistrySnapshotsQueueJobIDAcrossProviderCallbacks(t *testing.T) {
+	originalQueueJobID, validateMutation, executeMutation := domain.NewID(), domain.NewID(), domain.NewID()
+	wantQueueJobID := originalQueueJobID
+	provider := &queueMutatingCapability{validateMutation: validateMutation, executeMutation: executeMutation}
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	decisions := &capturedDecision{}
+	invocations := &capturedInvocations{}
+	result, err := registry.Execute(context.Background(), Request{
+		Action:             domain.ActionRequest{ID: domain.NewID(), Capability: "queue-mutator", Input: json.RawMessage(`{}`)},
+		QueueJobID:         &originalQueueJobID,
+		Policy:             policy.Policy{AllowedCapabilities: []string{"queue-mutator"}},
+		Scope:              allowAllScope{},
+		DecisionRecorder:   decisions,
+		InvocationRecorder: invocations,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !provider.validateCalled || provider.validateSaw == nil || *provider.validateSaw != wantQueueJobID {
+		t.Fatalf("Validate queue identity=%v want %s", provider.validateSaw, wantQueueJobID)
+	}
+	if !provider.executeCalled || provider.executeSaw == nil || *provider.executeSaw != wantQueueJobID {
+		t.Fatalf("Execute queue identity=%v want %s", provider.executeSaw, wantQueueJobID)
+	}
+	if originalQueueJobID != wantQueueJobID {
+		t.Fatalf("provider mutation escaped into caller-owned queue identity: got %s want %s", originalQueueJobID, wantQueueJobID)
+	}
+	if len(decisions.records) != 1 || decisions.records[0].QueueJobID == nil || *decisions.records[0].QueueJobID != wantQueueJobID {
+		t.Fatalf("execution authorization queue identity=%#v want %s", decisions.records, wantQueueJobID)
+	}
+	if len(invocations.starts) != 1 || invocations.starts[0].QueueJobID == nil || *invocations.starts[0].QueueJobID != wantQueueJobID {
+		t.Fatalf("provider start queue identity=%#v want %s", invocations.starts, wantQueueJobID)
+	}
+	if result.AdmissionProvenance == nil || result.AdmissionProvenance.QueueJobID == nil || *result.AdmissionProvenance.QueueJobID != wantQueueJobID {
+		t.Fatalf("admission queue identity=%#v want %s", result.AdmissionProvenance, wantQueueJobID)
+	}
+	for name, authoritative := range map[string]*domain.ID{
+		"execution authorization": decisions.records[0].QueueJobID,
+		"provider start":          invocations.starts[0].QueueJobID,
+		"admission":               result.AdmissionProvenance.QueueJobID,
+	} {
+		if authoritative == provider.validatePointer || authoritative == provider.executePointer {
+			t.Fatalf("provider received pointer alias to %s queue identity", name)
+		}
+	}
+	if provider.validatePointer == provider.executePointer {
+		t.Fatal("Validate and Execute shared a queue identity pointer")
+	}
+}
+
+func TestRegistryPreservesNilQueueJobIDAcrossProviderCallbacks(t *testing.T) {
+	provider := &queueMutatingCapability{validateMutation: domain.NewID(), executeMutation: domain.NewID()}
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	decisions := &capturedDecision{}
+	invocations := &capturedInvocations{}
+	result, err := registry.Execute(context.Background(), Request{
+		Action:             domain.ActionRequest{ID: domain.NewID(), Capability: "queue-mutator", Input: json.RawMessage(`{}`)},
+		Policy:             policy.Policy{AllowedCapabilities: []string{"queue-mutator"}},
+		Scope:              allowAllScope{},
+		DecisionRecorder:   decisions,
+		InvocationRecorder: invocations,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !provider.validateCalled || !provider.executeCalled || provider.validatePointer != nil || provider.executePointer != nil || provider.validateSaw != nil || provider.executeSaw != nil {
+		t.Fatalf("provider callbacks received synthesized queue identity: %#v", provider)
+	}
+	if len(decisions.records) != 1 || decisions.records[0].QueueJobID != nil {
+		t.Fatalf("execution authorization synthesized queue identity: %#v", decisions.records)
+	}
+	if len(invocations.starts) != 1 || invocations.starts[0].QueueJobID != nil {
+		t.Fatalf("provider start synthesized queue identity: %#v", invocations.starts)
+	}
+	if result.AdmissionProvenance == nil || result.AdmissionProvenance.QueueJobID != nil {
+		t.Fatalf("admission queue identity=%#v want nil", result.AdmissionProvenance)
 	}
 }
 
@@ -228,9 +348,12 @@ func TestValidationAndStartFailuresPreventProviderCallback(t *testing.T) {
 				t.Fatal(err)
 			}
 			invocations := &capturedInvocations{startErr: test.startErr}
-			_, err := registry.Execute(context.Background(), Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "boundary", Input: json.RawMessage(`{}`)}, Policy: policy.Policy{AllowedCapabilities: []string{"boundary"}}, Scope: allowAllScope{}, DecisionRecorder: &capturedDecision{}, InvocationRecorder: invocations})
+			result, err := registry.Execute(context.Background(), Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "boundary", Input: json.RawMessage(`{}`)}, Policy: policy.Policy{AllowedCapabilities: []string{"boundary"}}, Scope: allowAllScope{}, DecisionRecorder: &capturedDecision{}, InvocationRecorder: invocations})
 			if err == nil || provider.called {
 				t.Fatalf("error=%v provider_called=%v", err, provider.called)
+			}
+			if result.ProviderAttemptID != nil || result.AdmissionProvenance != nil {
+				t.Fatalf("pre-provider failure fabricated admission provenance: %#v", result)
 			}
 			if test.validateErr != nil && len(invocations.starts) != 0 {
 				t.Fatalf("provider start was reached after validation failure: %#v", invocations.starts)
@@ -337,11 +460,20 @@ func (c cancellationTestContext) cancel() { c.cancelFunc() }
 
 func TestRegistryOwnsProviderProvenanceMetadata(t *testing.T) {
 	bogusAttemptID := domain.NewID()
+	bogusRequestID := domain.NewID()
+	bogusAuthorizationID := domain.NewID()
 	bogusTerminalErr := errors.New("provider fabricated terminal degradation")
 	provider := &boundaryCapability{execute: func(context.Context) (Result, error) {
 		return Result{
-			Action:             domain.ActionResult{Status: "succeeded", Summary: "provider truth"},
-			ProviderAttemptID:  &bogusAttemptID,
+			Action:            domain.ActionResult{RequestID: bogusRequestID, Status: "succeeded", Summary: "provider truth"},
+			ToolRun:           &domain.ToolRun{Provider: "provider-controlled"},
+			ProviderAttemptID: &bogusAttemptID,
+			AdmissionProvenance: &ResultAdmissionProvenance{
+				ProviderAttemptID:             bogusAttemptID,
+				ActionRequestID:               bogusRequestID,
+				ExecutionAuthorizationEventID: bogusAuthorizationID,
+				Provider:                      "provider-controlled",
+			},
 			TerminalAuditError: bogusTerminalErr,
 		}, nil
 	}}
@@ -358,16 +490,24 @@ func TestRegistryOwnsProviderProvenanceMetadata(t *testing.T) {
 		{name: "actual terminal audit failure", terminalErr: errors.New("actual terminal persistence failure")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			actionID, queueJobID := domain.NewID(), domain.NewID()
+			decisions := &capturedDecision{}
 			invocations := &capturedInvocations{terminalErr: test.terminalErr}
-			result, err := registry.Execute(context.Background(), Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "boundary", Input: json.RawMessage(`{}`)}, Policy: policy.Policy{AllowedCapabilities: []string{"boundary"}}, Scope: allowAllScope{}, DecisionRecorder: &capturedDecision{}, InvocationRecorder: invocations})
+			result, err := registry.Execute(context.Background(), Request{Action: domain.ActionRequest{ID: actionID, Capability: "boundary", StepAttempt: 2, Input: json.RawMessage(`{}`)}, QueueJobID: &queueJobID, Policy: policy.Policy{AllowedCapabilities: []string{"boundary"}}, Scope: allowAllScope{}, DecisionRecorder: decisions, InvocationRecorder: invocations})
 			if err != nil {
 				t.Fatal(err)
 			}
 			if result.ProviderAttemptID == nil || *result.ProviderAttemptID != invocations.startIDs[0] || *result.ProviderAttemptID == bogusAttemptID {
 				t.Fatalf("provider attempt metadata was not reclaimed: result=%#v starts=%#v", result, invocations.startIDs)
 			}
-			if result.Action.Status != "succeeded" || result.Action.Summary != "provider truth" {
+			if result.Action.RequestID != actionID || result.Action.RequestID == bogusRequestID || result.Action.Status != "succeeded" || result.Action.Summary != "provider truth" {
 				t.Fatalf("provider result truth changed: %#v", result.Action)
+			}
+			if result.ToolRun == nil || result.ToolRun.Provider != "boundary" {
+				t.Fatalf("resolved provider metadata was not reclaimed: %#v", result.ToolRun)
+			}
+			if result.AdmissionProvenance == nil || result.AdmissionProvenance.ProviderAttemptID != invocations.startIDs[0] || result.AdmissionProvenance.ActionRequestID != actionID || result.AdmissionProvenance.StepAttempt != 2 || result.AdmissionProvenance.QueueJobID == nil || *result.AdmissionProvenance.QueueJobID != queueJobID || result.AdmissionProvenance.ExecutionAuthorizationEventID != decisions.ids[0] || result.AdmissionProvenance.Provider != "boundary" {
+				t.Fatalf("trusted admission provenance was not reclaimed: result=%#v decisions=%#v starts=%#v", result.AdmissionProvenance, decisions.ids, invocations.startIDs)
 			}
 			if test.terminalErr == nil && result.TerminalAuditError != nil {
 				t.Fatalf("provider-supplied terminal error survived: %v", result.TerminalAuditError)
@@ -382,15 +522,19 @@ func TestRegistryOwnsProviderProvenanceMetadata(t *testing.T) {
 func TestResultProvenanceMetadataIsNotSerialized(t *testing.T) {
 	attemptID := domain.NewID()
 	result := Result{
-		Action:             domain.ActionResult{Status: "succeeded"},
-		ProviderAttemptID:  &attemptID,
+		Action:            domain.ActionResult{Status: "succeeded"},
+		ProviderAttemptID: &attemptID,
+		AdmissionProvenance: &ResultAdmissionProvenance{
+			ProviderAttemptID: attemptID,
+			Provider:          "internal-provider-secret",
+		},
 		TerminalAuditError: errors.New("internal database detail"),
 	}
 	serialized, err := json.Marshal(result)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(serialized), string(attemptID)) || strings.Contains(string(serialized), "internal database detail") || strings.Contains(string(serialized), "ProviderAttemptID") || strings.Contains(string(serialized), "TerminalAuditError") {
+	if strings.Contains(string(serialized), string(attemptID)) || strings.Contains(string(serialized), "internal-provider-secret") || strings.Contains(string(serialized), "internal database detail") || strings.Contains(string(serialized), "ProviderAttemptID") || strings.Contains(string(serialized), "AdmissionProvenance") || strings.Contains(string(serialized), "TerminalAuditError") {
 		t.Fatalf("Registry provenance metadata leaked into Result JSON: %s", serialized)
 	}
 }

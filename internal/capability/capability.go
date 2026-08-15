@@ -96,13 +96,22 @@ type ProviderInvocationRecorder interface {
 	RecordProviderInvocationStarted(context.Context, ProviderInvocationStartRecord) (domain.ID, error)
 	RecordProviderInvocationTerminal(context.Context, ProviderInvocationTerminalRecord) error
 }
+type ResultAdmissionProvenance struct {
+	ProviderAttemptID             domain.ID
+	ActionRequestID               domain.ID
+	StepAttempt                   int
+	QueueJobID                    *domain.ID
+	ExecutionAuthorizationEventID domain.ID
+	Provider                      string
+}
 type Result struct {
-	Action             domain.ActionResult `json:"action"`
-	ToolRun            *domain.ToolRun     `json:"tool_run,omitempty"`
-	RawStdout          []byte              `json:"-"`
-	RawStderr          []byte              `json:"-"`
-	ProviderAttemptID  *domain.ID          `json:"-"`
-	TerminalAuditError error               `json:"-"`
+	Action              domain.ActionResult        `json:"action"`
+	ToolRun             *domain.ToolRun            `json:"tool_run,omitempty"`
+	RawStdout           []byte                     `json:"-"`
+	RawStderr           []byte                     `json:"-"`
+	ProviderAttemptID   *domain.ID                 `json:"-"`
+	AdmissionProvenance *ResultAdmissionProvenance `json:"-"`
+	TerminalAuditError  error                      `json:"-"`
 }
 type Scope interface{ Allows(string) bool }
 type Capability interface {
@@ -205,15 +214,20 @@ func (r *Registry) Names() []string {
 	return out
 }
 func (r *Registry) Execute(ctx context.Context, req Request) (Result, error) {
+	trustedQueueJobID := copyIDPointer(req.QueueJobID)
 	req.Provider = r.providerName(req.Action.Capability, req.Provider)
 	if req.PolicyPhase != "" && req.PolicyPhase != "execution" {
 		return Result{}, fmt.Errorf("provider execution requires execution policy phase")
 	}
-	c, authorizationEventID, err := r.authorize(ctx, req, true)
+	authorizationReq := req
+	authorizationReq.QueueJobID = copyIDPointer(trustedQueueJobID)
+	c, authorizationEventID, err := r.authorize(ctx, authorizationReq, true)
 	if err != nil {
 		return Result{}, err
 	}
-	if err := c.Validate(ctx, req); err != nil {
+	validationReq := req
+	validationReq.QueueJobID = copyIDPointer(trustedQueueJobID)
+	if err := c.Validate(ctx, validationReq); err != nil {
 		return Result{}, err
 	}
 	if req.InvocationRecorder == nil {
@@ -226,7 +240,7 @@ func (r *Registry) Execute(ctx context.Context, req Request) (Result, error) {
 		StepRunID:                     req.Action.StepRunID,
 		ActionRequestID:               req.Action.ID,
 		StepAttempt:                   req.Action.StepAttempt,
-		QueueJobID:                    req.QueueJobID,
+		QueueJobID:                    copyIDPointer(trustedQueueJobID),
 		ExecutionAuthorizationEventID: authorizationEventID,
 		Capability:                    req.Action.Capability,
 		Provider:                      req.Provider,
@@ -238,8 +252,22 @@ func (r *Registry) Execute(ctx context.Context, req Request) (Result, error) {
 	if attemptID == "" {
 		return Result{}, fmt.Errorf("persist provider invocation start: durable event id is required")
 	}
-	result, providerErr := c.Execute(ctx, req)
+	executionReq := req
+	executionReq.QueueJobID = copyIDPointer(trustedQueueJobID)
+	result, providerErr := c.Execute(ctx, executionReq)
+	result.Action.RequestID = req.Action.ID
+	if result.ToolRun != nil {
+		result.ToolRun.Provider = req.Provider
+	}
 	result.ProviderAttemptID = &attemptID
+	result.AdmissionProvenance = &ResultAdmissionProvenance{
+		ProviderAttemptID:             attemptID,
+		ActionRequestID:               req.Action.ID,
+		StepAttempt:                   req.Action.StepAttempt,
+		QueueJobID:                    copyIDPointer(trustedQueueJobID),
+		ExecutionAuthorizationEventID: authorizationEventID,
+		Provider:                      req.Provider,
+	}
 	result.TerminalAuditError = nil
 	terminalErr := req.InvocationRecorder.RecordProviderInvocationTerminal(ctx, ProviderInvocationTerminalRecord{
 		ProviderAttemptID: attemptID,
@@ -274,11 +302,24 @@ func (r *Registry) providerName(capabilityName, requested string) string {
 
 // Validate authorizes and validates an action without executing its provider.
 func (r *Registry) Validate(ctx context.Context, req Request) error {
-	c, _, err := r.authorize(ctx, req, false)
+	trustedQueueJobID := copyIDPointer(req.QueueJobID)
+	authorizationReq := req
+	authorizationReq.QueueJobID = copyIDPointer(trustedQueueJobID)
+	c, _, err := r.authorize(ctx, authorizationReq, false)
 	if err != nil {
 		return err
 	}
-	return c.Validate(ctx, req)
+	validationReq := req
+	validationReq.QueueJobID = copyIDPointer(trustedQueueJobID)
+	return c.Validate(ctx, validationReq)
+}
+
+func copyIDPointer(id *domain.ID) *domain.ID {
+	if id == nil {
+		return nil
+	}
+	value := *id
+	return &value
 }
 
 func (r *Registry) authorize(ctx context.Context, req Request, requireDecisionRecord bool) (Capability, domain.ID, error) {

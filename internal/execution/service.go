@@ -25,7 +25,7 @@ type Service struct {
 }
 type ResultStore interface {
 	PreviousObservationValues(context.Context, domain.ID, domain.ID, string) ([]string, error)
-	PersistResult(context.Context, domain.ID, domain.StepRun, *domain.ToolRun, []domain.Artifact, domain.ActionResult) error
+	PersistResult(context.Context, domain.ID, domain.StepRun, *domain.ToolRun, []domain.Artifact, domain.ActionResult, *capability.ResultAdmissionProvenance) error
 }
 
 func (s Service) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
@@ -94,10 +94,14 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 	if tool == nil {
 		now := time.Now().UTC()
 		version := "1"
+		provider := "platform"
 		if implementation, ok := s.Registry.Get(req.Action.Capability); ok {
 			version = implementation.Manifest().Version
 		}
-		tool = &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: "platform", ToolVersion: version, SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"in-process"}`), StartedAt: now, CompletedAt: &now}
+		if result.AdmissionProvenance != nil {
+			provider = result.AdmissionProvenance.Provider
+		}
+		tool = &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: provider, ToolVersion: version, SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"in-process"}`), StartedAt: now, CompletedAt: &now}
 	}
 	if result.ProviderAttemptID != nil {
 		attemptID := *result.ProviderAttemptID
@@ -164,7 +168,7 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 	}
 	if s.Store == nil {
 		persistenceErr = errors.Join(persistenceErr, fmt.Errorf("result store is required"))
-	} else if err := s.Store.PersistResult(persistCtx, s.ProgramID, step, tool, artifacts, result.Action); err != nil {
+	} else if err := s.Store.PersistResult(persistCtx, s.ProgramID, step, tool, artifacts, result.Action, result.AdmissionProvenance); err != nil {
 		persistenceErr = errors.Join(persistenceErr, err)
 	}
 	if persistenceErr != nil {

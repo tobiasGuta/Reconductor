@@ -35,6 +35,7 @@ type capturedStore struct {
 	tool        *domain.ToolRun
 	artifacts   []domain.Artifact
 	result      domain.ActionResult
+	admission   *capability.ResultAdmissionProvenance
 	err         error
 	previous    []string
 	loadedFor   string
@@ -202,6 +203,9 @@ func TestExecutionOverwritesProviderSuppliedToolRunAttemptIdentity(t *testing.T)
 	if result.ProviderAttemptID == nil || store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != *result.ProviderAttemptID || *store.tool.ProviderAttemptID != store.startID || *store.tool.ProviderAttemptID == bogusAttemptID {
 		t.Fatalf("tool provenance was not reclaimed: result=%#v tool=%#v start=%s bogus=%s", result, store.tool, store.startID, bogusAttemptID)
 	}
+	if store.admission == nil || store.admission.ProviderAttemptID != store.startID || store.admission.ActionRequestID != req.Action.ID || store.admission.ExecutionAuthorizationEventID != store.policyID || store.admission.Provider != provider.Manifest().Name || store.tool.Provider != provider.Manifest().Name || store.result.RequestID != req.Action.ID {
+		t.Fatalf("exact admission metadata was not delivered to Store: admission=%#v tool=%#v result=%#v", store.admission, store.tool, store.result)
+	}
 }
 
 func TestClassifyExecutionLoadsPriorProbeEvidence(t *testing.T) {
@@ -231,7 +235,7 @@ func TestClassifyExecutionLoadsPriorProbeEvidence(t *testing.T) {
 	if store.loadedFor != "probe.http" || len(captured.History) != 1 || captured.History[0]["status_code"] != float64(401) {
 		t.Fatalf("loaded_for=%q input=%s", store.loadedFor, classifier.input)
 	}
-	if store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != store.startID {
+	if store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != store.startID || store.tool.Provider != "classify.endpoint" || store.admission == nil || store.admission.Provider != "classify.endpoint" {
 		t.Fatalf("platform-synthesized provider ToolRun lost attempt identity: tool=%#v start=%s", store.tool, store.startID)
 	}
 }
@@ -386,8 +390,9 @@ func TestCompareAssetsExecutionDoesNotReplaceInvalidPreviousInput(t *testing.T) 
 	}
 }
 
-func (s *capturedStore) PersistResult(_ context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult) error {
+func (s *capturedStore) PersistResult(_ context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) error {
 	s.called, s.step, s.tool, s.artifacts, s.result = true, step, tool, append([]domain.Artifact(nil), artifacts...), result
+	s.admission = admission
 	return s.err
 }
 
@@ -490,7 +495,7 @@ func TestNoProviderStartFailurePersistsPlatformToolWithoutAttempt(t *testing.T) 
 	if provider.input != nil {
 		t.Fatalf("provider callback ran with input %s", provider.input)
 	}
-	if result.ProviderAttemptID != nil || store.tool == nil || store.tool.ProviderAttemptID != nil || store.step.Status != domain.StepFailed {
+	if result.ProviderAttemptID != nil || result.AdmissionProvenance != nil || store.admission != nil || store.tool == nil || store.tool.ProviderAttemptID != nil || store.tool.Provider != "platform" || store.step.Status != domain.StepFailed {
 		t.Fatalf("no-provider persistence result=%#v tool=%#v step=%#v", result, store.tool, store.step)
 	}
 }
@@ -508,7 +513,7 @@ func TestTerminalAuditDegradationDoesNotChangePersistedProviderSuccess(t *testin
 	if err != nil {
 		t.Fatalf("terminal audit degradation changed provider success: %v", err)
 	}
-	if !errors.Is(result.TerminalAuditError, terminalCause) || result.ProviderAttemptID == nil || store.step.Status != domain.StepSucceeded || store.result.Status != "succeeded" || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != *result.ProviderAttemptID {
+	if !errors.Is(result.TerminalAuditError, terminalCause) || result.ProviderAttemptID == nil || result.AdmissionProvenance == nil || store.admission == nil || store.admission.ProviderAttemptID != *result.ProviderAttemptID || store.step.Status != domain.StepSucceeded || store.result.Status != "succeeded" || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != *result.ProviderAttemptID {
 		t.Fatalf("degraded result=%#v step=%#v persisted=%#v tool=%#v", result, store.step, store.result, store.tool)
 	}
 }

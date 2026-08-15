@@ -189,7 +189,34 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	providerAttemptID, err := store.RecordProviderInvocationStarted(ctx, capability.ProviderInvocationStartRecord{ProgramID: programID, TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, ActionRequestID: actionRequest.ID, StepAttempt: actionRequest.StepAttempt, ExecutionAuthorizationEventID: authorizationID, Capability: actionRequest.Capability, Provider: "dnsx", Actor: actionRequest.RequestedBy})
+	validStart := capability.ProviderInvocationStartRecord{ProgramID: programID, TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, ActionRequestID: actionRequest.ID, StepAttempt: actionRequest.StepAttempt, ExecutionAuthorizationEventID: authorizationID, Capability: actionRequest.Capability, Provider: "dnsx", Actor: actionRequest.RequestedBy}
+	altQueueID := domain.NewID()
+	for _, test := range []struct {
+		name   string
+		mutate func(*capability.ProviderInvocationStartRecord)
+	}{
+		{name: "program", mutate: func(record *capability.ProviderInvocationStartRecord) { record.ProgramID = altProgramID }},
+		{name: "task", mutate: func(record *capability.ProviderInvocationStartRecord) { record.TaskID = altTaskID }},
+		{name: "workflow", mutate: func(record *capability.ProviderInvocationStartRecord) { record.WorkflowRunID = altRunID }},
+		{name: "step", mutate: func(record *capability.ProviderInvocationStartRecord) { record.StepRunID = altStepID }},
+		{name: "action", mutate: func(record *capability.ProviderInvocationStartRecord) { record.ActionRequestID = domain.NewID() }},
+		{name: "step attempt", mutate: func(record *capability.ProviderInvocationStartRecord) { record.StepAttempt++ }},
+		{name: "queue job", mutate: func(record *capability.ProviderInvocationStartRecord) { record.QueueJobID = &altQueueID }},
+		{name: "authorization", mutate: func(record *capability.ProviderInvocationStartRecord) {
+			record.ExecutionAuthorizationEventID = dispatchAuthorizationID
+		}},
+		{name: "capability", mutate: func(record *capability.ProviderInvocationStartRecord) { record.Capability = "alternate.capability" }},
+		{name: "provider", mutate: func(record *capability.ProviderInvocationStartRecord) { record.Provider = "alternate-provider" }},
+	} {
+		t.Run("provider start rejects mismatched "+test.name, func(t *testing.T) {
+			record := validStart
+			test.mutate(&record)
+			if _, err := store.RecordProviderInvocationStarted(ctx, record); err == nil {
+				t.Fatalf("provider start accepted mismatched %s", test.name)
+			}
+		})
+	}
+	providerAttemptID, err := store.RecordProviderInvocationStarted(ctx, validStart)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,12 +269,16 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	artifact := domain.Artifact{ID: artifactID, TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, ToolRunID: toolID, Type: "raw-provider-output", ContentType: "text/plain", Size: 24, SHA256: strings.Repeat("a", 64), StorageLocation: "synthetic://stderr.txt", CreatedAt: completed, ExpiresAt: &expires, RedactionState: "redacted"}
 	step := domain.StepRun{ID: stepID, WorkflowRunID: runID, Capability: "resolve.dns", Status: domain.StepFailed, Output: json.RawMessage(`{"lines":[],"authorized":[],"filtered":[]}`), ErrorClassification: "provider_error", ErrorDetails: "exit status 1: fake DNS failure", CompletedAt: &completed, IdempotencyKey: state.Steps["dns"].Run.IdempotencyKey}
 	action := domain.ActionResult{RequestID: actionRequest.ID, Status: "failed", Summary: "dnsx execution failed", Output: step.Output, Error: &domain.StructuredError{Classification: "provider_error", Message: step.ErrorDetails}}
+	admission := &capability.ResultAdmissionProvenance{ProviderAttemptID: providerAttemptID, ActionRequestID: actionRequest.ID, StepAttempt: actionRequest.StepAttempt, ExecutionAuthorizationEventID: authorizationID, Provider: "dnsx"}
 	wrongTool := *tool
 	wrongTool.ProviderAttemptID = &authorizationID
-	if err := store.PersistResult(ctx, programID, step, &wrongTool, []domain.Artifact{artifact}, action); !errors.Is(err, ErrWorkflowResultConflict) {
+	if err := store.PersistResult(ctx, programID, step, &wrongTool, []domain.Artifact{artifact}, action, admission); !errors.Is(err, ErrWorkflowResultConflict) {
 		t.Fatalf("non-start provider attempt link error=%v", err)
 	}
-	if err := store.PersistResult(ctx, programID, step, tool, []domain.Artifact{artifact}, action); err != nil {
+	if err := store.PersistResult(ctx, programID, step, tool, []domain.Artifact{artifact}, action, nil); !errors.Is(err, ErrWorkflowResultConflict) {
+		t.Fatalf("provider-attempt ToolRun without trusted admission provenance error=%v", err)
+	}
+	if err := store.PersistResult(ctx, programID, step, tool, []domain.Artifact{artifact}, action, admission); err != nil {
 		t.Fatal(err)
 	}
 

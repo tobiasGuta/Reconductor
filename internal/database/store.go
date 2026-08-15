@@ -711,14 +711,15 @@ func (s *Store) RecordPolicyDecision(ctx context.Context, record capability.Poli
 		"requirements": record.Requirements,
 	})
 	eventID := domain.NewID()
-	_, err := s.Pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,action_request_id,step_attempt,queue_job_id,capability,provider,safe_message,details) VALUES($1,$2,'policy',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, eventID, eventType, policyActor(record), optionalID(record.Action.TaskID), optionalID(record.ProgramID), optionalID(record.Action.WorkflowRunID), optionalID(record.Action.StepRunID), optionalID(record.Action.ID), exactPositiveInt(record.Action.StepAttempt), optionalIDPointer(record.QueueJobID), record.Action.Capability, record.Provider, message, details)
+	scheduledExecutionID, schedulerAttempt := providerSchedulerProvenance(ctx)
+	_, err := s.Pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,scheduled_execution_id,scheduler_attempt,action_request_id,step_attempt,queue_job_id,capability,provider,safe_message,details) VALUES($1,$2,'policy',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, eventID, eventType, policyActor(record), optionalID(record.Action.TaskID), optionalID(record.ProgramID), optionalID(record.Action.WorkflowRunID), optionalID(record.Action.StepRunID), scheduledExecutionID, schedulerAttempt, optionalID(record.Action.ID), exactPositiveInt(record.Action.StepAttempt), optionalIDPointer(record.QueueJobID), record.Action.Capability, record.Provider, message, details)
 	if err != nil {
 		return "", err
 	}
 	return eventID, nil
 }
 
-func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult) error {
+func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -737,21 +738,9 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 		if tool.ID == "" || tool.StepRunID != step.ID || tool.Capability != step.Capability {
 			return resultConflict(lineage.scheduled, "tool lineage does not match result step")
 		}
-		if tool.ProviderAttemptID != nil {
-			if *tool.ProviderAttemptID == "" {
-				return resultConflict(lineage.scheduled, "tool provider attempt identity is empty")
-			}
-			var validProviderAttempt bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(
-				SELECT 1 FROM audit_events
-				WHERE id=$1 AND event_type='provider_invocation_started' AND step_run_id=$2 AND capability=$3
-			)`, *tool.ProviderAttemptID, step.ID, step.Capability).Scan(&validProviderAttempt); err != nil {
-				return err
-			}
-			if !validProviderAttempt {
-				return resultConflict(lineage.scheduled, "tool provider attempt does not match provider start")
-			}
-		}
+	}
+	if err := lockAndValidateProviderResult(ctx, tx, lineage, programID, step, tool, result, admission); err != nil {
+		return err
 	}
 	if err := lockConflictingResultTools(ctx, tx, step.ID, tool, lineage.scheduled); err != nil {
 		return err
