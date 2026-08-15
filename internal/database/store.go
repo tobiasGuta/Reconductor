@@ -734,6 +734,12 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 	default:
 		return resultConflict(lineage.scheduled, "result status is not persistable")
 	}
+	if step.Status == domain.StepRetryable && step.CompletedAt != nil {
+		return resultConflict(lineage.scheduled, "retryable result is completed")
+	}
+	if (step.Status == domain.StepSucceeded || step.Status == domain.StepFailed) && step.CompletedAt == nil {
+		return resultConflict(lineage.scheduled, "terminal result is not completed")
+	}
 	if tool != nil {
 		if tool.ID == "" || tool.StepRunID != step.ID || tool.Capability != step.Capability {
 			return resultConflict(lineage.scheduled, "tool lineage does not match result step")
@@ -742,6 +748,25 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 	if err := lockAndValidateProviderResult(ctx, tx, lineage, programID, step, tool, result, admission); err != nil {
 		return err
 	}
+	exactProviderAttempt := admission != nil
+	if lineage.stepStatus != domain.StepRunning && (!exactProviderAttempt || lineage.stepStatus != domain.StepRetryable) {
+		return resultConflict(lineage.scheduled, "step does not admit this result")
+	}
+	attemptCount := lineage.attemptCount
+	if exactProviderAttempt {
+		stepAttempt, err := lockProviderStepAttempt(ctx, tx, admission.ProviderAttemptID)
+		if err != nil {
+			return err
+		}
+		if stepAttempt != nil {
+			if *stepAttempt < attemptCount {
+				return resultConflict(lineage.scheduled, "provider step attempt is stale")
+			}
+			if *stepAttempt > attemptCount {
+				attemptCount = *stepAttempt
+			}
+		}
+	}
 	if err := lockConflictingResultTools(ctx, tx, step.ID, tool, lineage.scheduled); err != nil {
 		return err
 	}
@@ -749,8 +774,8 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 		return err
 	}
 	tag, err := tx.Exec(ctx, `UPDATE step_runs
-		SET status=$2,output=$3,error_classification=$4,error_details=$5,completed_at=$6
-		WHERE id=$1 AND workflow_run_id=$7 AND idempotency_key=$8 AND status='running'`, step.ID, step.Status, step.Output, step.ErrorClassification, step.ErrorDetails, step.CompletedAt, step.WorkflowRunID, step.IdempotencyKey)
+		SET status=$2,output=$3,error_classification=$4,error_details=$5,completed_at=$6,attempt_count=$7
+		WHERE id=$1 AND workflow_run_id=$8 AND idempotency_key=$9 AND status=$10`, step.ID, step.Status, step.Output, step.ErrorClassification, step.ErrorDetails, step.CompletedAt, attemptCount, step.WorkflowRunID, step.IdempotencyKey, lineage.stepStatus)
 	if err != nil {
 		return err
 	}
@@ -792,6 +817,9 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 				return err
 			}
 		}
+		if err := persistTargetDecisions(ctx, tx, programID, step, tool, result.Output); err != nil {
+			return err
+		}
 	}
 	details, _ := json.Marshal(result)
 	_, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,workflow_run_id,step_run_id,tool_run_id,action_request_id,step_attempt,queue_job_id,provider_attempt_id,capability,provider,safe_message,details)
@@ -800,9 +828,6 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 		LEFT JOIN audit_events pa ON pa.id=$5 AND pa.event_type='provider_invocation_started'
 		WHERE wr.id=$2`, domain.NewID(), step.WorkflowRunID, step.ID, toolID(tool), providerAttemptID(tool), step.Capability, providerName(tool), result.Summary, details)
 	if err != nil {
-		return err
-	}
-	if err := persistTargetDecisions(ctx, tx, programID, step, tool, result.Output); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

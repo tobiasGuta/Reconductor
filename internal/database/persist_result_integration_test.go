@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/execution"
@@ -86,6 +87,89 @@ func (r failingPostgresTerminalRecorder) RecordProviderInvocationTerminal(contex
 type integrationAllowScope struct{}
 
 func (integrationAllowScope) Allows(string) bool { return true }
+
+type postgresWorkflowRetryCapability struct{ calls int }
+
+func (*postgresWorkflowRetryCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "test.workflow-retry", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true, SupportedProviders: []string{"retry-provider"}}
+}
+
+func (*postgresWorkflowRetryCapability) Validate(context.Context, capability.Request) error {
+	return nil
+}
+
+func (c *postgresWorkflowRetryCapability) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+	c.calls++
+	now := time.Now().UTC()
+	exitCode := 0
+	tool := &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: req.Provider, ToolVersion: "1", SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"integration"}`), StartedAt: now, CompletedAt: &now, ExitCode: &exitCode}
+	result := capability.Result{
+		Action:    domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "provider succeeded", Output: json.RawMessage(`{"lines":[]}`)},
+		ToolRun:   tool,
+		RawStdout: []byte("provider attempt output\n"),
+	}
+	if c.calls == 1 {
+		result.Action.Status = "failed"
+		result.Action.Summary = "provider retryable failure"
+		result.Action.Error = &domain.StructuredError{Classification: "provider_error", Message: "temporary failure", Retryable: true}
+		return result, errors.New("temporary failure")
+	}
+	return result, nil
+}
+
+type postgresWorkflowRetryArtifacts struct{}
+
+func (postgresWorkflowRetryArtifacts) Put(_ context.Context, req artifact.PutRequest) (domain.Artifact, error) {
+	return domain.Artifact{ID: domain.NewID(), TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), SHA256: strings.Repeat("a", 64), StorageLocation: "synthetic://" + req.Name, CreatedAt: time.Now().UTC(), RedactionState: "redacted"}, nil
+}
+
+func TestWorkflowRetryPersistsEveryProviderAttempt(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "workflow-provider-retry")
+	now := time.Now().UTC()
+	task := domain.Task{ID: domain.NewID(), ProgramID: env.programID, Objective: "workflow provider retry", WorkflowDefinitionID: env.definitionID, Status: domain.TaskRunning, RequestedBy: "integration-test", CreatedAt: now, UpdatedAt: now}
+	if err := env.store.CreateTask(env.ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	provider := &postgresWorkflowRetryCapability{}
+	registry := capability.NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	definition := workflow.Definition{ID: env.definitionID, Name: "workflow-provider-retry", Version: "1", Steps: []workflow.Step{{ID: "retry", Capability: "test.workflow-retry", Input: json.RawMessage(`{}`), Retry: workflow.RetryPolicy{MaxAttempts: 2, BaseDelay: time.Millisecond}}}}
+	engine := workflow.Engine{
+		Registry:  registry,
+		Executor:  execution.Service{Registry: registry, Store: env.store, Artifacts: postgresWorkflowRetryArtifacts{}, ProgramID: env.programID},
+		Persister: WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: t.TempDir()}},
+		Policy:    policy.Policy{AllowedCapabilities: []string{"test.workflow-retry"}},
+		Scope:     integrationAllowScope{},
+	}
+	state, err := engine.Run(env.ctx, definition, nil, task, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.calls != 2 || state.Run.Status != domain.RunCompleted || state.Steps["retry"].Run.Status != domain.StepSucceeded {
+		t.Fatalf("calls=%d state=%#v", provider.calls, state)
+	}
+	stepID := state.Steps["retry"].Run.ID
+	var status domain.StepStatus
+	var attemptCount, stepCount, toolCount, providerAttemptCount, artifactCount, artifactToolCount, toolExecutionCount int
+	var completedAt *time.Time
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT status,attempt_count,completed_at FROM step_runs WHERE id=$1`, stepID).Scan(&status, &attemptCount, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT
+		(SELECT count(*) FROM step_runs WHERE workflow_run_id=$1 AND step_definition_id='retry'),
+		(SELECT count(*) FROM tool_runs WHERE step_run_id=$2),
+		(SELECT count(DISTINCT provider_attempt_id) FROM tool_runs WHERE step_run_id=$2),
+		(SELECT count(*) FROM artifacts WHERE step_run_id=$2),
+		(SELECT count(DISTINCT tool_run_id) FROM artifacts WHERE step_run_id=$2),
+		(SELECT count(*) FROM audit_events WHERE step_run_id=$2 AND event_type='tool_execution')`, state.Run.ID, stepID).Scan(&stepCount, &toolCount, &providerAttemptCount, &artifactCount, &artifactToolCount, &toolExecutionCount); err != nil {
+		t.Fatal(err)
+	}
+	if status != domain.StepSucceeded || attemptCount != 2 || completedAt == nil || stepCount != 1 || toolCount != 2 || providerAttemptCount != 2 || artifactCount != 4 || artifactToolCount != 2 || toolExecutionCount != 2 {
+		t.Fatalf("status=%s attempt=%d completed=%v steps=%d tools=%d provider_attempts=%d artifacts=%d artifact_tools=%d tool_executions=%d", status, attemptCount, completedAt, stepCount, toolCount, providerAttemptCount, artifactCount, artifactToolCount, toolExecutionCount)
+	}
+}
 
 func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")

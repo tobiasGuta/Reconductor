@@ -479,6 +479,54 @@ func TestFailedProviderAttemptPersistsToolStepArtifactsAndOriginalError(t *testi
 	}
 }
 
+type retryableResultCapability struct{}
+
+func (retryableResultCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "retryable.result", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true}
+}
+
+func (retryableResultCapability) Validate(context.Context, capability.Request) error { return nil }
+
+func (retryableResultCapability) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+	return capability.Result{Action: domain.ActionResult{
+		RequestID: req.Action.ID,
+		Status:    "failed",
+		Summary:   "temporary provider failure",
+		Error:     &domain.StructuredError{Classification: "provider_error", Message: "retry later", Retryable: true},
+	}}, errors.New("temporary provider failure")
+}
+
+func TestRetryableServiceResultIsNotCompleted(t *testing.T) {
+	registry := capability.NewRegistry()
+	if err := registry.Register(retryableResultCapability{}); err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{}
+	req := capability.Request{
+		Action: domain.ActionRequest{
+			ID:             domain.NewID(),
+			TaskID:         domain.NewID(),
+			WorkflowRunID:  domain.NewID(),
+			StepRunID:      domain.NewID(),
+			Capability:     "retryable.result",
+			Input:          json.RawMessage(`{}`),
+			IdempotencyKey: "retryable-result",
+			StepAttempt:    2,
+		},
+		Policy: policy.Policy{AllowedCapabilities: []string{"retryable.result"}},
+		Scope:  allowedScope{},
+	}
+	if _, err := (Service{Registry: registry, Store: store, ProgramID: domain.NewID()}).Execute(context.Background(), req); err == nil {
+		t.Fatal("retryable provider failure was not returned")
+	}
+	if !store.called || store.step.Status != domain.StepRetryable || store.step.CompletedAt != nil {
+		t.Fatalf("retryable step=%#v", store.step)
+	}
+	if store.admission == nil || store.admission.StepAttempt != 2 {
+		t.Fatalf("retryable admission=%#v", store.admission)
+	}
+}
+
 func TestNoProviderStartFailurePersistsPlatformToolWithoutAttempt(t *testing.T) {
 	registry := capability.NewRegistry()
 	provider := &inputCaptureCapability{}
