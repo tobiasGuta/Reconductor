@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
@@ -27,7 +29,7 @@ func TestScheduledPersistResultFenceAcceptanceAndRejection(t *testing.T) {
 		fixture := newScheduledResultFixture(t, "result-current-http", "probe.http")
 		output := json.RawMessage(`{"lines":["http://127.0.0.1/"],"authorized_records":[{"provider":"httpx","kind":"url","target":"http://127.0.0.1/","status_code":200}]}`)
 		step, tool, artifacts, result := scheduledResultPayload(fixture, output)
-		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result); err != nil {
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, nil); err != nil {
 			t.Fatal(err)
 		}
 		assertResultRowCounts(t, fixture, 1, 1, 1, 0, 1)
@@ -42,7 +44,7 @@ func TestScheduledPersistResultFenceAcceptanceAndRejection(t *testing.T) {
 			t.Fatal(err)
 		}
 		step, tool, artifacts, result := scheduledResultPayload(fixture, output)
-		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result); err != nil {
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, nil); err != nil {
 			t.Fatal(err)
 		}
 		assertResultRowCounts(t, fixture, 1, 1, 0, 1, 1)
@@ -179,7 +181,7 @@ func TestScheduledPersistResultFenceAcceptanceAndRejection(t *testing.T) {
 		step, tool, artifacts, result := fixture.validPayload()
 		artifacts[0].Size = -1
 		before := resultFenceSnapshot(t, fixture)
-		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result); err == nil {
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, nil); err == nil {
 			t.Fatal("invalid artifact size was accepted")
 		}
 		after := resultFenceSnapshot(t, fixture)
@@ -187,6 +189,181 @@ func TestScheduledPersistResultFenceAcceptanceAndRejection(t *testing.T) {
 			t.Fatalf("failed result transaction mutated database\nbefore=%s\nafter=%s", before, after)
 		}
 	})
+}
+
+func TestScheduledProviderStartRequiresExactAuthorizationProvenance(t *testing.T) {
+	fixture := newScheduledResultFixture(t, "provider-start-scheduled", "probe.http")
+	action := scheduledProviderAction(fixture, 1)
+	queueJobID := domain.NewID()
+	authorizationID, err := fixture.env.store.RecordPolicyDecision(fixture.context(), capability.PolicyDecisionRecord{ProgramID: fixture.env.programID, Action: action, QueueJobID: &queueJobID, Provider: "fixture-provider", PolicyID: "integration", Phase: "execution", Evaluation: policy.Evaluation{Decision: policy.Allow, Reason: "scheduled provider start test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := capability.ProviderInvocationStartRecord{ProgramID: fixture.env.programID, TaskID: fixture.lineage.task.ID, WorkflowRunID: fixture.lineage.runID, StepRunID: fixture.stepID, ActionRequestID: action.ID, StepAttempt: action.StepAttempt, QueueJobID: &queueJobID, ExecutionAuthorizationEventID: authorizationID, Capability: fixture.capability, Provider: "fixture-provider", Actor: action.RequestedBy}
+
+	otherStatus := domain.RunRunning
+	other := createRecoveryFixture(t, fixture.env, "provider-start-other-scheduled", &otherStatus, domain.TaskRunning, nil)
+	otherCtx := WithScheduledExecutionFence(fixture.env.ctx, ScheduledExecutionFence{ExecutionID: other.execution.ID, LeaseOwner: other.execution.LeaseOwner, Attempt: other.execution.AttemptCount})
+	wrongAttempt := fixture.fence
+	wrongAttempt.Attempt++
+	for _, test := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{name: "scheduled execution", ctx: otherCtx},
+		{name: "scheduler attempt", ctx: WithScheduledExecutionFence(fixture.env.ctx, wrongAttempt)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := fixture.env.store.RecordProviderInvocationStarted(test.ctx, valid); err == nil {
+				t.Fatalf("provider start accepted mismatched %s", test.name)
+			}
+		})
+	}
+	if _, err := fixture.env.store.RecordProviderInvocationStarted(fixture.context(), valid); err != nil {
+		t.Fatalf("exact scheduled provider start rejected: %v", err)
+	}
+}
+
+func TestScheduledPersistResultRequiresExactProviderAdmission(t *testing.T) {
+	t.Run("valid exact provenance", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-admission-valid", "probe.http")
+		action := scheduledProviderAction(fixture, 1)
+		queueJobID := domain.NewID()
+		admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, &queueJobID, "fixture-provider")
+		step, tool, artifacts, result := fixture.validPayload()
+		applyScheduledProviderAdmission(tool, &result, admission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission); err != nil {
+			t.Fatal(err)
+		}
+		assertResultRowCounts(t, fixture, 1, 1, 1, 0, 1)
+	})
+
+	t.Run("nullable queue and step attempt", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-admission-nullable", "probe.http")
+		action := scheduledProviderAction(fixture, 0)
+		admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, nil, "fixture-provider")
+		step, tool, artifacts, result := fixture.validPayload()
+		applyScheduledProviderAdmission(tool, &result, admission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission); err != nil {
+			t.Fatal(err)
+		}
+		var stepAttempt *int
+		var queueJobID *domain.ID
+		if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT step_attempt,queue_job_id FROM audit_events WHERE id=$1`, admission.ProviderAttemptID).Scan(&stepAttempt, &queueJobID); err != nil {
+			t.Fatal(err)
+		}
+		if stepAttempt != nil || queueJobID != nil {
+			t.Fatalf("unknown optional provenance was synthesized: step_attempt=%v queue_job_id=%v", stepAttempt, queueJobID)
+		}
+	})
+
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, scheduledResultFixture, domain.ActionRequest, *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance))
+	}{
+		{name: "wrong P", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			first := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider")
+			second := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider")
+			return second, func(tool *domain.ToolRun, result *domain.ActionResult, admission *capability.ResultAdmissionProvenance) {
+				applyScheduledProviderAdmission(tool, result, admission)
+				tool.ProviderAttemptID = &first.ProviderAttemptID
+			}
+		}},
+		{name: "wrong program", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			otherProgramID, _ := createSchedulerIntegrationProgram(t, fixture.env.ctx, fixture.env.store, "provider-admission-other-program-"+string(domain.NewID()))
+			return recordScheduledProviderAdmission(t, fixture, fixture.context(), otherProgramID, action, queueJobID, "fixture-provider"), applyScheduledProviderAdmission
+		}},
+		{name: "wrong task", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			otherStatus := domain.RunRunning
+			other := createRecoveryFixture(t, fixture.env, "provider-admission-other-task", &otherStatus, domain.TaskRunning, nil)
+			action.TaskID = other.task.ID
+			return recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider"), applyScheduledProviderAdmission
+		}},
+		{name: "wrong workflow", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			otherStatus := domain.RunRunning
+			other := createRecoveryFixture(t, fixture.env, "provider-admission-other-workflow", &otherStatus, domain.TaskRunning, nil)
+			action.WorkflowRunID = other.runID
+			return recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider"), applyScheduledProviderAdmission
+		}},
+		{name: "wrong StepRun", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			otherStatus := domain.RunRunning
+			other := createRecoveryFixture(t, fixture.env, "provider-admission-other-step", &otherStatus, domain.TaskRunning, []recoveryStepSpec{{name: "other", status: domain.StepRunning, started: true}})
+			action.StepRunID = other.steps["other"]
+			return recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider"), applyScheduledProviderAdmission
+		}},
+		{name: "wrong ActionRequest", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider")
+			return admission, func(tool *domain.ToolRun, result *domain.ActionResult, admission *capability.ResultAdmissionProvenance) {
+				applyScheduledProviderAdmission(tool, result, admission)
+				admission.ActionRequestID = domain.NewID()
+				result.RequestID = admission.ActionRequestID
+			}
+		}},
+		{name: "wrong step attempt", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider")
+			return admission, func(tool *domain.ToolRun, result *domain.ActionResult, admission *capability.ResultAdmissionProvenance) {
+				applyScheduledProviderAdmission(tool, result, admission)
+				admission.StepAttempt++
+			}
+		}},
+		{name: "wrong queue job", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider")
+			return admission, func(tool *domain.ToolRun, result *domain.ActionResult, admission *capability.ResultAdmissionProvenance) {
+				applyScheduledProviderAdmission(tool, result, admission)
+				other := domain.NewID()
+				admission.QueueJobID = &other
+			}
+		}},
+		{name: "wrong E", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider")
+			return admission, func(tool *domain.ToolRun, result *domain.ActionResult, admission *capability.ResultAdmissionProvenance) {
+				applyScheduledProviderAdmission(tool, result, admission)
+				admission.ExecutionAuthorizationEventID = domain.NewID()
+			}
+		}},
+		{name: "wrong capability", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			action.Capability = "alternate.capability"
+			return recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider"), applyScheduledProviderAdmission
+		}},
+		{name: "wrong provider", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, queueJobID, "fixture-provider")
+			return admission, func(tool *domain.ToolRun, result *domain.ActionResult, admission *capability.ResultAdmissionProvenance) {
+				applyScheduledProviderAdmission(tool, result, admission)
+				admission.Provider = "alternate-provider"
+				tool.Provider = admission.Provider
+			}
+		}},
+		{name: "wrong scheduled execution", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			otherStatus := domain.RunRunning
+			other := createRecoveryFixture(t, fixture.env, "provider-admission-other-scheduled", &otherStatus, domain.TaskRunning, nil)
+			otherCtx := WithScheduledExecutionFence(fixture.env.ctx, ScheduledExecutionFence{ExecutionID: other.execution.ID, LeaseOwner: other.execution.LeaseOwner, Attempt: other.execution.AttemptCount})
+			return recordScheduledProviderAdmission(t, fixture, otherCtx, fixture.env.programID, action, queueJobID, "fixture-provider"), applyScheduledProviderAdmission
+		}},
+		{name: "wrong scheduler attempt", prepare: func(t *testing.T, fixture scheduledResultFixture, action domain.ActionRequest, queueJobID *domain.ID) (*capability.ResultAdmissionProvenance, func(*domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance)) {
+			wrongFence := fixture.fence
+			wrongFence.Attempt++
+			return recordScheduledProviderAdmission(t, fixture, WithScheduledExecutionFence(fixture.env.ctx, wrongFence), fixture.env.programID, action, queueJobID, "fixture-provider"), applyScheduledProviderAdmission
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newScheduledResultFixture(t, "provider-admission-"+strings.ReplaceAll(test.name, " ", "-"), "probe.http")
+			action := scheduledProviderAction(fixture, 1)
+			queueJobID := domain.NewID()
+			admission, apply := test.prepare(t, fixture, action, &queueJobID)
+			step, tool, artifacts, result := fixture.validPayload()
+			apply(tool, &result, admission)
+			before := resultFenceSnapshot(t, fixture)
+			err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission)
+			if !errors.Is(err, ErrStaleScheduledExecutionResult) {
+				t.Fatalf("PersistResult error=%v want %v", err, ErrStaleScheduledExecutionResult)
+			}
+			after := resultFenceSnapshot(t, fixture)
+			if after != before {
+				t.Fatalf("rejected exact-P mismatch mutated database\nbefore=%s\nafter=%s", before, after)
+			}
+		})
+	}
 }
 
 func TestScheduledWorkflowSaveFence(t *testing.T) {
@@ -247,7 +424,7 @@ func TestScheduledWorkflowSaveFence(t *testing.T) {
 		}
 		fixture := scheduledResultFixture{env: env, lineage: recoveryTestFixture{task: task, runID: runID}, stepID: stepID, idempotencyKey: key, capability: "probe.http"}
 		step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":["http://127.0.0.1/"]}`))
-		if err := env.store.PersistResult(env.ctx, env.programID, step, tool, artifacts, result); err != nil {
+		if err := env.store.PersistResult(env.ctx, env.programID, step, tool, artifacts, result, nil); err != nil {
 			t.Fatal(err)
 		}
 		assertStepRecoveryStatus(t, env, stepID, domain.StepSucceeded)
@@ -272,7 +449,7 @@ func TestScheduledWorkflowSaveFence(t *testing.T) {
 		fixture := scheduledResultFixture{env: env, lineage: recoveryTestFixture{task: task, runID: runID}, stepID: stepID, idempotencyKey: "unscheduled-conflict-key", capability: "probe.http"}
 		step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":["http://127.0.0.1/"]}`))
 		step.IdempotencyKey = "wrong-key"
-		if err := env.store.PersistResult(env.ctx, env.programID, step, tool, artifacts, result); !errors.Is(err, ErrWorkflowResultConflict) {
+		if err := env.store.PersistResult(env.ctx, env.programID, step, tool, artifacts, result, nil); !errors.Is(err, ErrWorkflowResultConflict) {
 			t.Fatalf("unscheduled identity error=%v want %v", err, ErrWorkflowResultConflict)
 		}
 		assertStepRecoveryStatus(t, env, stepID, domain.StepRunning)
@@ -295,7 +472,7 @@ func TestPersistResultRecoveryConcurrency(t *testing.T) {
 		step, tool, artifacts, result := fixture.validPayload()
 		persisted := make(chan error, 1)
 		go func() {
-			persisted <- fixture.env.store.PersistResult(raceCtx, fixture.env.programID, step, tool, artifacts, result)
+			persisted <- fixture.env.store.PersistResult(raceCtx, fixture.env.programID, step, tool, artifacts, result, nil)
 		}()
 		waitForPostgresLock(t, raceCtx, fixture.env.store, `%UPDATE step_runs%SET status=%`)
 		waitForScheduledLeaseExpiry(t, raceCtx, fixture)
@@ -364,7 +541,7 @@ func TestPersistResultRecoveryConcurrency(t *testing.T) {
 		step, tool, artifacts, result := fixture.validPayload()
 		persisted := make(chan error, 1)
 		go func() {
-			persisted <- fixture.env.store.PersistResult(raceCtx, fixture.env.programID, step, tool, artifacts, result)
+			persisted <- fixture.env.store.PersistResult(raceCtx, fixture.env.programID, step, tool, artifacts, result, nil)
 		}()
 		waitForPostgresLock(t, raceCtx, fixture.env.store, `%WHERE se.id=$1%FOR UPDATE OF se%`)
 
@@ -408,7 +585,7 @@ func TestConcurrentDuplicatePersistResult(t *testing.T) {
 		go func() {
 			select {
 			case <-start:
-				results <- fixture.env.store.PersistResult(raceCtx, fixture.env.programID, step, tool, artifacts, result)
+				results <- fixture.env.store.PersistResult(raceCtx, fixture.env.programID, step, tool, artifacts, result, nil)
 			case <-raceCtx.Done():
 				results <- raceCtx.Err()
 			}
@@ -461,6 +638,35 @@ func (fixture scheduledResultFixture) context() context.Context {
 	return WithScheduledExecutionFence(fixture.env.ctx, fixture.fence)
 }
 
+func scheduledProviderAction(fixture scheduledResultFixture, stepAttempt int) domain.ActionRequest {
+	return domain.ActionRequest{ID: domain.NewID(), TaskID: fixture.lineage.task.ID, WorkflowRunID: fixture.lineage.runID, StepRunID: fixture.stepID, RequestedBy: "integration-test", Capability: fixture.capability, IdempotencyKey: fixture.idempotencyKey, StepAttempt: stepAttempt, Input: json.RawMessage(`{}`)}
+}
+
+func recordScheduledProviderAdmission(t *testing.T, fixture scheduledResultFixture, ctx context.Context, programID domain.ID, action domain.ActionRequest, queueJobID *domain.ID, provider string) *capability.ResultAdmissionProvenance {
+	t.Helper()
+	authorizationID, err := fixture.env.store.RecordPolicyDecision(ctx, capability.PolicyDecisionRecord{ProgramID: programID, Action: action, QueueJobID: queueJobID, Provider: provider, PolicyID: "integration", Phase: "execution", Evaluation: policy.Evaluation{Decision: policy.Allow, Reason: "exact provider admission test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerAttemptID, err := fixture.env.store.RecordProviderInvocationStarted(ctx, capability.ProviderInvocationStartRecord{ProgramID: programID, TaskID: action.TaskID, WorkflowRunID: action.WorkflowRunID, StepRunID: action.StepRunID, ActionRequestID: action.ID, StepAttempt: action.StepAttempt, QueueJobID: queueJobID, ExecutionAuthorizationEventID: authorizationID, Capability: action.Capability, Provider: provider, Actor: action.RequestedBy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var queueJobCopy *domain.ID
+	if queueJobID != nil {
+		id := *queueJobID
+		queueJobCopy = &id
+	}
+	return &capability.ResultAdmissionProvenance{ProviderAttemptID: providerAttemptID, ActionRequestID: action.ID, StepAttempt: action.StepAttempt, QueueJobID: queueJobCopy, ExecutionAuthorizationEventID: authorizationID, Provider: provider}
+}
+
+func applyScheduledProviderAdmission(tool *domain.ToolRun, result *domain.ActionResult, admission *capability.ResultAdmissionProvenance) {
+	providerAttemptID := admission.ProviderAttemptID
+	tool.ProviderAttemptID = &providerAttemptID
+	tool.Provider = admission.Provider
+	result.RequestID = admission.ActionRequestID
+}
+
 func (fixture scheduledResultFixture) validPayload() (domain.StepRun, *domain.ToolRun, []domain.Artifact, domain.ActionResult) {
 	line := `{"template-id":"harmless-info","matched-at":"http://127.0.0.1/","info":{"name":"Harmless local response","severity":"info"}}`
 	output, _ := json.Marshal(map[string]any{"lines": []string{line}})
@@ -493,7 +699,7 @@ func scheduledFixtureState(fixture scheduledResultFixture, runStatus domain.RunS
 func assertScheduledResultRejectedNoMutation(t *testing.T, fixture scheduledResultFixture, ctx context.Context, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult) {
 	t.Helper()
 	before := resultFenceSnapshot(t, fixture)
-	err := fixture.env.store.PersistResult(ctx, fixture.env.programID, step, tool, artifacts, result)
+	err := fixture.env.store.PersistResult(ctx, fixture.env.programID, step, tool, artifacts, result, nil)
 	if !errors.Is(err, ErrStaleScheduledExecutionResult) {
 		t.Fatalf("persist result error=%v want %v", err, ErrStaleScheduledExecutionResult)
 	}
