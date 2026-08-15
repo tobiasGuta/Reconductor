@@ -183,6 +183,17 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 		}
 	}
 	result, runErr := s.executeJob(ctx, d, provider, sc, auditor)
+	if result.TerminalAuditError != nil {
+		logger := s.Logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		var providerAttemptID domain.ID
+		if result.ProviderAttemptID != nil {
+			providerAttemptID = *result.ProviderAttemptID
+		}
+		logger.Warn("provider invocation terminal audit failed", "provider_attempt_id", providerAttemptID)
+	}
 	if runErr != nil {
 		retryable := result.Action.Error != nil && result.Action.Error.Retryable
 		return s.Queue.Fail(ctx, d.MessageID, d.Job, runErr.Error(), retryable)
@@ -191,7 +202,12 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 }
 
 func (s *Service) executeJob(ctx context.Context, d queue.Delivery, provider string, sc capability.Scope, auditor capability.PolicyDecisionRecorder) (capability.Result, error) {
-	return (execution.Service{Registry: s.Registry, Store: s.Results, Artifacts: s.Artifacts, ProgramID: d.Job.ProgramID, PolicyAuditor: auditor}).Execute(ctx, capability.Request{Action: d.Job.Action, Provider: provider, Approved: d.Job.Approved, Policy: d.Job.Policy, Scope: sc})
+	var queueJobID *domain.ID
+	if d.Job.ID != "" {
+		id := d.Job.ID
+		queueJobID = &id
+	}
+	return (execution.Service{Registry: s.Registry, Store: s.Results, Artifacts: s.Artifacts, ProgramID: d.Job.ProgramID, PolicyAuditor: auditor}).Execute(ctx, capability.Request{Action: d.Job.Action, Provider: provider, Approved: d.Job.Approved, Policy: d.Job.Policy, Scope: sc, QueueJobID: queueJobID})
 }
 
 func (s *Service) purgeExpired(ctx context.Context) error {

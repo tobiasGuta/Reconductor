@@ -261,6 +261,7 @@ type ToolRun struct {
 	ArtifactIDs          []ID            `json:"artifact_ids"`
 	StdoutArtifactID     *ID             `json:"stdout_artifact_id,omitempty"`
 	StderrArtifactID     *ID             `json:"stderr_artifact_id,omitempty"`
+	ProviderAttemptID    *ID             `json:"provider_attempt_id,omitempty"`
 }
 type ActionRequest struct {
 	ID             ID              `json:"id"`
@@ -272,6 +273,7 @@ type ActionRequest struct {
 	Reason         string          `json:"reason"`
 	Input          json.RawMessage `json:"input"`
 	IdempotencyKey string          `json:"idempotency_key"`
+	StepAttempt    int             `json:"step_attempt,omitempty"`
 }
 type StructuredError struct {
 	Classification string `json:"classification"`

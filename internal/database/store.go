@@ -697,7 +697,7 @@ func (s *Store) AlreadySucceeded(ctx context.Context, key string) (bool, error) 
 	return ok, err
 }
 
-func (s *Store) RecordPolicyDecision(ctx context.Context, record capability.PolicyDecisionRecord) error {
+func (s *Store) RecordPolicyDecision(ctx context.Context, record capability.PolicyDecisionRecord) (domain.ID, error) {
 	eventType := map[policy.Decision]string{policy.Allow: "policy_allowed", policy.Deny: "policy_denied", policy.RequireApproval: "policy_approval_required"}[record.Evaluation.Decision]
 	if eventType == "" {
 		eventType = "policy_decision"
@@ -710,11 +710,16 @@ func (s *Store) RecordPolicyDecision(ctx context.Context, record capability.Poli
 		"reason":       record.Evaluation.Reason,
 		"requirements": record.Requirements,
 	})
-	_, err := s.Pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,capability,provider,safe_message,details) VALUES($1,$2,'policy',$3,$4,$5,$6,$7,$8,$9,$10,$11)`, domain.NewID(), eventType, policyActor(record), optionalID(record.Action.TaskID), optionalID(record.ProgramID), optionalID(record.Action.WorkflowRunID), optionalID(record.Action.StepRunID), record.Action.Capability, record.Provider, message, details)
-	return err
+	eventID := domain.NewID()
+	scheduledExecutionID, schedulerAttempt := providerSchedulerProvenance(ctx)
+	_, err := s.Pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,scheduled_execution_id,scheduler_attempt,action_request_id,step_attempt,queue_job_id,capability,provider,safe_message,details) VALUES($1,$2,'policy',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, eventID, eventType, policyActor(record), optionalID(record.Action.TaskID), optionalID(record.ProgramID), optionalID(record.Action.WorkflowRunID), optionalID(record.Action.StepRunID), scheduledExecutionID, schedulerAttempt, optionalID(record.Action.ID), exactPositiveInt(record.Action.StepAttempt), optionalIDPointer(record.QueueJobID), record.Action.Capability, record.Provider, message, details)
+	if err != nil {
+		return "", err
+	}
+	return eventID, nil
 }
 
-func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult) error {
+func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -734,6 +739,9 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 			return resultConflict(lineage.scheduled, "tool lineage does not match result step")
 		}
 	}
+	if err := lockAndValidateProviderResult(ctx, tx, lineage, programID, step, tool, result, admission); err != nil {
+		return err
+	}
 	if err := lockConflictingResultTools(ctx, tx, step.ID, tool, lineage.scheduled); err != nil {
 		return err
 	}
@@ -750,7 +758,7 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 		return resultConflict(lineage.scheduled, "step changed before result persistence")
 	}
 	if tool != nil {
-		_, err = tx.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,completed_at,exit_code,timed_out,stdout_artifact_id,stderr_artifact_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, tool.ID, tool.StepRunID, tool.Capability, tool.Provider, tool.ToolVersion, tool.SanitizedArguments, tool.ExecutionEnvironment, tool.StartedAt, tool.CompletedAt, tool.ExitCode, tool.TimedOut, tool.StdoutArtifactID, tool.StderrArtifactID)
+		_, err = tx.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,completed_at,exit_code,timed_out,stdout_artifact_id,stderr_artifact_id,provider_attempt_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, tool.ID, tool.StepRunID, tool.Capability, tool.Provider, tool.ToolVersion, tool.SanitizedArguments, tool.ExecutionEnvironment, tool.StartedAt, tool.CompletedAt, tool.ExitCode, tool.TimedOut, tool.StdoutArtifactID, tool.StderrArtifactID, tool.ProviderAttemptID)
 		if err != nil {
 			return err
 		}
@@ -786,7 +794,11 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 		}
 	}
 	details, _ := json.Marshal(result)
-	_, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,workflow_run_id,step_run_id,tool_run_id,capability,provider,safe_message,details) SELECT $1,'tool_execution','worker','worker',wr.task_id,$2,$3,$4,$5,$6,$7,$8 FROM workflow_runs wr WHERE wr.id=$2`, domain.NewID(), step.WorkflowRunID, step.ID, toolID(tool), step.Capability, providerName(tool), result.Summary, details)
+	_, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,workflow_run_id,step_run_id,tool_run_id,action_request_id,step_attempt,queue_job_id,provider_attempt_id,capability,provider,safe_message,details)
+		SELECT $1,'tool_execution','worker','worker',wr.task_id,$2,$3,$4,pa.action_request_id,pa.step_attempt,pa.queue_job_id,$5,$6,$7,$8,$9
+		FROM workflow_runs wr
+		LEFT JOIN audit_events pa ON pa.id=$5 AND pa.event_type='provider_invocation_started'
+		WHERE wr.id=$2`, domain.NewID(), step.WorkflowRunID, step.ID, toolID(tool), providerAttemptID(tool), step.Capability, providerName(tool), result.Summary, details)
 	if err != nil {
 		return err
 	}
@@ -1062,6 +1074,27 @@ func optionalID(id domain.ID) any {
 		return nil
 	}
 	return id
+}
+
+func optionalIDPointer(id *domain.ID) any {
+	if id == nil || *id == "" {
+		return nil
+	}
+	return *id
+}
+
+func exactPositiveInt(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
+}
+
+func providerAttemptID(tool *domain.ToolRun) any {
+	if tool == nil || tool.ProviderAttemptID == nil {
+		return nil
+	}
+	return *tool.ProviderAttemptID
 }
 
 func policyActor(record capability.PolicyDecisionRecord) string {

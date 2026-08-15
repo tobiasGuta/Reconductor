@@ -18,6 +18,26 @@ import (
 type testScope struct{}
 
 func (testScope) Allows(string) bool { return true }
+
+type providerTestProvenanceRecorder struct{}
+
+func (providerTestProvenanceRecorder) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
+	return domain.NewID(), nil
+}
+func (providerTestProvenanceRecorder) RecordProviderInvocationStarted(context.Context, capability.ProviderInvocationStartRecord) (domain.ID, error) {
+	return domain.NewID(), nil
+}
+func (providerTestProvenanceRecorder) RecordProviderInvocationTerminal(context.Context, capability.ProviderInvocationTerminalRecord) error {
+	return nil
+}
+
+func executeProviderTest(registry *capability.Registry, req capability.Request) (capability.Result, error) {
+	recorder := providerTestProvenanceRecorder{}
+	req.DecisionRecorder = recorder
+	req.InvocationRecorder = recorder
+	return registry.Execute(context.Background(), req)
+}
+
 func TestCompareAssetsStatusRouting(t *testing.T) {
 	cfg, err := config.LoadWith(func(k string) string {
 		if k == "DATABASE_URL" {
@@ -40,7 +60,7 @@ func TestCompareAssetsStatusRouting(t *testing.T) {
 		"coverage_complete":true,
 		"target_plan_digest":"test-plan"
 	}`)
-	result, err := r.Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "compare.assets", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}}, Scope: testScope{}})
+	result, err := executeProviderTest(r, capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "compare.assets", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}}, Scope: testScope{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +170,7 @@ func TestCompareAssetsRejectsMalformedHistoricalValueWrappers(t *testing.T) {
 		t.Fatal(err)
 	}
 	input, _ := json.Marshal(CompareAssetsInput{Current: []string{}, Previous: []string{`{"value":"not a url"}`}, CoverageComplete: true, TargetPlanDigest: "plan"})
-	_, err = Registry(cfg).Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "compare.assets", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}}, Scope: testScope{}})
+	_, err = executeProviderTest(Registry(cfg), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "compare.assets", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}}, Scope: testScope{}})
 	if err == nil || !strings.Contains(err.Error(), "does not contain a valid HTTP URL") {
 		t.Fatalf("malformed value wrapper was not rejected: %v", err)
 	}
@@ -280,7 +300,7 @@ func TestInternalCapabilitiesEmitTypedNonNullOutputs(t *testing.T) {
 		{"report.changes", `{"changes":[],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`, &ReportChangesOutput{}},
 	}
 	for _, test := range tests {
-		result, err := registry.Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: test.name, Input: json.RawMessage(test.input)}, Policy: policy.Policy{AllowedCapabilities: []string{test.name}}, Scope: scope})
+		result, err := executeProviderTest(registry, capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: test.name, Input: json.RawMessage(test.input)}, Policy: policy.Policy{AllowedCapabilities: []string{test.name}}, Scope: scope})
 		if err != nil {
 			t.Fatalf("%s: %v", test.name, err)
 		}

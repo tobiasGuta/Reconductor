@@ -18,6 +18,25 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/targeting"
 )
 
+type integrationProvenanceRecorder struct{}
+
+func (integrationProvenanceRecorder) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
+	return domain.NewID(), nil
+}
+func (integrationProvenanceRecorder) RecordProviderInvocationStarted(context.Context, capability.ProviderInvocationStartRecord) (domain.ID, error) {
+	return domain.NewID(), nil
+}
+func (integrationProvenanceRecorder) RecordProviderInvocationTerminal(context.Context, capability.ProviderInvocationTerminalRecord) error {
+	return nil
+}
+
+func executeIntegrationCapability(registry *capability.Registry, req capability.Request) (capability.Result, error) {
+	recorder := integrationProvenanceRecorder{}
+	req.DecisionRecorder = recorder
+	req.InvocationRecorder = recorder
+	return registry.Execute(context.Background(), req)
+}
+
 func TestLocalScopePlanProbeFilterCompareAndReport(t *testing.T) {
 	var base string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -61,7 +80,7 @@ func TestLocalScopePlanProbeFilterCompareAndReport(t *testing.T) {
 	registry := providers.Registry(cfg)
 	pol := policy.Policy{AllowedCapabilities: []string{"compare.assets", "report.changes"}}
 	compareInput, _ := json.Marshal(map[string]any{"current": []string{`{"url":"` + filtered.Authorized[0] + `","status_code":200}`}, "previous": []string{}, "coverage_complete": true, "target_plan_digest": "integration-plan"})
-	compare, err := registry.Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "compare.assets", Input: compareInput}, Policy: pol, Scope: sc})
+	compare, err := executeIntegrationCapability(registry, capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "compare.assets", Input: compareInput}, Policy: pol, Scope: sc})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +89,7 @@ func TestLocalScopePlanProbeFilterCompareAndReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	reportInput, _ := json.Marshal(map[string]any{"changes": changes["changes"], "endpoints": []any{}, "candidate_matches": []string{}, "target_plan_digest": "integration-plan"})
-	report, err := registry.Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "report.changes", Input: reportInput}, Policy: pol, Scope: sc})
+	report, err := executeIntegrationCapability(registry, capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "report.changes", Input: reportInput}, Policy: pol, Scope: sc})
 	if err != nil {
 		t.Fatal(err)
 	}

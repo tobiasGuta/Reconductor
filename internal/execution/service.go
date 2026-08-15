@@ -16,15 +16,16 @@ import (
 )
 
 type Service struct {
-	Registry      *capability.Registry
-	Store         ResultStore
-	Artifacts     artifact.Storage
-	ProgramID     domain.ID
-	PolicyAuditor capability.PolicyDecisionRecorder
+	Registry        *capability.Registry
+	Store           ResultStore
+	Artifacts       artifact.Storage
+	ProgramID       domain.ID
+	PolicyAuditor   capability.PolicyDecisionRecorder
+	ProviderAuditor capability.ProviderInvocationRecorder
 }
 type ResultStore interface {
 	PreviousObservationValues(context.Context, domain.ID, domain.ID, string) ([]string, error)
-	PersistResult(context.Context, domain.ID, domain.StepRun, *domain.ToolRun, []domain.Artifact, domain.ActionResult) error
+	PersistResult(context.Context, domain.ID, domain.StepRun, *domain.ToolRun, []domain.Artifact, domain.ActionResult, *capability.ResultAdmissionProvenance) error
 }
 
 func (s Service) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
@@ -34,6 +35,12 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 	if req.DecisionRecorder == nil {
 		if recorder, ok := s.Store.(capability.PolicyDecisionRecorder); ok {
 			req.DecisionRecorder = recorder
+		}
+	}
+	req.InvocationRecorder = s.ProviderAuditor
+	if req.InvocationRecorder == nil {
+		if recorder, ok := s.Store.(capability.ProviderInvocationRecorder); ok {
+			req.InvocationRecorder = recorder
 		}
 	}
 	if req.Action.Capability == "compare.assets" {
@@ -87,10 +94,18 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 	if tool == nil {
 		now := time.Now().UTC()
 		version := "1"
+		provider := "platform"
 		if implementation, ok := s.Registry.Get(req.Action.Capability); ok {
 			version = implementation.Manifest().Version
 		}
-		tool = &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: "platform", ToolVersion: version, SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"in-process"}`), StartedAt: now, CompletedAt: &now}
+		if result.AdmissionProvenance != nil {
+			provider = result.AdmissionProvenance.Provider
+		}
+		tool = &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: provider, ToolVersion: version, SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"in-process"}`), StartedAt: now, CompletedAt: &now}
+	}
+	if result.ProviderAttemptID != nil {
+		attemptID := *result.ProviderAttemptID
+		tool.ProviderAttemptID = &attemptID
 	}
 	var artifacts []domain.Artifact
 	var persistenceErr error
@@ -153,7 +168,7 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 	}
 	if s.Store == nil {
 		persistenceErr = errors.Join(persistenceErr, fmt.Errorf("result store is required"))
-	} else if err := s.Store.PersistResult(persistCtx, s.ProgramID, step, tool, artifacts, result.Action); err != nil {
+	} else if err := s.Store.PersistResult(persistCtx, s.ProgramID, step, tool, artifacts, result.Action, result.AdmissionProvenance); err != nil {
 		persistenceErr = errors.Join(persistenceErr, err)
 	}
 	if persistenceErr != nil {

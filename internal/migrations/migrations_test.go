@@ -18,8 +18,26 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) != 10 {
+	if len(versions) != 11 {
 		t.Fatalf("migrations=%v", versions)
+	}
+	wantVersions := []string{
+		"0001_platform_core.sql",
+		"0002_findings_approvals_audit.sql",
+		"0003_audit_immutability.sql",
+		"0004_scope_target_plans.sql",
+		"0005_policy_enforcement.sql",
+		"0006_verification_verdicts.sql",
+		"0007_scheduled_reconnaissance.sql",
+		"0008_scheduler_hardening.sql",
+		"0009_scheduler_recovery_protocol.sql",
+		"0010_structured_execution_provenance.sql",
+		"0011_provider_attempt_provenance.sql",
+	}
+	for index := range wantVersions {
+		if versions[index] != wantVersions[index] {
+			t.Fatalf("migration[%d]=%q want=%q", index, versions[index], wantVersions[index])
+		}
 	}
 	for _, name := range versions {
 		body, err := files.ReadFile("sql/" + name)
@@ -138,6 +156,131 @@ func TestStructuredExecutionProvenanceMigrationPreservesLegacyAuditRows(t *testi
 		if !strings.Contains(indexDefinition, required) {
 			t.Fatalf("index definition %q missing %q", indexDefinition, required)
 		}
+	}
+}
+
+func TestProviderAttemptProvenanceMigrationConstraints(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.Close)
+	schema := "migration_provider_attempt_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	identifier := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP SCHEMA "+identifier+" CASCADE"); err != nil {
+			t.Errorf("drop migration test schema: %v", err)
+		}
+	})
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	pool, err := pgxpool.New(ctx, parsed.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	applyEmbeddedMigrationsThrough(t, ctx, pool, 10)
+
+	const (
+		programID     = "00000000-0000-4000-8000-000000002001"
+		definitionID  = "00000000-0000-4000-8000-000000002002"
+		taskID        = "00000000-0000-4000-8000-000000002003"
+		runID         = "00000000-0000-4000-8000-000000002004"
+		stepID        = "00000000-0000-4000-8000-000000002005"
+		legacyAuditID = "00000000-0000-4000-8000-000000002006"
+		legacyToolID  = "00000000-0000-4000-8000-000000002007"
+		actionID      = "00000000-0000-4000-8000-000000002008"
+		authorizeID   = "00000000-0000-4000-8000-000000002009"
+		providerID    = "00000000-0000-4000-8000-000000002010"
+		terminalID    = "00000000-0000-4000-8000-000000002011"
+		linkedToolID  = "00000000-0000-4000-8000-000000002012"
+	)
+	for _, statement := range []string{
+		`INSERT INTO programs(id,name,platform,scope_reference,policy_reference) VALUES('` + programID + `','provider-attempt-migration','integration','synthetic://local','integration')`,
+		`INSERT INTO workflow_definitions(id,name,version,definition) VALUES('` + definitionID + `','provider-attempt-migration','1','{}')`,
+		`INSERT INTO tasks(id,program_id,objective,workflow_definition_id,status,requested_by) VALUES('` + taskID + `','` + programID + `','migration','` + definitionID + `','running','integration')`,
+		`INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,trigger_source) VALUES('` + runID + `','` + taskID + `','` + definitionID + `','1','running','integration')`,
+		`INSERT INTO step_runs(id,workflow_run_id,step_definition_id,capability,status,idempotency_key) VALUES('` + stepID + `','` + runID + `','step','test.capability','running','provider-attempt-migration')`,
+		`INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,safe_message) VALUES('` + legacyAuditID + `','legacy_provider_history','test','integration','` + taskID + `','` + programID + `','` + runID + `','` + stepID + `','legacy')`,
+		`INSERT INTO tool_runs(id,step_run_id,capability,provider,started_at) VALUES('` + legacyToolID + `','` + stepID + `','test.capability','legacy',clock_timestamp())`,
+	} {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Up(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+
+	var legacyAction, legacyAttempt, legacyQueue, legacyAuthorization, legacyProvider, legacyToolProvider *string
+	if err := pool.QueryRow(ctx, `SELECT action_request_id::text,step_attempt::text,queue_job_id::text,execution_authorization_event_id::text,provider_attempt_id::text FROM audit_events WHERE id=$1`, legacyAuditID).Scan(&legacyAction, &legacyAttempt, &legacyQueue, &legacyAuthorization, &legacyProvider); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT provider_attempt_id::text FROM tool_runs WHERE id=$1`, legacyToolID).Scan(&legacyToolProvider); err != nil {
+		t.Fatal(err)
+	}
+	if legacyAction != nil || legacyAttempt != nil || legacyQueue != nil || legacyAuthorization != nil || legacyProvider != nil || legacyToolProvider != nil {
+		t.Fatalf("legacy provenance was backfilled: action=%v attempt=%v queue=%v authorization=%v provider=%v tool=%v", legacyAction, legacyAttempt, legacyQueue, legacyAuthorization, legacyProvider, legacyToolProvider)
+	}
+
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,action_request_id,step_attempt,capability,provider,safe_message,details) VALUES($1,'policy_allowed','policy','integration',$2,$3,$4,$5,$6,3,'test.capability','test-provider','allow','{"phase":"execution"}')`, authorizeID, taskID, programID, runID, stepID, actionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,action_request_id,step_attempt,execution_authorization_event_id,capability,provider,safe_message) VALUES($1,'provider_invocation_started','provider','integration',$2,$3,$4,$5,$6,3,$7,'test.capability','test-provider','start')`, providerID, taskID, programID, runID, stepID, actionID, authorizeID); err != nil {
+		t.Fatal(err)
+	}
+	var startProvider *string
+	if err := pool.QueryRow(ctx, `SELECT provider_attempt_id::text FROM audit_events WHERE id=$1`, providerID).Scan(&startProvider); err != nil || startProvider != nil {
+		t.Fatalf("start provider_attempt_id=%v err=%v", startProvider, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,action_request_id,execution_authorization_event_id,safe_message) VALUES(gen_random_uuid(),'provider_invocation_started','provider','integration',$1,$2,'bad step')`, actionID, authorizeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,execution_authorization_event_id,safe_message) VALUES(gen_random_uuid(),'provider_invocation_started','provider','integration',$1,'missing action')`, authorizeID); err == nil {
+		t.Fatal("provider start without action_request_id was accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,action_request_id,step_attempt,safe_message) VALUES(gen_random_uuid(),'test_step_attempt','test','integration',$1,0,'zero attempt')`, actionID); err == nil {
+		t.Fatal("step_attempt=0 was accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,action_request_id,step_attempt,safe_message) VALUES(gen_random_uuid(),'test_step_attempt','test','integration',$1,-1,'negative attempt')`, actionID); err == nil {
+		t.Fatal("negative step_attempt was accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,action_request_id,execution_authorization_event_id,safe_message) VALUES(gen_random_uuid(),'provider_invocation_started','provider','integration',$1,'00000000-0000-4000-8000-000000002099','missing authorization')`, actionID); err == nil {
+		t.Fatal("missing execution authorization FK was accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,provider_attempt_id,safe_message) VALUES($1,'provider_invocation_succeeded','provider','integration',$2,'success')`, terminalID, providerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,provider_attempt_id,safe_message) VALUES(gen_random_uuid(),'provider_invocation_failed','provider','integration',$1,'duplicate')`, providerID); err == nil {
+		t.Fatal("duplicate terminal was accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,safe_message) VALUES(gen_random_uuid(),'provider_invocation_cancelled','provider','integration','missing provider')`); err == nil {
+		t.Fatal("terminal without provider_attempt_id was accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,started_at,provider_attempt_id) VALUES($1,$2,'test.capability','test-provider',clock_timestamp(),$3)`, linkedToolID, stepID, providerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,started_at,provider_attempt_id) VALUES(gen_random_uuid(),$1,'test.capability','test-provider',clock_timestamp(),$2)`, stepID, providerID); err == nil {
+		t.Fatal("second ToolRun for one provider attempt was accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,started_at,provider_attempt_id) VALUES(gen_random_uuid(),$1,'test.capability','test-provider',clock_timestamp(),'00000000-0000-4000-8000-000000002099')`, stepID); err == nil {
+		t.Fatal("missing ToolRun provider attempt FK was accepted")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE audit_events SET provider_attempt_id=$2 WHERE id=$1`, legacyAuditID, providerID); err == nil || !strings.Contains(err.Error(), "audit_events are append-only") {
+		t.Fatalf("audit update error=%v", err)
 	}
 }
 
