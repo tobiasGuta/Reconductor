@@ -39,14 +39,23 @@ func IsScheduledExecutionFenceError(err error) bool {
 }
 
 type lockedResultLineage struct {
-	scheduled bool
-	taskID    domain.ID
+	scheduled    bool
+	taskID       domain.ID
+	stepStatus   domain.StepStatus
+	attemptCount int
 }
 
 func lockConflictingResultTools(ctx context.Context, tx pgx.Tx, stepID domain.ID, tool *domain.ToolRun, scheduled bool) error {
 	query := `SELECT id FROM tool_runs WHERE step_run_id=$1 ORDER BY id FOR UPDATE`
 	args := []any{stepID}
-	if tool != nil {
+	if tool != nil && tool.ProviderAttemptID != nil {
+		query = `SELECT id FROM tool_runs
+			WHERE id=$2
+			   OR provider_attempt_id=$3
+			   OR (step_run_id=$1 AND provider_attempt_id IS NULL)
+			ORDER BY id FOR UPDATE`
+		args = append(args, tool.ID, *tool.ProviderAttemptID)
+	} else if tool != nil {
 		query = `SELECT id FROM tool_runs WHERE step_run_id=$1 OR id=$2 ORDER BY id FOR UPDATE`
 		args = append(args, tool.ID)
 	}
@@ -171,8 +180,9 @@ func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step
 
 	var workflowRunID domain.ID
 	var status domain.StepStatus
+	var attemptCount int
 	var idempotencyKey, capabilityName string
-	err = tx.QueryRow(ctx, `SELECT workflow_run_id,status,idempotency_key,capability FROM step_runs WHERE id=$1 FOR UPDATE`, step.ID).Scan(&workflowRunID, &status, &idempotencyKey, &capabilityName)
+	err = tx.QueryRow(ctx, `SELECT workflow_run_id,status,attempt_count,idempotency_key,capability FROM step_runs WHERE id=$1 FOR UPDATE`, step.ID).Scan(&workflowRunID, &status, &attemptCount, &idempotencyKey, &capabilityName)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return lockedResultLineage{}, resultConflict(hasScheduled, "step does not exist")
 	}
@@ -182,16 +192,22 @@ func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step
 	if workflowRunID != step.WorkflowRunID {
 		return lockedResultLineage{}, resultConflict(hasScheduled, "step and workflow lineage do not match")
 	}
-	if status != domain.StepRunning {
-		return lockedResultLineage{}, resultConflict(hasScheduled, "step is not running")
-	}
 	if step.IdempotencyKey == "" || idempotencyKey != step.IdempotencyKey {
 		return lockedResultLineage{}, resultConflict(hasScheduled, "step idempotency identity does not match")
 	}
 	if step.Capability == "" || capabilityName != step.Capability {
 		return lockedResultLineage{}, resultConflict(hasScheduled, "step capability does not match")
 	}
-	return lockedResultLineage{scheduled: hasScheduled, taskID: taskID}, nil
+	return lockedResultLineage{scheduled: hasScheduled, taskID: taskID, stepStatus: status, attemptCount: attemptCount}, nil
+}
+
+func lockProviderStepAttempt(ctx context.Context, tx pgx.Tx, providerAttemptID domain.ID) (*int, error) {
+	var stepAttempt *int
+	err := tx.QueryRow(ctx, `SELECT step_attempt FROM audit_events WHERE id=$1 AND event_type='provider_invocation_started' FOR UPDATE`, providerAttemptID).Scan(&stepAttempt)
+	if err != nil {
+		return nil, err
+	}
+	return stepAttempt, nil
 }
 
 func lockAndValidateWorkflowSave(ctx context.Context, tx pgx.Tx, state *workflow.State, lifecyclePresent bool) error {

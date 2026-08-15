@@ -366,6 +366,351 @@ func TestScheduledPersistResultRequiresExactProviderAdmission(t *testing.T) {
 	}
 }
 
+func TestPersistResultProviderRetryAdmission(t *testing.T) {
+	t.Run("P1 retryable followed by P2 success preserves complete attempt evidence", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-retry-success", "probe.http")
+		firstOutput := json.RawMessage(`{"lines":["http://127.0.0.1/first"],"authorized":["http://127.0.0.1/first"],"filtered":[{"target":"http://127.0.0.1/blocked-first","reason":"matched_exclusion"}]}`)
+		firstAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		firstStep, firstTool, firstArtifacts, firstResult := scheduledResultPayload(fixture, firstOutput)
+		makeRetryableResult(&firstStep, &firstResult)
+		applyScheduledProviderAdmission(firstTool, &firstResult, firstAdmission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, firstStep, firstTool, firstArtifacts, firstResult, firstAdmission); err != nil {
+			t.Fatal(err)
+		}
+		assertPersistedStepState(t, fixture, domain.StepRetryable, 1, false)
+		assertResultRowCounts(t, fixture, 1, 1, 0, 0, 1)
+		assertTargetDecisionCount(t, fixture, 0)
+
+		secondOutput := json.RawMessage(`{"lines":["http://127.0.0.1/second"],"authorized":["http://127.0.0.1/second"],"filtered":[{"target":"http://127.0.0.1/blocked-second","reason":"matched_exclusion"}]}`)
+		secondAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 2), nil, "fixture-provider")
+		secondStep, secondTool, secondArtifacts, secondResult := scheduledResultPayload(fixture, secondOutput)
+		applyScheduledProviderAdmission(secondTool, &secondResult, secondAdmission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, secondStep, secondTool, secondArtifacts, secondResult, secondAdmission); err != nil {
+			t.Fatal(err)
+		}
+		assertPersistedStepState(t, fixture, domain.StepSucceeded, 2, true)
+		assertResultRowCounts(t, fixture, 2, 2, 1, 0, 2)
+		assertTargetDecisionCount(t, fixture, 2)
+
+		var providerAttempts, artifactTools, executionAttempts int
+		if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT
+			(SELECT count(DISTINCT provider_attempt_id) FROM tool_runs WHERE step_run_id=$1),
+			(SELECT count(DISTINCT tool_run_id) FROM artifacts WHERE step_run_id=$1),
+			(SELECT count(DISTINCT provider_attempt_id) FROM audit_events WHERE step_run_id=$1 AND event_type='tool_execution')`, fixture.stepID).Scan(&providerAttempts, &artifactTools, &executionAttempts); err != nil {
+			t.Fatal(err)
+		}
+		if providerAttempts != 2 || artifactTools != 2 || executionAttempts != 2 || firstTool.ID == secondTool.ID || firstAdmission.ProviderAttemptID == secondAdmission.ProviderAttemptID {
+			t.Fatalf("attempt linkage providers=%d artifact_tools=%d execution_attempts=%d", providerAttempts, artifactTools, executionAttempts)
+		}
+	})
+
+	t.Run("same P duplicate and ToolRun ID collision leave no mutation", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-retry-duplicates", "probe.http")
+		admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		makeRetryableResult(&step, &result)
+		applyScheduledProviderAdmission(tool, &result, admission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission); err != nil {
+			t.Fatal(err)
+		}
+
+		duplicateStep, duplicateTool, duplicateArtifacts, duplicateResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		applyScheduledProviderAdmission(duplicateTool, &duplicateResult, admission)
+		before := resultFenceSnapshot(t, fixture)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, duplicateStep, duplicateTool, duplicateArtifacts, duplicateResult, admission); !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("same-P duplicate error=%v", err)
+		}
+		if after := resultFenceSnapshot(t, fixture); after != before {
+			t.Fatalf("same-P duplicate mutated database\nbefore=%s\nafter=%s", before, after)
+		}
+
+		collisionAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 2), nil, "fixture-provider")
+		collisionStep, collisionTool, collisionArtifacts, collisionResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		collisionTool.ID = tool.ID
+		for index := range collisionArtifacts {
+			collisionArtifacts[index].ToolRunID = collisionTool.ID
+		}
+		applyScheduledProviderAdmission(collisionTool, &collisionResult, collisionAdmission)
+		before = resultFenceSnapshot(t, fixture)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, collisionStep, collisionTool, collisionArtifacts, collisionResult, collisionAdmission); !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("ToolRun collision error=%v", err)
+		}
+		if after := resultFenceSnapshot(t, fixture); after != before {
+			t.Fatalf("ToolRun collision mutated database\nbefore=%s\nafter=%s", before, after)
+		}
+	})
+
+	t.Run("P already used by another StepRun is a scheduled result conflict", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-retry-cross-step-provider-attempt", "probe.http")
+		admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		foreignStepID := domain.NewID()
+		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO step_runs(id,workflow_run_id,step_definition_id,capability,status,attempt_count,input,started_at,idempotency_key)
+			VALUES($1,$2,'foreign-provider','probe.http','running',1,'{}',clock_timestamp(),$3)`, foreignStepID, fixture.lineage.runID, string(domain.NewID())); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,provider_attempt_id)
+			VALUES($1,$2,'probe.http','fixture-provider','1','{}','{}',clock_timestamp(),$3)`, domain.NewID(), foreignStepID, admission.ProviderAttemptID); err != nil {
+			t.Fatal(err)
+		}
+
+		step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		applyScheduledProviderAdmission(tool, &result, admission)
+		before := resultFenceSnapshot(t, fixture)
+		var toolCountBefore int
+		if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT count(*) FROM tool_runs`).Scan(&toolCountBefore); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission); !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("cross-Step P collision error=%v", err)
+		}
+		if after := resultFenceSnapshot(t, fixture); after != before {
+			t.Fatalf("cross-Step P collision mutated database\nbefore=%s\nafter=%s", before, after)
+		}
+		var toolCountAfter int
+		if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT count(*) FROM tool_runs`).Scan(&toolCountAfter); err != nil {
+			t.Fatal(err)
+		}
+		if toolCountAfter != toolCountBefore {
+			t.Fatalf("cross-Step P collision tool count=%d want=%d", toolCountAfter, toolCountBefore)
+		}
+	})
+
+	t.Run("P1 retryable followed by P2 retryable preserves an open StepRun", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-retry-retryable", "probe.http")
+		firstOutput := json.RawMessage(`{"lines":["http://127.0.0.1/first"],"authorized":["http://127.0.0.1/first"],"filtered":[{"target":"http://127.0.0.1/blocked-first","reason":"matched_exclusion"}]}`)
+		firstAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		firstStep, firstTool, firstArtifacts, firstResult := scheduledResultPayload(fixture, firstOutput)
+		makeRetryableResult(&firstStep, &firstResult)
+		applyScheduledProviderAdmission(firstTool, &firstResult, firstAdmission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, firstStep, firstTool, firstArtifacts, firstResult, firstAdmission); err != nil {
+			t.Fatal(err)
+		}
+
+		secondOutput := json.RawMessage(`{"lines":["http://127.0.0.1/second"],"authorized":["http://127.0.0.1/second"],"filtered":[{"target":"http://127.0.0.1/blocked-second","reason":"matched_exclusion"}]}`)
+		secondAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 2), nil, "fixture-provider")
+		secondStep, secondTool, secondArtifacts, secondResult := scheduledResultPayload(fixture, secondOutput)
+		makeRetryableResult(&secondStep, &secondResult)
+		applyScheduledProviderAdmission(secondTool, &secondResult, secondAdmission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, secondStep, secondTool, secondArtifacts, secondResult, secondAdmission); err != nil {
+			t.Fatal(err)
+		}
+
+		assertPersistedStepState(t, fixture, domain.StepRetryable, 2, false)
+		assertResultRowCounts(t, fixture, 2, 2, 0, 0, 2)
+		assertAttemptEvidence(t, fixture, 2)
+		assertNoSuccessOnlyDerivedData(t, fixture)
+		if firstTool.ID == secondTool.ID || firstAdmission.ProviderAttemptID == secondAdmission.ProviderAttemptID {
+			t.Fatal("retryable provider attempts did not retain distinct identities")
+		}
+	})
+
+	t.Run("P1 retryable followed by P2 terminal failure closes the StepRun", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-retry-terminal-failure", "probe.http")
+		firstOutput := json.RawMessage(`{"lines":["http://127.0.0.1/first"],"authorized":["http://127.0.0.1/first"],"filtered":[{"target":"http://127.0.0.1/blocked-first","reason":"matched_exclusion"}]}`)
+		firstAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		firstStep, firstTool, firstArtifacts, firstResult := scheduledResultPayload(fixture, firstOutput)
+		makeRetryableResult(&firstStep, &firstResult)
+		applyScheduledProviderAdmission(firstTool, &firstResult, firstAdmission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, firstStep, firstTool, firstArtifacts, firstResult, firstAdmission); err != nil {
+			t.Fatal(err)
+		}
+
+		secondOutput := json.RawMessage(`{"lines":["http://127.0.0.1/second"],"authorized":["http://127.0.0.1/second"],"filtered":[{"target":"http://127.0.0.1/blocked-second","reason":"matched_exclusion"}]}`)
+		secondAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 2), nil, "fixture-provider")
+		secondStep, secondTool, secondArtifacts, secondResult := scheduledResultPayload(fixture, secondOutput)
+		makeTerminalFailedResult(&secondStep, &secondResult)
+		applyScheduledProviderAdmission(secondTool, &secondResult, secondAdmission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, secondStep, secondTool, secondArtifacts, secondResult, secondAdmission); err != nil {
+			t.Fatal(err)
+		}
+
+		assertPersistedStepState(t, fixture, domain.StepFailed, 2, true)
+		assertResultRowCounts(t, fixture, 2, 2, 0, 0, 2)
+		assertAttemptEvidence(t, fixture, 2)
+		assertNoSuccessOnlyDerivedData(t, fixture)
+		if firstTool.ID == secondTool.ID || firstAdmission.ProviderAttemptID == secondAdmission.ProviderAttemptID {
+			t.Fatal("failed provider attempts did not retain distinct identities")
+		}
+
+		lateAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 3), nil, "fixture-provider")
+		lateStep, lateTool, lateArtifacts, lateResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		applyScheduledProviderAdmission(lateTool, &lateResult, lateAdmission)
+		before := resultFenceSnapshot(t, fixture)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, lateStep, lateTool, lateArtifacts, lateResult, lateAdmission); !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("late result after terminal failure error=%v", err)
+		}
+		if after := resultFenceSnapshot(t, fixture); after != before {
+			t.Fatalf("late result after terminal failure mutated database\nbefore=%s\nafter=%s", before, after)
+		}
+		assertAttemptEvidence(t, fixture, 2)
+	})
+
+	t.Run("different P with equal A is admitted without increment", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-retry-equal-attempt", "probe.http")
+		firstAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		firstStep, firstTool, firstArtifacts, firstResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		makeRetryableResult(&firstStep, &firstResult)
+		applyScheduledProviderAdmission(firstTool, &firstResult, firstAdmission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, firstStep, firstTool, firstArtifacts, firstResult, firstAdmission); err != nil {
+			t.Fatal(err)
+		}
+		secondAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		secondStep, secondTool, secondArtifacts, secondResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		applyScheduledProviderAdmission(secondTool, &secondResult, secondAdmission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, secondStep, secondTool, secondArtifacts, secondResult, secondAdmission); err != nil {
+			t.Fatal(err)
+		}
+		assertPersistedStepState(t, fixture, domain.StepSucceeded, 1, true)
+		assertResultRowCounts(t, fixture, 2, 2, 0, 0, 2)
+	})
+
+	t.Run("lower A rejects and null A preserves stored attempt count", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-retry-attempt-order", "probe.http")
+		firstAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 2), nil, "fixture-provider")
+		firstStep, firstTool, firstArtifacts, firstResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		makeRetryableResult(&firstStep, &firstResult)
+		applyScheduledProviderAdmission(firstTool, &firstResult, firstAdmission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, firstStep, firstTool, firstArtifacts, firstResult, firstAdmission); err != nil {
+			t.Fatal(err)
+		}
+		assertPersistedStepState(t, fixture, domain.StepRetryable, 2, false)
+
+		staleAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		staleStep, staleTool, staleArtifacts, staleResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		applyScheduledProviderAdmission(staleTool, &staleResult, staleAdmission)
+		before := resultFenceSnapshot(t, fixture)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, staleStep, staleTool, staleArtifacts, staleResult, staleAdmission); !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("lower attempt error=%v", err)
+		}
+		if after := resultFenceSnapshot(t, fixture); after != before {
+			t.Fatalf("lower attempt mutated database\nbefore=%s\nafter=%s", before, after)
+		}
+
+		nullFixture := newScheduledResultFixture(t, "provider-retry-null-attempt", "probe.http")
+		if _, err := nullFixture.env.store.Pool.Exec(nullFixture.env.ctx, `UPDATE step_runs SET attempt_count=3 WHERE id=$1`, nullFixture.stepID); err != nil {
+			t.Fatal(err)
+		}
+		nullAdmission := recordScheduledProviderAdmission(t, nullFixture, nullFixture.context(), nullFixture.env.programID, scheduledProviderAction(nullFixture, 0), nil, "fixture-provider")
+		nullStep, nullTool, nullArtifacts, nullResult := scheduledResultPayload(nullFixture, json.RawMessage(`{"lines":[]}`))
+		makeRetryableResult(&nullStep, &nullResult)
+		applyScheduledProviderAdmission(nullTool, &nullResult, nullAdmission)
+		if err := nullFixture.env.store.PersistResult(nullFixture.context(), nullFixture.env.programID, nullStep, nullTool, nullArtifacts, nullResult, nullAdmission); err != nil {
+			t.Fatal(err)
+		}
+		assertPersistedStepState(t, nullFixture, domain.StepRetryable, 3, false)
+	})
+
+	t.Run("legacy null P remains strict and cannot mix", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-retry-legacy-first", "probe.http")
+		legacyStep, legacyTool, legacyArtifacts, legacyResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		makeRetryableResult(&legacyStep, &legacyResult)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, legacyStep, legacyTool, legacyArtifacts, legacyResult, nil); err != nil {
+			t.Fatal(err)
+		}
+		exactAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 2), nil, "fixture-provider")
+		exactStep, exactTool, exactArtifacts, exactResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		applyScheduledProviderAdmission(exactTool, &exactResult, exactAdmission)
+		before := resultFenceSnapshot(t, fixture)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, exactStep, exactTool, exactArtifacts, exactResult, exactAdmission); !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("exact P mixed with legacy error=%v", err)
+		}
+		if after := resultFenceSnapshot(t, fixture); after != before {
+			t.Fatalf("exact P mixed with legacy mutated database\nbefore=%s\nafter=%s", before, after)
+		}
+
+		exactFixture := newScheduledResultFixture(t, "provider-retry-exact-first", "probe.http")
+		firstAdmission := recordScheduledProviderAdmission(t, exactFixture, exactFixture.context(), exactFixture.env.programID, scheduledProviderAction(exactFixture, 1), nil, "fixture-provider")
+		firstStep, firstTool, firstArtifacts, firstResult := scheduledResultPayload(exactFixture, json.RawMessage(`{"lines":[]}`))
+		makeRetryableResult(&firstStep, &firstResult)
+		applyScheduledProviderAdmission(firstTool, &firstResult, firstAdmission)
+		if err := exactFixture.env.store.PersistResult(exactFixture.context(), exactFixture.env.programID, firstStep, firstTool, firstArtifacts, firstResult, firstAdmission); err != nil {
+			t.Fatal(err)
+		}
+		lateLegacyStep, lateLegacyTool, lateLegacyArtifacts, lateLegacyResult := scheduledResultPayload(exactFixture, json.RawMessage(`{"lines":[]}`))
+		before = resultFenceSnapshot(t, exactFixture)
+		if err := exactFixture.env.store.PersistResult(exactFixture.context(), exactFixture.env.programID, lateLegacyStep, lateLegacyTool, lateLegacyArtifacts, lateLegacyResult, nil); !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("legacy P reopened retryable error=%v", err)
+		}
+		if after := resultFenceSnapshot(t, exactFixture); after != before {
+			t.Fatalf("legacy P reopened retryable mutated database\nbefore=%s\nafter=%s", before, after)
+		}
+	})
+
+	t.Run("terminal StepRun rejects later new P", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "provider-retry-terminal", "probe.http")
+		firstAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		firstStep, firstTool, firstArtifacts, firstResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		applyScheduledProviderAdmission(firstTool, &firstResult, firstAdmission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, firstStep, firstTool, firstArtifacts, firstResult, firstAdmission); err != nil {
+			t.Fatal(err)
+		}
+		lateAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 2), nil, "fixture-provider")
+		lateStep, lateTool, lateArtifacts, lateResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		applyScheduledProviderAdmission(lateTool, &lateResult, lateAdmission)
+		before := resultFenceSnapshot(t, fixture)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, lateStep, lateTool, lateArtifacts, lateResult, lateAdmission); !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("late terminal result error=%v", err)
+		}
+		if after := resultFenceSnapshot(t, fixture); after != before {
+			t.Fatalf("late terminal result mutated database\nbefore=%s\nafter=%s", before, after)
+		}
+	})
+}
+
+func TestConcurrentDistinctProviderAttemptsFromRetryableSerialize(t *testing.T) {
+	fixture := newScheduledResultFixture(t, "provider-retry-concurrent", "probe.http")
+	firstAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+	firstStep, firstTool, firstArtifacts, firstResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+	makeRetryableResult(&firstStep, &firstResult)
+	applyScheduledProviderAdmission(firstTool, &firstResult, firstAdmission)
+	if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, firstStep, firstTool, firstArtifacts, firstResult, firstAdmission); err != nil {
+		t.Fatal(err)
+	}
+
+	type candidate struct {
+		step      domain.StepRun
+		tool      *domain.ToolRun
+		artifacts []domain.Artifact
+		result    domain.ActionResult
+		admission *capability.ResultAdmissionProvenance
+	}
+	candidates := make([]candidate, 0, 2)
+	for index := range 2 {
+		admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 2), nil, "fixture-provider")
+		step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(fmt.Sprintf(`{"lines":["http://127.0.0.1/%d"]}`, index)))
+		applyScheduledProviderAdmission(tool, &result, admission)
+		candidates = append(candidates, candidate{step: step, tool: tool, artifacts: artifacts, result: result, admission: admission})
+	}
+	runCtx, cancel := context.WithTimeout(fixture.context(), 8*time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, item := range candidates {
+		item := item
+		go func() {
+			<-start
+			results <- fixture.env.store.PersistResult(runCtx, fixture.env.programID, item.step, item.tool, item.artifacts, item.result, item.admission)
+		}()
+	}
+	close(start)
+	succeeded, rejected := 0, 0
+	for range 2 {
+		switch err := <-results; {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrStaleScheduledExecutionResult):
+			rejected++
+		default:
+			t.Fatalf("concurrent result error=%v", err)
+		}
+	}
+	if succeeded != 1 || rejected != 1 {
+		t.Fatalf("concurrent outcomes succeeded=%d rejected=%d", succeeded, rejected)
+	}
+	assertPersistedStepState(t, fixture, domain.StepSucceeded, 2, true)
+	assertResultRowCounts(t, fixture, 2, 2, 1, 0, 2)
+}
+
 func TestScheduledWorkflowSaveFence(t *testing.T) {
 	t.Run("current scheduled attempt saves", func(t *testing.T) {
 		fixture := newScheduledResultFixture(t, "save-current", "probe.http")
@@ -682,6 +1027,85 @@ func scheduledResultPayload(fixture scheduledResultFixture, output json.RawMessa
 	artifacts := []domain.Artifact{{ID: artifactID, TaskID: fixture.lineage.task.ID, WorkflowRunID: fixture.lineage.runID, StepRunID: fixture.stepID, ToolRunID: toolID, Type: "normalized-result", ContentType: "application/json", Size: int64(len(output)), SHA256: strings.Repeat("a", 64), StorageLocation: "synthetic://result.json", CreatedAt: now, RedactionState: "redacted"}}
 	result := domain.ActionResult{RequestID: domain.NewID(), Status: "succeeded", Summary: "fixture result succeeded", Output: output, ArtifactIDs: []domain.ID{artifactID}}
 	return step, tool, artifacts, result
+}
+
+func makeRetryableResult(step *domain.StepRun, result *domain.ActionResult) {
+	step.Status = domain.StepRetryable
+	step.CompletedAt = nil
+	step.ErrorClassification = "provider_error"
+	step.ErrorDetails = "temporary provider failure"
+	result.Status = "failed"
+	result.Summary = "temporary provider failure"
+	result.Error = &domain.StructuredError{Classification: step.ErrorClassification, Message: step.ErrorDetails, Retryable: true}
+}
+
+func makeTerminalFailedResult(step *domain.StepRun, result *domain.ActionResult) {
+	now := time.Now().UTC()
+	step.Status = domain.StepFailed
+	step.CompletedAt = &now
+	step.ErrorClassification = "provider_error"
+	step.ErrorDetails = "terminal provider failure"
+	result.Status = "failed"
+	result.Summary = "terminal provider failure"
+	result.Error = &domain.StructuredError{Classification: step.ErrorClassification, Message: step.ErrorDetails, Retryable: false}
+}
+
+func assertPersistedStepState(t *testing.T, fixture scheduledResultFixture, status domain.StepStatus, attemptCount int, completed bool) {
+	t.Helper()
+	var gotStatus domain.StepStatus
+	var gotAttemptCount int
+	var completedAt *time.Time
+	if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT status,attempt_count,completed_at FROM step_runs WHERE id=$1`, fixture.stepID).Scan(&gotStatus, &gotAttemptCount, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if gotStatus != status || gotAttemptCount != attemptCount || (completedAt != nil) != completed {
+		t.Fatalf("step status=%s attempt_count=%d completed_at=%v", gotStatus, gotAttemptCount, completedAt)
+	}
+}
+
+func assertTargetDecisionCount(t *testing.T, fixture scheduledResultFixture, want int) {
+	t.Helper()
+	var count int
+	if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT count(*) FROM audit_events WHERE step_run_id=$1 AND event_type IN ('target_accepted','target_filtered','exclusion_matched','protocol_or_port_rejected')`, fixture.stepID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != want {
+		t.Fatalf("target decision events=%d want=%d", count, want)
+	}
+}
+
+func assertAttemptEvidence(t *testing.T, fixture scheduledResultFixture, want int) {
+	t.Helper()
+	var tools, providerAttempts, artifacts, artifactTools, toolAudits, auditAttempts, auditTools int
+	if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT
+		(SELECT count(*) FROM tool_runs WHERE step_run_id=$1),
+		(SELECT count(DISTINCT provider_attempt_id) FROM tool_runs WHERE step_run_id=$1),
+		(SELECT count(*) FROM artifacts WHERE step_run_id=$1),
+		(SELECT count(DISTINCT tool_run_id) FROM artifacts WHERE step_run_id=$1),
+		(SELECT count(*) FROM audit_events WHERE step_run_id=$1 AND event_type='tool_execution'),
+		(SELECT count(DISTINCT provider_attempt_id) FROM audit_events WHERE step_run_id=$1 AND event_type='tool_execution'),
+		(SELECT count(DISTINCT tool_run_id) FROM audit_events WHERE step_run_id=$1 AND event_type='tool_execution')`, fixture.stepID).Scan(&tools, &providerAttempts, &artifacts, &artifactTools, &toolAudits, &auditAttempts, &auditTools); err != nil {
+		t.Fatal(err)
+	}
+	if tools != want || providerAttempts != want || artifacts != want || artifactTools != want || toolAudits != want || auditAttempts != want || auditTools != want {
+		t.Fatalf("attempt evidence tools=%d provider_attempts=%d artifacts=%d artifact_tools=%d tool_audits=%d audit_attempts=%d audit_tools=%d want=%d", tools, providerAttempts, artifacts, artifactTools, toolAudits, auditAttempts, auditTools, want)
+	}
+}
+
+func assertNoSuccessOnlyDerivedData(t *testing.T, fixture scheduledResultFixture) {
+	t.Helper()
+	var observations, findings, changes, endpoints, targetDecisions int
+	if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT
+		(SELECT count(*) FROM asset_observations WHERE workflow_run_id=$1),
+		(SELECT count(*) FROM candidate_findings WHERE workflow_run_id=$1),
+		(SELECT count(*) FROM change_items WHERE workflow_run_id=$1),
+		(SELECT count(*) FROM endpoints WHERE program_id=$2),
+		(SELECT count(*) FROM audit_events WHERE step_run_id=$3 AND event_type IN ('target_accepted','target_filtered','exclusion_matched','protocol_or_port_rejected'))`, fixture.lineage.runID, fixture.env.programID, fixture.stepID).Scan(&observations, &findings, &changes, &endpoints, &targetDecisions); err != nil {
+		t.Fatal(err)
+	}
+	if observations != 0 || findings != 0 || changes != 0 || endpoints != 0 || targetDecisions != 0 {
+		t.Fatalf("success-only data observations=%d findings=%d changes=%d endpoints=%d target_decisions=%d", observations, findings, changes, endpoints, targetDecisions)
+	}
 }
 
 func scheduledFixtureState(fixture scheduledResultFixture, runStatus domain.RunStatus, stepStatus domain.StepStatus) *workflow.State {

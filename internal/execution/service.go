@@ -163,6 +163,7 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 			step.ErrorDetails = result.Action.Error.Message
 			if result.Action.Error.Retryable {
 				step.Status = domain.StepRetryable
+				step.CompletedAt = nil
 			}
 		}
 	}
