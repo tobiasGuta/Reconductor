@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
@@ -22,6 +23,17 @@ type scheduledResultFixture struct {
 	idempotencyKey string
 	capability     string
 	fence          ScheduledExecutionFence
+}
+
+type providerResultCollisionCandidate struct {
+	fixture   scheduledResultFixture
+	action    domain.ActionRequest
+	admission *capability.ResultAdmissionProvenance
+	step      domain.StepRun
+	tool      *domain.ToolRun
+	artifacts []domain.Artifact
+	result    domain.ActionResult
+	before    string
 }
 
 func TestScheduledPersistResultFenceAcceptanceAndRejection(t *testing.T) {
@@ -366,6 +378,323 @@ func TestScheduledPersistResultRequiresExactProviderAdmission(t *testing.T) {
 	}
 }
 
+func TestProviderResultAcceptedDecisionProvenance(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*domain.StepRun, *domain.ActionResult)
+	}{
+		{name: "success"},
+		{name: "retryable", mutate: makeRetryableResult},
+		{name: "terminal failure", mutate: makeTerminalFailedResult},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newScheduledResultFixture(t, "result-decision-accepted-"+strings.ReplaceAll(test.name, " ", "-"), "probe.http")
+			action := scheduledProviderAction(fixture, 1)
+			queueJobID := domain.NewID()
+			admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, &queueJobID, "fixture-provider")
+			step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+			if test.mutate != nil {
+				test.mutate(&step, &result)
+			}
+			applyScheduledProviderAdmission(tool, &result, admission)
+
+			if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission); err != nil {
+				t.Fatal(err)
+			}
+
+			decision := loadProviderResultDecision(t, fixture, "provider_result_accepted", admission.ProviderAttemptID, "")
+			assertProviderResultDecisionProvenance(t, decision, providerResultDecisionExpectation{
+				Actor:                         action.RequestedBy,
+				TaskID:                        fixture.lineage.task.ID,
+				ProgramID:                     fixture.env.programID,
+				WorkflowRunID:                 fixture.lineage.runID,
+				StepRunID:                     fixture.stepID,
+				ToolRunID:                     &tool.ID,
+				ScheduledExecutionID:          fixture.lineage.execution.ID,
+				SchedulerAttempt:              fixture.fence.Attempt,
+				ActionRequestID:               action.ID,
+				StepAttempt:                   action.StepAttempt,
+				QueueJobID:                    &queueJobID,
+				ExecutionAuthorizationEventID: admission.ExecutionAuthorizationEventID,
+				ProviderAttemptID:             admission.ProviderAttemptID,
+				Capability:                    fixture.capability,
+				Provider:                      admission.Provider,
+				SafeMessage:                   "provider result accepted by persistence fence",
+				Details:                       `{}`,
+			})
+			assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_accepted", "", 1)
+		})
+	}
+}
+
+func TestProviderResultAcceptedDecisionFailureRollsBackResult(t *testing.T) {
+	fixture := newScheduledResultFixture(t, "result-decision-accepted-rollback", "probe.http")
+	admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+	step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+	applyScheduledProviderAdmission(tool, &result, admission)
+	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `CREATE FUNCTION reject_provider_result_accepted() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.event_type='provider_result_accepted' THEN
+				RAISE EXCEPTION 'synthetic accepted decision rejection';
+			END IF;
+			RETURN NEW;
+		END $$;
+		CREATE TRIGGER reject_provider_result_accepted BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION reject_provider_result_accepted()`); err != nil {
+		t.Fatal(err)
+	}
+
+	before := resultFenceSnapshot(t, fixture)
+	err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission)
+	if err == nil || !strings.Contains(err.Error(), "synthetic accepted decision rejection") {
+		t.Fatalf("accepted decision failure=%v", err)
+	}
+	if after := resultFenceSnapshot(t, fixture); after != before {
+		t.Fatalf("accepted decision failure mutated result\nbefore=%s\nafter=%s", before, after)
+	}
+	assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_accepted", "", 0)
+	assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_rejected", "", 0)
+}
+
+func TestProviderResultRejectedReasonCodes(t *testing.T) {
+	type rejectionCase struct {
+		code    resultFenceReasonCode
+		prepare func(*testing.T, scheduledResultFixture, *context.Context, *domain.ID, *domain.StepRun, *domain.ToolRun, *[]domain.Artifact, *domain.ActionResult, *capability.ResultAdmissionProvenance)
+	}
+	tests := []rejectionCase{
+		{code: resultFenceInvalidResultIdentity, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, step *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			step.ID = ""
+		}},
+		{code: resultFenceInvalidScheduledClaim, prepare: func(_ *testing.T, fixture scheduledResultFixture, ctx *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			*ctx = WithScheduledExecutionFence(fixture.env.ctx, ScheduledExecutionFence{ExecutionID: fixture.fence.ExecutionID, Attempt: fixture.fence.Attempt})
+		}},
+		{code: resultFenceScheduledExecutionUnavailable, prepare: func(t *testing.T, fixture scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE scheduled_executions SET status='completed' WHERE id=$1`, fixture.lineage.execution.ID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{code: resultFenceScheduledLineageMismatch, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, programID *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			*programID = domain.NewID()
+		}},
+		{code: resultFenceScheduledClaimMismatch, prepare: func(_ *testing.T, fixture scheduledResultFixture, ctx *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			wrong := fixture.fence
+			wrong.LeaseOwner = "wrong-owner"
+			*ctx = WithScheduledExecutionFence(fixture.env.ctx, wrong)
+		}},
+		{code: resultFenceScheduledLeaseExpired, prepare: func(t *testing.T, fixture scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			expireRecoveryLease(t, fixture.env, fixture.lineage.execution.ID, fixture.fence.Attempt)
+		}},
+		{code: resultFenceWorkflowLineageMismatch, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, step *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			step.IdempotencyKey = "wrong-key"
+		}},
+		{code: resultFenceWorkflowNotRunning, prepare: func(t *testing.T, fixture scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE workflow_runs SET status='failed' WHERE id=$1`, fixture.lineage.runID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{code: resultFenceInvalidResultState, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, step *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			step.Status = domain.StepPending
+		}},
+		{code: resultFenceToolLineageMismatch, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, tool *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			tool.StepRunID = domain.NewID()
+		}},
+		{code: resultFenceProviderProvenanceMismatch, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, result *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			result.RequestID = domain.NewID()
+		}},
+		{code: resultFenceStepNotAdmittingResult, prepare: func(t *testing.T, fixture scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE step_runs SET status='succeeded',completed_at=clock_timestamp() WHERE id=$1`, fixture.stepID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{code: resultFenceStaleProviderStepAttempt, prepare: func(t *testing.T, fixture scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE step_runs SET attempt_count=2 WHERE id=$1`, fixture.stepID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{code: resultFenceToolResultConflict, prepare: func(t *testing.T, fixture scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,started_at) VALUES($1,$2,$3,'legacy',clock_timestamp())`, domain.NewID(), fixture.stepID, fixture.capability); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{code: resultFenceArtifactIdentityInvalid, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			(*artifacts)[0].ID = ""
+		}},
+		{code: resultFenceArtifactLineageMismatch, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			(*artifacts)[0].ToolRunID = domain.NewID()
+		}},
+		{code: resultFenceArtifactResultConflict, prepare: prepareArtifactResultConflict},
+		{code: resultFenceConcurrentStepChange, prepare: func(t *testing.T, fixture scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, _ *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `CREATE FUNCTION suppress_result_step_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+				CREATE TRIGGER suppress_result_step_update BEFORE UPDATE OF status ON step_runs FOR EACH ROW WHEN (OLD.id = '`+string(fixture.stepID)+`') EXECUTE FUNCTION suppress_result_step_update()`); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.code), func(t *testing.T) {
+			fixture := newScheduledResultFixture(t, "result-reason-"+string(test.code), "probe.http")
+			action := scheduledProviderAction(fixture, 1)
+			admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, nil, "fixture-provider")
+			step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+			applyScheduledProviderAdmission(tool, &result, admission)
+			ctx := fixture.context()
+			programID := fixture.env.programID
+			test.prepare(t, fixture, &ctx, &programID, &step, tool, &artifacts, &result, admission)
+			before := resultFenceSnapshot(t, fixture)
+
+			err := fixture.env.store.PersistResult(ctx, programID, step, tool, artifacts, result, admission)
+			if !errors.Is(err, ErrStaleScheduledExecutionResult) {
+				t.Fatalf("rejection error=%v want %v", err, ErrStaleScheduledExecutionResult)
+			}
+			if after := resultFenceSnapshot(t, fixture); after != before {
+				t.Fatalf("rejection mutated result\nbefore=%s\nafter=%s", before, after)
+			}
+			decision := loadProviderResultDecision(t, fixture, "provider_result_rejected", admission.ProviderAttemptID, string(test.code))
+			if decision.Actor != action.RequestedBy || decision.Component != "result_fence" || decision.ProviderAttemptID != admission.ProviderAttemptID || decision.SafeMessage != "provider result rejected by persistence fence" || decision.Details != `{"reason_code": "`+string(test.code)+`"}` {
+				t.Fatalf("rejected decision=%#v", decision)
+			}
+			if strings.Contains(decision.SafeMessage+decision.Details, err.Error()) || strings.Contains(decision.SafeMessage+decision.Details, string(result.Output)) {
+				t.Fatalf("rejected decision leaked internal data: %#v", decision)
+			}
+		})
+	}
+}
+
+func TestProviderResultRejectedUsesImmutableLineageAndDeduplicates(t *testing.T) {
+	fixture := newScheduledResultFixture(t, "result-rejected-immutable", "probe.http")
+	action := scheduledProviderAction(fixture, 1)
+	queueJobID := domain.NewID()
+	admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, &queueJobID, "fixture-provider")
+	step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"submitted":"must-not-persist"}`))
+	applyScheduledProviderAdmission(tool, &result, admission)
+	tool.Provider = "submitted-forged-provider"
+
+	for range 2 {
+		err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission)
+		if !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("rejection error=%v", err)
+		}
+	}
+	assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_rejected", string(resultFenceProviderProvenanceMismatch), 1)
+	decision := loadProviderResultDecision(t, fixture, "provider_result_rejected", admission.ProviderAttemptID, string(resultFenceProviderProvenanceMismatch))
+	assertProviderResultDecisionProvenance(t, decision, providerResultDecisionExpectation{
+		Actor:                         action.RequestedBy,
+		TaskID:                        fixture.lineage.task.ID,
+		ProgramID:                     fixture.env.programID,
+		WorkflowRunID:                 fixture.lineage.runID,
+		StepRunID:                     fixture.stepID,
+		ScheduledExecutionID:          fixture.lineage.execution.ID,
+		SchedulerAttempt:              fixture.fence.Attempt,
+		ActionRequestID:               action.ID,
+		StepAttempt:                   action.StepAttempt,
+		QueueJobID:                    &queueJobID,
+		ExecutionAuthorizationEventID: admission.ExecutionAuthorizationEventID,
+		ProviderAttemptID:             admission.ProviderAttemptID,
+		Capability:                    fixture.capability,
+		Provider:                      admission.Provider,
+		SafeMessage:                   "provider result rejected by persistence fence",
+		Details:                       `{"reason_code": "provider_provenance_mismatch"}`,
+	})
+	if decision.ToolRunID != nil || strings.Contains(decision.Details, "must-not-persist") || strings.Contains(decision.Details, "submitted-forged-provider") {
+		t.Fatalf("rejected decision trusted submitted data: %#v", decision)
+	}
+}
+
+func TestProviderResultDuplicateLinksAuthoritativeToolAndConcurrentRejectionDeduplicates(t *testing.T) {
+	fixture := newScheduledResultFixture(t, "result-rejected-authoritative-tool", "probe.http")
+	admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+	firstStep, firstTool, firstArtifacts, firstResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+	makeRetryableResult(&firstStep, &firstResult)
+	applyScheduledProviderAdmission(firstTool, &firstResult, admission)
+	if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, firstStep, firstTool, firstArtifacts, firstResult, admission); err != nil {
+		t.Fatal(err)
+	}
+
+	duplicateStep, duplicateTool, duplicateArtifacts, duplicateResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+	applyScheduledProviderAdmission(duplicateTool, &duplicateResult, admission)
+	ctx, cancel := context.WithTimeout(fixture.context(), 8*time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			results <- fixture.env.store.PersistResult(ctx, fixture.env.programID, duplicateStep, duplicateTool, duplicateArtifacts, duplicateResult, admission)
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("duplicate rejection=%v", err)
+		}
+	}
+	assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_rejected", string(resultFenceToolResultConflict), 1)
+	decision := loadProviderResultDecision(t, fixture, "provider_result_rejected", admission.ProviderAttemptID, string(resultFenceToolResultConflict))
+	if decision.ToolRunID == nil || *decision.ToolRunID != firstTool.ID {
+		t.Fatalf("rejected authoritative tool=%v want=%s", decision.ToolRunID, firstTool.ID)
+	}
+}
+
+func TestProviderResultRejectedAuditFailurePreservesClassification(t *testing.T) {
+	fixture := newScheduledResultFixture(t, "result-rejected-audit-failure", "probe.http")
+	admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+	step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+	applyScheduledProviderAdmission(tool, &result, admission)
+	result.RequestID = domain.NewID()
+	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `CREATE FUNCTION reject_provider_result_rejected() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.event_type='provider_result_rejected' THEN
+				RAISE EXCEPTION 'synthetic rejected decision rejection';
+			END IF;
+			RETURN NEW;
+		END $$;
+		CREATE TRIGGER reject_provider_result_rejected BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION reject_provider_result_rejected()`); err != nil {
+		t.Fatal(err)
+	}
+
+	before := resultFenceSnapshot(t, fixture)
+	err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission)
+	if !errors.Is(err, ErrStaleScheduledExecutionResult) || !strings.Contains(err.Error(), "persist provider result rejection") || !strings.Contains(err.Error(), "synthetic rejected decision rejection") {
+		t.Fatalf("rejection audit error=%v", err)
+	}
+	if after := resultFenceSnapshot(t, fixture); after != before {
+		t.Fatalf("rejection audit failure mutated result\nbefore=%s\nafter=%s", before, after)
+	}
+	assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_rejected", string(resultFenceProviderProvenanceMismatch), 0)
+}
+
+func TestProviderResultRejectedRequiresVerifiableAdmission(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*capability.ResultAdmissionProvenance)
+	}{
+		{name: "incomplete", mutate: func(admission *capability.ResultAdmissionProvenance) { admission.ExecutionAuthorizationEventID = "" }},
+		{name: "unknown P", mutate: func(admission *capability.ResultAdmissionProvenance) { admission.ProviderAttemptID = domain.NewID() }},
+		{name: "forged action", mutate: func(admission *capability.ResultAdmissionProvenance) { admission.ActionRequestID = domain.NewID() }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newScheduledResultFixture(t, "result-unverified-"+strings.ReplaceAll(test.name, " ", "-"), "probe.http")
+			admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+			originalP := admission.ProviderAttemptID
+			step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+			applyScheduledProviderAdmission(tool, &result, admission)
+			test.mutate(admission)
+			if admission.ProviderAttemptID != originalP {
+				tool.ProviderAttemptID = &admission.ProviderAttemptID
+			}
+			if admission.ActionRequestID != result.RequestID {
+				result.RequestID = admission.ActionRequestID
+			}
+			err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission)
+			if !errors.Is(err, ErrStaleScheduledExecutionResult) {
+				t.Fatalf("unverified rejection=%v", err)
+			}
+			assertProviderResultDecisionCount(t, fixture, originalP, "provider_result_rejected", "", 0)
+			assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_rejected", "", 0)
+		})
+	}
+}
+
 func TestPersistResultProviderRetryAdmission(t *testing.T) {
 	t.Run("P1 retryable followed by P2 success preserves complete attempt evidence", func(t *testing.T) {
 		fixture := newScheduledResultFixture(t, "provider-retry-success", "probe.http")
@@ -607,6 +936,13 @@ func TestPersistResultProviderRetryAdmission(t *testing.T) {
 		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, legacyStep, legacyTool, legacyArtifacts, legacyResult, nil); err != nil {
 			t.Fatal(err)
 		}
+		var legacyDecisions int
+		if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT count(*) FROM audit_events WHERE step_run_id=$1 AND event_type IN ('provider_result_accepted','provider_result_rejected')`, fixture.stepID).Scan(&legacyDecisions); err != nil {
+			t.Fatal(err)
+		}
+		if legacyDecisions != 0 {
+			t.Fatalf("legacy null-P decisions=%d want=0", legacyDecisions)
+		}
 		exactAdmission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 2), nil, "fixture-provider")
 		exactStep, exactTool, exactArtifacts, exactResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
 		applyScheduledProviderAdmission(exactTool, &exactResult, exactAdmission)
@@ -709,6 +1045,159 @@ func TestConcurrentDistinctProviderAttemptsFromRetryableSerialize(t *testing.T) 
 	}
 	assertPersistedStepState(t, fixture, domain.StepSucceeded, 2, true)
 	assertResultRowCounts(t, fixture, 2, 2, 1, 0, 2)
+	assertAttemptEvidence(t, fixture, 2)
+	var rejectedDecisions int
+	if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT count(*) FROM audit_events WHERE step_run_id=$1 AND event_type='provider_result_rejected'`, fixture.stepID).Scan(&rejectedDecisions); err != nil {
+		t.Fatal(err)
+	}
+	if rejectedDecisions != 1 {
+		t.Fatalf("concurrent distinct-P rejected decisions=%d want=1", rejectedDecisions)
+	}
+}
+
+func TestProviderResultConcurrentGlobalIdentityCollisions(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		reason       resultFenceReasonCode
+		queryPattern string
+		apply        func(domain.ID, *providerResultCollisionCandidate)
+	}{
+		{
+			name:         "ToolRun ID",
+			reason:       resultFenceToolResultConflict,
+			queryPattern: `%INSERT INTO tool_runs(id,step_run_id,%`,
+			apply: func(sharedID domain.ID, candidate *providerResultCollisionCandidate) {
+				candidate.tool.ID = sharedID
+				for index := range candidate.artifacts {
+					candidate.artifacts[index].ToolRunID = sharedID
+				}
+			},
+		},
+		{
+			name:         "artifact ID",
+			reason:       resultFenceArtifactResultConflict,
+			queryPattern: `%INSERT INTO artifacts(id,task_id,%`,
+			apply: func(sharedID domain.ID, candidate *providerResultCollisionCandidate) {
+				candidate.artifacts[0].ID = sharedID
+				candidate.result.ArtifactIDs[0] = sharedID
+				candidate.tool.StdoutArtifactID = &candidate.artifacts[0].ID
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			env := newRecoveryTestEnvironment(t, "provider-result-concurrent-"+strings.ReplaceAll(test.name, " ", "-"))
+			installResultIdentityInsertBarrier(t, env)
+			secondProgramID, secondDefinitionID := createSchedulerIntegrationProgram(t, env.ctx, env.store, "provider-result-concurrent-second-program-"+strings.ReplaceAll(test.name, " ", "-"))
+			environments := []recoveryTestEnvironment{
+				env,
+				{store: env.store, ctx: env.ctx, programID: secondProgramID, definitionID: secondDefinitionID},
+			}
+			sharedID := domain.NewID()
+			candidates := make([]providerResultCollisionCandidate, 0, 2)
+			for index, fixtureEnv := range environments {
+				fixture := newScheduledResultFixtureInEnvironment(t, fixtureEnv, fmt.Sprintf("provider-result-concurrent-%s-%d", strings.ReplaceAll(test.name, " ", "-"), index), "probe.http")
+				action := scheduledProviderAction(fixture, 1)
+				admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, nil, "fixture-provider")
+				output := json.RawMessage(fmt.Sprintf(`{"lines":["http://127.0.0.1/%d"],"authorized_records":[{"provider":"httpx","kind":"url","target":"http://127.0.0.1/%d","status_code":200}]}`, index, index))
+				step, tool, artifacts, result := scheduledResultPayload(fixture, output)
+				applyScheduledProviderAdmission(tool, &result, admission)
+				candidate := providerResultCollisionCandidate{fixture: fixture, action: action, admission: admission, step: step, tool: tool, artifacts: artifacts, result: result}
+				test.apply(sharedID, &candidate)
+				candidate.before = resultFenceSnapshot(t, fixture)
+				candidates = append(candidates, candidate)
+			}
+
+			release := holdResultIdentityInsertBarrier(t, env, sharedID)
+			defer release()
+			runCtx, cancel := context.WithTimeout(env.ctx, 10*time.Second)
+			defer cancel()
+			results := [2]chan error{make(chan error, 1), make(chan error, 1)}
+			for index := range candidates {
+				index := index
+				go func() {
+					candidate := candidates[index]
+					ctx := WithScheduledExecutionFence(runCtx, candidate.fixture.fence)
+					results[index] <- env.store.PersistResult(ctx, candidate.fixture.env.programID, candidate.step, candidate.tool, candidate.artifacts, candidate.result, candidate.admission)
+				}()
+			}
+			waitForConcurrentResultInsertBarrier(t, runCtx, env.store, results[0], results[1], test.queryPattern)
+			release()
+
+			errorsByCandidate := [2]error{}
+			for index := range errorsByCandidate {
+				select {
+				case errorsByCandidate[index] = <-results[index]:
+				case <-runCtx.Done():
+					t.Fatalf("concurrent identity results did not finish: %v", runCtx.Err())
+				}
+			}
+			winner, loser := collisionOutcomeIndexes(t, errorsByCandidate, test.reason)
+			assertProviderResultCollisionOutcome(t, candidates[winner], candidates[loser], test.reason)
+		})
+	}
+}
+
+func collisionOutcomeIndexes(t *testing.T, outcomes [2]error, reason resultFenceReasonCode) (int, int) {
+	t.Helper()
+	winner, loser := -1, -1
+	for index, err := range outcomes {
+		if err == nil {
+			if winner != -1 {
+				t.Fatalf("concurrent identity collision produced multiple winners: %v", outcomes)
+			}
+			winner = index
+			continue
+		}
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "23505" {
+			t.Fatalf("concurrent identity collision escaped as PostgreSQL 23505: %v", err)
+		}
+		rejection, semantic := resultFenceRejection(err)
+		if !errors.Is(err, ErrStaleScheduledExecutionResult) || !semantic || rejection.reason != reason {
+			t.Fatalf("concurrent identity rejection=%v reason=%v want=%v", err, rejection, reason)
+		}
+		if loser != -1 {
+			t.Fatalf("concurrent identity collision produced multiple rejections: %v", outcomes)
+		}
+		loser = index
+	}
+	if winner == -1 || loser == -1 {
+		t.Fatalf("concurrent identity outcomes=%v want one winner and one rejection", outcomes)
+	}
+	return winner, loser
+}
+
+func assertProviderResultCollisionOutcome(t *testing.T, winner, loser providerResultCollisionCandidate, reason resultFenceReasonCode) {
+	t.Helper()
+	if after := resultFenceSnapshot(t, loser.fixture); after != loser.before {
+		t.Fatalf("losing identity-collision transaction mutated result state\nbefore=%s\nafter=%s", loser.before, after)
+	}
+	assertPersistedStepState(t, winner.fixture, domain.StepSucceeded, 1, true)
+	assertStepRecoveryStatus(t, loser.fixture.env, loser.fixture.stepID, domain.StepRunning)
+	assertResultRowCounts(t, winner.fixture, 1, 1, 1, 0, 1)
+	assertResultRowCounts(t, loser.fixture, 0, 0, 0, 0, 0)
+	assertProviderResultDecisionCount(t, winner.fixture, winner.admission.ProviderAttemptID, "provider_result_accepted", "", 1)
+	assertProviderResultDecisionCount(t, winner.fixture, winner.admission.ProviderAttemptID, "provider_result_rejected", string(reason), 0)
+	assertProviderResultDecisionCount(t, loser.fixture, loser.admission.ProviderAttemptID, "provider_result_accepted", "", 0)
+	assertProviderResultDecisionCount(t, loser.fixture, loser.admission.ProviderAttemptID, "provider_result_rejected", string(reason), 1)
+	decision := loadProviderResultDecision(t, loser.fixture, "provider_result_rejected", loser.admission.ProviderAttemptID, string(reason))
+	assertProviderResultDecisionProvenance(t, decision, providerResultDecisionExpectation{
+		Actor:                         loser.action.RequestedBy,
+		TaskID:                        loser.fixture.lineage.task.ID,
+		ProgramID:                     loser.fixture.env.programID,
+		WorkflowRunID:                 loser.fixture.lineage.runID,
+		StepRunID:                     loser.fixture.stepID,
+		ScheduledExecutionID:          loser.fixture.lineage.execution.ID,
+		SchedulerAttempt:              loser.fixture.fence.Attempt,
+		ActionRequestID:               loser.action.ID,
+		StepAttempt:                   loser.action.StepAttempt,
+		ExecutionAuthorizationEventID: loser.admission.ExecutionAuthorizationEventID,
+		ProviderAttemptID:             loser.admission.ProviderAttemptID,
+		Capability:                    loser.fixture.capability,
+		Provider:                      loser.admission.Provider,
+		SafeMessage:                   "provider result rejected by persistence fence",
+		Details:                       `{"reason_code": "` + string(reason) + `"}`,
+	})
 }
 
 func TestScheduledWorkflowSaveFence(t *testing.T) {
@@ -805,21 +1294,21 @@ func TestScheduledWorkflowSaveFence(t *testing.T) {
 func TestPersistResultRecoveryConcurrency(t *testing.T) {
 	t.Run("result locks first and recovery preserves the accepted terminal evidence", func(t *testing.T) {
 		fixture := newScheduledResultFixture(t, "result-race-result-first", "scan.nuclei")
-		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE scheduled_executions SET lease_expires_at=clock_timestamp()+interval '1 second' WHERE id=$1`, fixture.lineage.execution.ID); err != nil {
-			t.Fatal(err)
-		}
 		installPersistResultStepBarrier(t, fixture.env)
 		release := holdPersistResultStepBarrier(t, fixture.env, fixture.stepID)
 		defer release()
 
-		raceCtx, cancel := context.WithTimeout(fixture.context(), 8*time.Second)
+		raceCtx, cancel := context.WithTimeout(fixture.context(), 15*time.Second)
 		defer cancel()
 		step, tool, artifacts, result := fixture.validPayload()
 		persisted := make(chan error, 1)
+		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE scheduled_executions SET lease_expires_at=clock_timestamp()+interval '3 seconds' WHERE id=$1`, fixture.lineage.execution.ID); err != nil {
+			t.Fatal(err)
+		}
 		go func() {
 			persisted <- fixture.env.store.PersistResult(raceCtx, fixture.env.programID, step, tool, artifacts, result, nil)
 		}()
-		waitForPostgresLock(t, raceCtx, fixture.env.store, `%UPDATE step_runs%SET status=%`)
+		waitForPostgresLockOrResult(t, raceCtx, fixture.env.store, persisted, `%UPDATE step_runs%SET status=%`)
 		waitForScheduledLeaseExpiry(t, raceCtx, fixture)
 
 		recovered := make(chan error, 1)
@@ -963,6 +1452,11 @@ func TestConcurrentDuplicatePersistResult(t *testing.T) {
 func newScheduledResultFixture(t *testing.T, name, capabilityName string) scheduledResultFixture {
 	t.Helper()
 	env := newRecoveryTestEnvironment(t, name)
+	return newScheduledResultFixtureInEnvironment(t, env, name, capabilityName)
+}
+
+func newScheduledResultFixtureInEnvironment(t *testing.T, env recoveryTestEnvironment, name, capabilityName string) scheduledResultFixture {
+	t.Helper()
 	runStatus := domain.RunRunning
 	lineage := createRecoveryFixture(t, env, name, &runStatus, domain.TaskRunning, []recoveryStepSpec{{name: "provider", status: domain.StepRunning, started: true, attemptCount: 1}})
 	stepID := lineage.steps["provider"]
@@ -1076,7 +1570,7 @@ func assertTargetDecisionCount(t *testing.T, fixture scheduledResultFixture, wan
 
 func assertAttemptEvidence(t *testing.T, fixture scheduledResultFixture, want int) {
 	t.Helper()
-	var tools, providerAttempts, artifacts, artifactTools, toolAudits, auditAttempts, auditTools int
+	var tools, providerAttempts, artifacts, artifactTools, toolAudits, auditAttempts, auditTools, acceptedDecisions int
 	if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT
 		(SELECT count(*) FROM tool_runs WHERE step_run_id=$1),
 		(SELECT count(DISTINCT provider_attempt_id) FROM tool_runs WHERE step_run_id=$1),
@@ -1084,11 +1578,12 @@ func assertAttemptEvidence(t *testing.T, fixture scheduledResultFixture, want in
 		(SELECT count(DISTINCT tool_run_id) FROM artifacts WHERE step_run_id=$1),
 		(SELECT count(*) FROM audit_events WHERE step_run_id=$1 AND event_type='tool_execution'),
 		(SELECT count(DISTINCT provider_attempt_id) FROM audit_events WHERE step_run_id=$1 AND event_type='tool_execution'),
-		(SELECT count(DISTINCT tool_run_id) FROM audit_events WHERE step_run_id=$1 AND event_type='tool_execution')`, fixture.stepID).Scan(&tools, &providerAttempts, &artifacts, &artifactTools, &toolAudits, &auditAttempts, &auditTools); err != nil {
+		(SELECT count(DISTINCT tool_run_id) FROM audit_events WHERE step_run_id=$1 AND event_type='tool_execution'),
+		(SELECT count(*) FROM audit_events WHERE step_run_id=$1 AND event_type='provider_result_accepted')`, fixture.stepID).Scan(&tools, &providerAttempts, &artifacts, &artifactTools, &toolAudits, &auditAttempts, &auditTools, &acceptedDecisions); err != nil {
 		t.Fatal(err)
 	}
-	if tools != want || providerAttempts != want || artifacts != want || artifactTools != want || toolAudits != want || auditAttempts != want || auditTools != want {
-		t.Fatalf("attempt evidence tools=%d provider_attempts=%d artifacts=%d artifact_tools=%d tool_audits=%d audit_attempts=%d audit_tools=%d want=%d", tools, providerAttempts, artifacts, artifactTools, toolAudits, auditAttempts, auditTools, want)
+	if tools != want || providerAttempts != want || artifacts != want || artifactTools != want || toolAudits != want || auditAttempts != want || auditTools != want || acceptedDecisions != want {
+		t.Fatalf("attempt evidence tools=%d provider_attempts=%d artifacts=%d artifact_tools=%d tool_audits=%d audit_attempts=%d audit_tools=%d accepted_decisions=%d want=%d", tools, providerAttempts, artifacts, artifactTools, toolAudits, auditAttempts, auditTools, acceptedDecisions, want)
 	}
 }
 
@@ -1139,6 +1634,75 @@ func assertScheduledValidResultRejectedNoMutation(t *testing.T, fixture schedule
 	assertScheduledResultRejectedNoMutation(t, fixture, ctx, step, tool, artifacts, result)
 }
 
+func installResultIdentityInsertBarrier(t *testing.T, env recoveryTestEnvironment) {
+	t.Helper()
+	if _, err := env.store.Pool.Exec(env.ctx, `CREATE FUNCTION result_identity_insert_barrier() RETURNS trigger AS $$
+		BEGIN
+			PERFORM pg_advisory_xact_lock(hashtext(NEW.id::text));
+			RETURN NEW;
+		END;
+	$$ LANGUAGE plpgsql;
+	CREATE TRIGGER result_tool_identity_insert_barrier BEFORE INSERT ON tool_runs FOR EACH ROW EXECUTE FUNCTION result_identity_insert_barrier();
+	CREATE TRIGGER result_artifact_identity_insert_barrier BEFORE INSERT ON artifacts FOR EACH ROW EXECUTE FUNCTION result_identity_insert_barrier()`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func holdResultIdentityInsertBarrier(t *testing.T, env recoveryTestEnvironment, id domain.ID) func() {
+	t.Helper()
+	conn, err := env.store.Pool.Acquire(env.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var key int32
+	if err := conn.QueryRow(env.ctx, `SELECT hashtext($1::text)`, id).Scan(&key); err != nil {
+		conn.Release()
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(env.ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
+		conn.Release()
+		t.Fatal(err)
+	}
+	released := false
+	return func() {
+		if released {
+			return
+		}
+		released = true
+		if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key); err != nil {
+			t.Errorf("release result identity advisory lock: %v", err)
+		}
+		conn.Release()
+	}
+}
+
+func waitForConcurrentResultInsertBarrier(t *testing.T, ctx context.Context, store *Store, first, second <-chan error, queryPattern string) {
+	t.Helper()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting int
+		if err := store.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE pid<>pg_backend_pid()
+			  AND wait_event_type='Lock'
+			  AND query LIKE $1`, queryPattern).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting >= 2 {
+			return
+		}
+		select {
+		case err := <-first:
+			t.Fatalf("first PersistResult returned before both inserts reached the PostgreSQL barrier: %v", err)
+		case err := <-second:
+			t.Fatalf("second PersistResult returned before both inserts reached the PostgreSQL barrier: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("both result inserts did not reach the PostgreSQL barrier: %v", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func installPersistResultStepBarrier(t *testing.T, env recoveryTestEnvironment) {
 	t.Helper()
 	if _, err := env.store.Pool.Exec(env.ctx, `CREATE FUNCTION scheduler_result_step_barrier() RETURNS trigger AS $$
@@ -1182,6 +1746,39 @@ func holdPersistResultStepBarrier(t *testing.T, env recoveryTestEnvironment, ste
 	}
 }
 
+func waitForPostgresLockOrResult(t *testing.T, ctx context.Context, store *Store, persisted <-chan error, queryPattern string) {
+	t.Helper()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-persisted:
+			t.Fatalf("PersistResult returned before reaching the PostgreSQL lock barrier: %v", err)
+		default:
+		}
+
+		var waiting bool
+		if err := store.Pool.QueryRow(ctx, `SELECT EXISTS(
+			SELECT 1 FROM pg_stat_activity
+			WHERE pid<>pg_backend_pid()
+			  AND wait_event_type='Lock'
+			  AND query LIKE $1
+		)`, queryPattern).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case err := <-persisted:
+			t.Fatalf("PersistResult returned before reaching the PostgreSQL lock barrier: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("database statement did not reach lock barrier: %v", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func waitForScheduledLeaseExpiry(t *testing.T, ctx context.Context, fixture scheduledResultFixture) {
 	t.Helper()
 	ticker := time.NewTicker(20 * time.Millisecond)
@@ -1217,7 +1814,7 @@ func resultFenceSnapshot(t *testing.T, fixture scheduledResultFixture) string {
 		'candidates',(SELECT COALESCE(jsonb_agg(to_jsonb(cf) ORDER BY cf.id),'[]'::jsonb) FROM candidate_findings cf WHERE cf.workflow_run_id=$3),
 		'changes',(SELECT COALESCE(jsonb_agg(to_jsonb(ci) ORDER BY ci.id),'[]'::jsonb) FROM change_items ci WHERE ci.workflow_run_id=$3),
 		'approvals',(SELECT COALESCE(jsonb_agg(to_jsonb(ap) ORDER BY ap.id),'[]'::jsonb) FROM approvals ap WHERE ap.task_id=$2),
-		'audits',(SELECT COALESCE(jsonb_agg(to_jsonb(ae) ORDER BY ae.id),'[]'::jsonb) FROM audit_events ae WHERE ae.workflow_run_id=$3 OR (ae.workflow_run_id IS NULL AND ae.task_id=$2))
+		'audits',(SELECT COALESCE(jsonb_agg(to_jsonb(ae) ORDER BY ae.id),'[]'::jsonb) FROM audit_events ae WHERE ae.event_type<>'provider_result_rejected' AND (ae.workflow_run_id=$3 OR (ae.workflow_run_id IS NULL AND ae.task_id=$2)))
 	)::text`, fixture.lineage.execution.ID, fixture.lineage.task.ID, fixture.lineage.runID, fixture.stepID, fixture.env.programID).Scan(&snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -1239,5 +1836,106 @@ func assertResultRowCounts(t *testing.T, fixture scheduledResultFixture, toolWan
 	}
 	if tools != toolWant || artifacts != artifactWant || observations != observationWant || findings != findingWant || toolAudits != toolAuditWant {
 		t.Fatalf("result counts tools=%d artifacts=%d observations=%d findings=%d tool_audits=%d", tools, artifacts, observations, findings, toolAudits)
+	}
+}
+
+type providerResultDecision struct {
+	Component                     string
+	Actor                         string
+	TaskID                        domain.ID
+	ProgramID                     domain.ID
+	WorkflowRunID                 domain.ID
+	StepRunID                     domain.ID
+	ToolRunID                     *domain.ID
+	ScheduledExecutionID          domain.ID
+	SchedulerAttempt              int
+	ActionRequestID               domain.ID
+	StepAttempt                   int
+	QueueJobID                    *domain.ID
+	ExecutionAuthorizationEventID domain.ID
+	ProviderAttemptID             domain.ID
+	Capability                    string
+	Provider                      string
+	SafeMessage                   string
+	Details                       string
+}
+
+type providerResultDecisionExpectation struct {
+	Actor                         string
+	TaskID                        domain.ID
+	ProgramID                     domain.ID
+	WorkflowRunID                 domain.ID
+	StepRunID                     domain.ID
+	ToolRunID                     *domain.ID
+	ScheduledExecutionID          domain.ID
+	SchedulerAttempt              int
+	ActionRequestID               domain.ID
+	StepAttempt                   int
+	QueueJobID                    *domain.ID
+	ExecutionAuthorizationEventID domain.ID
+	ProviderAttemptID             domain.ID
+	Capability                    string
+	Provider                      string
+	SafeMessage                   string
+	Details                       string
+}
+
+func loadProviderResultDecision(t *testing.T, fixture scheduledResultFixture, eventType string, providerAttemptID domain.ID, reason string) providerResultDecision {
+	t.Helper()
+	var decision providerResultDecision
+	err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT component,actor,task_id,program_id,workflow_run_id,step_run_id,tool_run_id,
+		scheduled_execution_id,scheduler_attempt,action_request_id,step_attempt,queue_job_id,execution_authorization_event_id,
+		provider_attempt_id,capability,provider,safe_message,details::text
+		FROM audit_events
+		WHERE event_type=$1 AND provider_attempt_id=$2 AND ($3='' OR details->>'reason_code'=$3)
+		ORDER BY occurred_at,id LIMIT 1`, eventType, providerAttemptID, reason).Scan(
+		&decision.Component, &decision.Actor, &decision.TaskID, &decision.ProgramID, &decision.WorkflowRunID, &decision.StepRunID, &decision.ToolRunID,
+		&decision.ScheduledExecutionID, &decision.SchedulerAttempt, &decision.ActionRequestID, &decision.StepAttempt, &decision.QueueJobID,
+		&decision.ExecutionAuthorizationEventID, &decision.ProviderAttemptID, &decision.Capability, &decision.Provider, &decision.SafeMessage, &decision.Details)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decision
+}
+
+func assertProviderResultDecisionProvenance(t *testing.T, got providerResultDecision, want providerResultDecisionExpectation) {
+	t.Helper()
+	if got.Component != "result_fence" || got.Actor != want.Actor || got.TaskID != want.TaskID || got.ProgramID != want.ProgramID || got.WorkflowRunID != want.WorkflowRunID || got.StepRunID != want.StepRunID || !equalIDPointers(got.ToolRunID, want.ToolRunID) || got.ScheduledExecutionID != want.ScheduledExecutionID || got.SchedulerAttempt != want.SchedulerAttempt || got.ActionRequestID != want.ActionRequestID || got.StepAttempt != want.StepAttempt || !equalIDPointers(got.QueueJobID, want.QueueJobID) || got.ExecutionAuthorizationEventID != want.ExecutionAuthorizationEventID || got.ProviderAttemptID != want.ProviderAttemptID || got.Capability != want.Capability || got.Provider != want.Provider || got.SafeMessage != want.SafeMessage || got.Details != want.Details {
+		t.Fatalf("decision=%#v want=%#v", got, want)
+	}
+}
+
+func equalIDPointers(left, right *domain.ID) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func assertProviderResultDecisionCount(t *testing.T, fixture scheduledResultFixture, providerAttemptID domain.ID, eventType, reason string, want int) {
+	t.Helper()
+	var count int
+	if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT count(*) FROM audit_events WHERE provider_attempt_id=$1 AND event_type=$2 AND ($3='' OR details->>'reason_code'=$3)`, providerAttemptID, eventType, reason).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != want {
+		t.Fatalf("%s provider result decisions for P=%s reason=%q count=%d want=%d", eventType, providerAttemptID, reason, count, want)
+	}
+}
+
+func prepareArtifactResultConflict(t *testing.T, fixture scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+	t.Helper()
+	foreignStepID, foreignToolID := domain.NewID(), domain.NewID()
+	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO step_runs(id,workflow_run_id,step_definition_id,capability,status,attempt_count,input,started_at,idempotency_key)
+		VALUES($1,$2,'artifact-conflict','probe.http','running',1,'{}',clock_timestamp(),$3)`, foreignStepID, fixture.lineage.runID, string(domain.NewID())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,started_at) VALUES($1,$2,'probe.http','fixture',clock_timestamp())`, foreignToolID, foreignStepID); err != nil {
+		t.Fatal(err)
+	}
+	a := (*artifacts)[0]
+	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,redaction_state,sensitive)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)`, a.ID, a.TaskID, a.WorkflowRunID, foreignStepID, foreignToolID, a.Type, a.ContentType, a.Size, a.SHA256, a.StorageLocation, a.CreatedAt, a.RedactionState); err != nil {
+		t.Fatal(err)
 	}
 }

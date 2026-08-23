@@ -17,6 +17,44 @@ var (
 	ErrWorkflowResultConflict        = errors.New("workflow result conflicts with persisted state")
 )
 
+type resultFenceReasonCode string
+
+const (
+	resultFenceInvalidResultIdentity         resultFenceReasonCode = "invalid_result_identity"
+	resultFenceInvalidScheduledClaim         resultFenceReasonCode = "invalid_scheduled_claim"
+	resultFenceScheduledExecutionUnavailable resultFenceReasonCode = "scheduled_execution_unavailable"
+	resultFenceScheduledLineageMismatch      resultFenceReasonCode = "scheduled_lineage_mismatch"
+	resultFenceScheduledClaimMismatch        resultFenceReasonCode = "scheduled_claim_mismatch"
+	resultFenceScheduledLeaseExpired         resultFenceReasonCode = "scheduled_lease_expired"
+	resultFenceWorkflowLineageMismatch       resultFenceReasonCode = "workflow_lineage_mismatch"
+	resultFenceWorkflowNotRunning            resultFenceReasonCode = "workflow_not_running"
+	resultFenceInvalidResultState            resultFenceReasonCode = "invalid_result_state"
+	resultFenceToolLineageMismatch           resultFenceReasonCode = "tool_lineage_mismatch"
+	resultFenceProviderProvenanceMismatch    resultFenceReasonCode = "provider_provenance_mismatch"
+	resultFenceStepNotAdmittingResult        resultFenceReasonCode = "step_not_admitting_result"
+	resultFenceStaleProviderStepAttempt      resultFenceReasonCode = "stale_provider_step_attempt"
+	resultFenceToolResultConflict            resultFenceReasonCode = "tool_result_conflict"
+	resultFenceArtifactIdentityInvalid       resultFenceReasonCode = "artifact_identity_invalid"
+	resultFenceArtifactLineageMismatch       resultFenceReasonCode = "artifact_lineage_mismatch"
+	resultFenceArtifactResultConflict        resultFenceReasonCode = "artifact_result_conflict"
+	resultFenceConcurrentStepChange          resultFenceReasonCode = "concurrent_step_change"
+)
+
+type semanticResultFenceError struct {
+	cause  error
+	reason resultFenceReasonCode
+	detail string
+}
+
+func (e *semanticResultFenceError) Error() string { return fmt.Sprintf("%v: %s", e.cause, e.detail) }
+func (e *semanticResultFenceError) Unwrap() error { return e.cause }
+
+func resultFenceRejection(err error) (*semanticResultFenceError, bool) {
+	var rejection *semanticResultFenceError
+	ok := errors.As(err, &rejection)
+	return rejection, ok
+}
+
 type ScheduledExecutionFence struct {
 	ExecutionID domain.ID
 	LeaseOwner  string
@@ -65,7 +103,7 @@ func lockConflictingResultTools(ctx context.Context, tx pgx.Tx, stepID domain.ID
 	}
 	defer rows.Close()
 	if rows.Next() {
-		return resultConflict(scheduled, "tool result already exists")
+		return resultConflict(scheduled, resultFenceToolResultConflict, "tool result already exists")
 	}
 	return rows.Err()
 }
@@ -75,14 +113,14 @@ func lockAndValidateResultArtifacts(ctx context.Context, tx pgx.Tx, lineage lock
 	seen := make(map[domain.ID]struct{}, len(artifacts))
 	for _, artifact := range artifacts {
 		if artifact.ID == "" {
-			return resultConflict(lineage.scheduled, "artifact identity is missing")
+			return resultConflict(lineage.scheduled, resultFenceArtifactIdentityInvalid, "artifact identity is missing")
 		}
 		if _, duplicate := seen[artifact.ID]; duplicate {
-			return resultConflict(lineage.scheduled, "artifact identity is duplicated")
+			return resultConflict(lineage.scheduled, resultFenceArtifactIdentityInvalid, "artifact identity is duplicated")
 		}
 		seen[artifact.ID] = struct{}{}
 		if tool == nil || artifact.TaskID != lineage.taskID || artifact.WorkflowRunID != step.WorkflowRunID || artifact.StepRunID != step.ID || artifact.ToolRunID != tool.ID {
-			return resultConflict(lineage.scheduled, "artifact lineage does not match result step")
+			return resultConflict(lineage.scheduled, resultFenceArtifactLineageMismatch, "artifact lineage does not match result step")
 		}
 		ids = append(ids, artifact.ID)
 	}
@@ -96,7 +134,7 @@ func lockAndValidateResultArtifacts(ctx context.Context, tx pgx.Tx, lineage lock
 	}
 	defer rows.Close()
 	if rows.Next() {
-		return resultConflict(lineage.scheduled, "artifact metadata already exists")
+		return resultConflict(lineage.scheduled, resultFenceArtifactResultConflict, "artifact metadata already exists")
 	}
 	return rows.Err()
 }
@@ -104,7 +142,7 @@ func lockAndValidateResultArtifacts(ctx context.Context, tx pgx.Tx, lineage lock
 func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step domain.StepRun) (lockedResultLineage, error) {
 	fence, fenced := scheduledExecutionFenceFromContext(ctx)
 	if step.ID == "" || step.WorkflowRunID == "" {
-		return lockedResultLineage{}, resultConflict(fenced, "result step identity is incomplete")
+		return lockedResultLineage{}, resultConflict(fenced, resultFenceInvalidResultIdentity, "result step identity is incomplete")
 	}
 	var scheduled domain.ScheduledExecution
 	var scheduledProgramID domain.ID
@@ -112,11 +150,11 @@ func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step
 	var err error
 	if fenced {
 		if fence.ExecutionID == "" || fence.LeaseOwner == "" || fence.Attempt < 1 {
-			return lockedResultLineage{}, staleResultError("claim identity is incomplete")
+			return lockedResultLineage{}, staleResultError(resultFenceInvalidScheduledClaim, "claim identity is incomplete")
 		}
 		scheduled, scheduledProgramID, err = lockedScheduledExecution(ctx, tx, fence.ExecutionID)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return lockedResultLineage{}, staleResultError("scheduled execution does not exist")
+			return lockedResultLineage{}, staleResultError(resultFenceScheduledExecutionUnavailable, "scheduled execution does not exist")
 		}
 		if err != nil {
 			return lockedResultLineage{}, err
@@ -128,32 +166,32 @@ func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step
 			return lockedResultLineage{}, err
 		}
 		if hasScheduled {
-			return lockedResultLineage{}, staleResultError("scheduled claim identity is missing")
+			return lockedResultLineage{}, staleResultError(resultFenceInvalidScheduledClaim, "scheduled claim identity is missing")
 		}
 	}
 
 	if hasScheduled {
 		if scheduledProgramID != programID {
-			return lockedResultLineage{}, staleResultError("program lineage does not match")
+			return lockedResultLineage{}, staleResultError(resultFenceScheduledLineageMismatch, "program lineage does not match")
 		}
 		if scheduled.Status != domain.ScheduledExecutionRunning {
-			return lockedResultLineage{}, staleResultError("scheduled execution is not running")
+			return lockedResultLineage{}, staleResultError(resultFenceScheduledExecutionUnavailable, "scheduled execution is not running")
 		}
 		if scheduled.TaskID == nil || scheduled.WorkflowRunID == nil || *scheduled.WorkflowRunID != step.WorkflowRunID {
-			return lockedResultLineage{}, staleResultError("scheduled workflow lineage does not match")
+			return lockedResultLineage{}, staleResultError(resultFenceScheduledLineageMismatch, "scheduled workflow lineage does not match")
 		}
 		if scheduled.LeaseOwner != fence.LeaseOwner {
-			return lockedResultLineage{}, staleResultError("scheduler owner does not match")
+			return lockedResultLineage{}, staleResultError(resultFenceScheduledClaimMismatch, "scheduler owner does not match")
 		}
 		if scheduled.AttemptCount != fence.Attempt {
-			return lockedResultLineage{}, staleResultError("scheduler attempt does not match")
+			return lockedResultLineage{}, staleResultError(resultFenceScheduledClaimMismatch, "scheduler attempt does not match")
 		}
 		valid, validErr := lockedSchedulerLeaseValid(ctx, tx, scheduled.ID, fence.LeaseOwner, fence.Attempt)
 		if validErr != nil {
 			return lockedResultLineage{}, validErr
 		}
 		if !valid {
-			return lockedResultLineage{}, staleResultError("scheduler lease is no longer valid")
+			return lockedResultLineage{}, staleResultError(resultFenceScheduledLeaseExpired, "scheduler lease is no longer valid")
 		}
 	}
 
@@ -166,16 +204,16 @@ func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step
 		WHERE wr.id=$1
 		FOR UPDATE OF wr`, step.WorkflowRunID).Scan(&taskID, &runStatus, &taskProgramID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return lockedResultLineage{}, resultConflict(hasScheduled, "workflow does not exist")
+		return lockedResultLineage{}, resultConflict(hasScheduled, resultFenceWorkflowLineageMismatch, "workflow does not exist")
 	}
 	if err != nil {
 		return lockedResultLineage{}, err
 	}
 	if taskProgramID != programID || (hasScheduled && *scheduled.TaskID != taskID) {
-		return lockedResultLineage{}, resultConflict(hasScheduled, "task and workflow lineage do not match")
+		return lockedResultLineage{}, resultConflict(hasScheduled, resultFenceWorkflowLineageMismatch, "task and workflow lineage do not match")
 	}
 	if runStatus != domain.RunRunning {
-		return lockedResultLineage{}, resultConflict(hasScheduled, "workflow is not running")
+		return lockedResultLineage{}, resultConflict(hasScheduled, resultFenceWorkflowNotRunning, "workflow is not running")
 	}
 
 	var workflowRunID domain.ID
@@ -184,19 +222,19 @@ func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step
 	var idempotencyKey, capabilityName string
 	err = tx.QueryRow(ctx, `SELECT workflow_run_id,status,attempt_count,idempotency_key,capability FROM step_runs WHERE id=$1 FOR UPDATE`, step.ID).Scan(&workflowRunID, &status, &attemptCount, &idempotencyKey, &capabilityName)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return lockedResultLineage{}, resultConflict(hasScheduled, "step does not exist")
+		return lockedResultLineage{}, resultConflict(hasScheduled, resultFenceWorkflowLineageMismatch, "step does not exist")
 	}
 	if err != nil {
 		return lockedResultLineage{}, err
 	}
 	if workflowRunID != step.WorkflowRunID {
-		return lockedResultLineage{}, resultConflict(hasScheduled, "step and workflow lineage do not match")
+		return lockedResultLineage{}, resultConflict(hasScheduled, resultFenceWorkflowLineageMismatch, "step and workflow lineage do not match")
 	}
 	if step.IdempotencyKey == "" || idempotencyKey != step.IdempotencyKey {
-		return lockedResultLineage{}, resultConflict(hasScheduled, "step idempotency identity does not match")
+		return lockedResultLineage{}, resultConflict(hasScheduled, resultFenceWorkflowLineageMismatch, "step idempotency identity does not match")
 	}
 	if step.Capability == "" || capabilityName != step.Capability {
-		return lockedResultLineage{}, resultConflict(hasScheduled, "step capability does not match")
+		return lockedResultLineage{}, resultConflict(hasScheduled, resultFenceWorkflowLineageMismatch, "step capability does not match")
 	}
 	return lockedResultLineage{scheduled: hasScheduled, taskID: taskID, stepStatus: status, attemptCount: attemptCount}, nil
 }
@@ -315,17 +353,17 @@ func lockAndValidateWorkflowSave(ctx context.Context, tx pgx.Tx, state *workflow
 	return rows.Err()
 }
 
-func staleResultError(reason string) error {
-	return fmt.Errorf("%w: %s", ErrStaleScheduledExecutionResult, reason)
+func staleResultError(reason resultFenceReasonCode, detail string) error {
+	return &semanticResultFenceError{cause: ErrStaleScheduledExecutionResult, reason: reason, detail: detail}
 }
 
 func lostLeaseError(reason string) error {
 	return fmt.Errorf("%w: %s", ErrLostScheduledExecutionLease, reason)
 }
 
-func resultConflict(scheduled bool, reason string) error {
+func resultConflict(scheduled bool, reason resultFenceReasonCode, detail string) error {
 	if scheduled {
-		return staleResultError(reason)
+		return staleResultError(reason, detail)
 	}
-	return fmt.Errorf("%w: %s", ErrWorkflowResultConflict, reason)
+	return &semanticResultFenceError{cause: ErrWorkflowResultConflict, reason: reason, detail: detail}
 }
