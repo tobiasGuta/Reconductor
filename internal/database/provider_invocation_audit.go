@@ -58,21 +58,21 @@ func (s *Store) RecordProviderInvocationStarted(ctx context.Context, record capa
 func lockAndValidateProviderResult(ctx context.Context, tx pgx.Tx, lineage lockedResultLineage, programID domain.ID, step domain.StepRun, tool *domain.ToolRun, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) error {
 	if admission == nil {
 		if tool != nil && tool.ProviderAttemptID != nil {
-			return resultConflict(lineage.scheduled, "tool provider attempt has no trusted admission provenance")
+			return resultConflict(lineage.scheduled, resultFenceProviderProvenanceMismatch, "tool provider attempt has no trusted admission provenance")
 		}
 		return nil
 	}
 	if admission.ProviderAttemptID == "" || admission.ActionRequestID == "" || admission.ExecutionAuthorizationEventID == "" || admission.Provider == "" {
-		return resultConflict(lineage.scheduled, "trusted provider admission provenance is incomplete")
+		return resultConflict(lineage.scheduled, resultFenceProviderProvenanceMismatch, "trusted provider admission provenance is incomplete")
 	}
 	if tool == nil || tool.ProviderAttemptID == nil || *tool.ProviderAttemptID == "" || *tool.ProviderAttemptID != admission.ProviderAttemptID {
-		return resultConflict(lineage.scheduled, "tool provider attempt does not match trusted admission provenance")
+		return resultConflict(lineage.scheduled, resultFenceProviderProvenanceMismatch, "tool provider attempt does not match trusted admission provenance")
 	}
 	if result.RequestID != admission.ActionRequestID {
-		return resultConflict(lineage.scheduled, "result action request does not match trusted admission provenance")
+		return resultConflict(lineage.scheduled, resultFenceProviderProvenanceMismatch, "result action request does not match trusted admission provenance")
 	}
 	if tool.Provider != admission.Provider {
-		return resultConflict(lineage.scheduled, "tool provider does not match trusted admission provenance")
+		return resultConflict(lineage.scheduled, resultFenceProviderProvenanceMismatch, "tool provider does not match trusted admission provenance")
 	}
 	scheduledExecutionID, schedulerAttempt := providerSchedulerProvenance(ctx)
 	var providerAttemptID domain.ID
@@ -93,9 +93,106 @@ func lockAndValidateProviderResult(ctx context.Context, tx pgx.Tx, lineage locke
 		  AND scheduler_attempt IS NOT DISTINCT FROM $13
 		FOR UPDATE`, admission.ProviderAttemptID, optionalID(programID), optionalID(lineage.taskID), optionalID(step.WorkflowRunID), optionalID(step.ID), optionalID(admission.ActionRequestID), exactPositiveInt(admission.StepAttempt), optionalIDPointer(admission.QueueJobID), optionalID(admission.ExecutionAuthorizationEventID), nullIfEmpty(step.Capability), nullIfEmpty(admission.Provider), scheduledExecutionID, schedulerAttempt).Scan(&providerAttemptID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return resultConflict(lineage.scheduled, "provider attempt does not exactly match trusted admission provenance")
+		return resultConflict(lineage.scheduled, resultFenceProviderProvenanceMismatch, "provider attempt does not exactly match trusted admission provenance")
 	}
 	return err
+}
+
+func persistProviderResultAccepted(ctx context.Context, tx pgx.Tx, providerAttemptID, toolRunID domain.ID) error {
+	tag, err := tx.Exec(ctx, `INSERT INTO audit_events(
+		id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,tool_run_id,
+		scheduled_execution_id,scheduler_attempt,action_request_id,step_attempt,queue_job_id,
+		execution_authorization_event_id,provider_attempt_id,capability,provider,safe_message,details)
+		SELECT $1,'provider_result_accepted','result_fence',provider_start.actor,provider_start.task_id,
+			provider_start.program_id,provider_start.workflow_run_id,provider_start.step_run_id,tool.id,
+			provider_start.scheduled_execution_id,provider_start.scheduler_attempt,provider_start.action_request_id,
+			provider_start.step_attempt,provider_start.queue_job_id,provider_start.execution_authorization_event_id,
+			provider_start.id,provider_start.capability,provider_start.provider,
+			'provider result accepted by persistence fence','{}'::jsonb
+		FROM audit_events provider_start
+		JOIN tool_runs tool
+		  ON tool.id=$2
+		 AND tool.provider_attempt_id=provider_start.id
+		 AND tool.step_run_id=provider_start.step_run_id
+		WHERE provider_start.id=$3
+		  AND provider_start.event_type='provider_invocation_started'
+		  AND NOT EXISTS (
+			SELECT 1 FROM audit_events existing
+			WHERE existing.event_type='provider_result_accepted'
+			  AND existing.provider_attempt_id=provider_start.id
+		  )`, domain.NewID(), toolRunID, providerAttemptID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("provider attempt %s cannot record one accepted result decision", providerAttemptID)
+	}
+	return nil
+}
+
+func completeResultAdmission(admission *capability.ResultAdmissionProvenance) bool {
+	return admission != nil && admission.ProviderAttemptID != "" && admission.ActionRequestID != "" && admission.ExecutionAuthorizationEventID != "" && admission.Provider != ""
+}
+
+func (s *Store) recordProviderResultRejected(ctx context.Context, admission *capability.ResultAdmissionProvenance, reason resultFenceReasonCode) (bool, error) {
+	if !completeResultAdmission(admission) {
+		return false, nil
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var providerAttemptID domain.ID
+	err = tx.QueryRow(ctx, `SELECT id FROM audit_events
+		WHERE id=$1
+		  AND event_type='provider_invocation_started'
+		  AND action_request_id IS NOT DISTINCT FROM $2
+		  AND step_attempt IS NOT DISTINCT FROM $3
+		  AND queue_job_id IS NOT DISTINCT FROM $4
+		  AND execution_authorization_event_id IS NOT DISTINCT FROM $5
+		  AND provider IS NOT DISTINCT FROM $6
+		FOR UPDATE`, admission.ProviderAttemptID, optionalID(admission.ActionRequestID), exactPositiveInt(admission.StepAttempt), optionalIDPointer(admission.QueueJobID), optionalID(admission.ExecutionAuthorizationEventID), nullIfEmpty(admission.Provider)).Scan(&providerAttemptID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
+			return false, rollbackErr
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	_, err = tx.Exec(ctx, `INSERT INTO audit_events(
+		id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,tool_run_id,
+		scheduled_execution_id,scheduler_attempt,action_request_id,step_attempt,queue_job_id,
+		execution_authorization_event_id,provider_attempt_id,capability,provider,safe_message,details)
+		SELECT $1,'provider_result_rejected','result_fence',provider_start.actor,provider_start.task_id,
+			provider_start.program_id,provider_start.workflow_run_id,provider_start.step_run_id,tool.id,
+			provider_start.scheduled_execution_id,provider_start.scheduler_attempt,provider_start.action_request_id,
+			provider_start.step_attempt,provider_start.queue_job_id,provider_start.execution_authorization_event_id,
+			provider_start.id,provider_start.capability,provider_start.provider,
+			'provider result rejected by persistence fence',$2
+		FROM audit_events provider_start
+		LEFT JOIN tool_runs tool
+		  ON tool.provider_attempt_id=provider_start.id
+		 AND tool.step_run_id=provider_start.step_run_id
+		WHERE provider_start.id=$3
+		  AND provider_start.event_type='provider_invocation_started'
+		  AND NOT EXISTS (
+			SELECT 1 FROM audit_events existing
+			WHERE existing.event_type='provider_result_rejected'
+			  AND existing.provider_attempt_id=provider_start.id
+			  AND existing.details->>'reason_code'=$4
+		  )`, domain.NewID(), mustJSON(map[string]string{"reason_code": string(reason)}), providerAttemptID, string(reason))
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) RecordProviderInvocationTerminal(ctx context.Context, record capability.ProviderInvocationTerminalRecord) error {

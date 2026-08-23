@@ -152,7 +152,7 @@ func TestWorkflowRetryPersistsEveryProviderAttempt(t *testing.T) {
 	}
 	stepID := state.Steps["retry"].Run.ID
 	var status domain.StepStatus
-	var attemptCount, stepCount, toolCount, providerAttemptCount, artifactCount, artifactToolCount, toolExecutionCount int
+	var attemptCount, stepCount, toolCount, providerAttemptCount, artifactCount, artifactToolCount, toolExecutionCount, acceptedDecisionCount int
 	var completedAt *time.Time
 	if err := env.store.Pool.QueryRow(env.ctx, `SELECT status,attempt_count,completed_at FROM step_runs WHERE id=$1`, stepID).Scan(&status, &attemptCount, &completedAt); err != nil {
 		t.Fatal(err)
@@ -163,11 +163,12 @@ func TestWorkflowRetryPersistsEveryProviderAttempt(t *testing.T) {
 		(SELECT count(DISTINCT provider_attempt_id) FROM tool_runs WHERE step_run_id=$2),
 		(SELECT count(*) FROM artifacts WHERE step_run_id=$2),
 		(SELECT count(DISTINCT tool_run_id) FROM artifacts WHERE step_run_id=$2),
-		(SELECT count(*) FROM audit_events WHERE step_run_id=$2 AND event_type='tool_execution')`, state.Run.ID, stepID).Scan(&stepCount, &toolCount, &providerAttemptCount, &artifactCount, &artifactToolCount, &toolExecutionCount); err != nil {
+		(SELECT count(*) FROM audit_events WHERE step_run_id=$2 AND event_type='tool_execution'),
+		(SELECT count(*) FROM audit_events WHERE step_run_id=$2 AND event_type='provider_result_accepted')`, state.Run.ID, stepID).Scan(&stepCount, &toolCount, &providerAttemptCount, &artifactCount, &artifactToolCount, &toolExecutionCount, &acceptedDecisionCount); err != nil {
 		t.Fatal(err)
 	}
-	if status != domain.StepSucceeded || attemptCount != 2 || completedAt == nil || stepCount != 1 || toolCount != 2 || providerAttemptCount != 2 || artifactCount != 4 || artifactToolCount != 2 || toolExecutionCount != 2 {
-		t.Fatalf("status=%s attempt=%d completed=%v steps=%d tools=%d provider_attempts=%d artifacts=%d artifact_tools=%d tool_executions=%d", status, attemptCount, completedAt, stepCount, toolCount, providerAttemptCount, artifactCount, artifactToolCount, toolExecutionCount)
+	if status != domain.StepSucceeded || attemptCount != 2 || completedAt == nil || stepCount != 1 || toolCount != 2 || providerAttemptCount != 2 || artifactCount != 4 || artifactToolCount != 2 || toolExecutionCount != 2 || acceptedDecisionCount != 2 {
+		t.Fatalf("status=%s attempt=%d completed=%v steps=%d tools=%d provider_attempts=%d artifacts=%d artifact_tools=%d tool_executions=%d accepted_decisions=%d", status, attemptCount, completedAt, stepCount, toolCount, providerAttemptCount, artifactCount, artifactToolCount, toolExecutionCount, acceptedDecisionCount)
 	}
 }
 
@@ -364,6 +365,15 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	}
 	if err := store.PersistResult(ctx, programID, step, tool, []domain.Artifact{artifact}, action, admission); err != nil {
 		t.Fatal(err)
+	}
+	var acceptedDecisions, rejectedDecisions int
+	if err := store.Pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM audit_events WHERE event_type='provider_result_accepted' AND provider_attempt_id=$1),
+		(SELECT count(*) FROM audit_events WHERE event_type='provider_result_rejected' AND provider_attempt_id=$1 AND details->>'reason_code'='provider_provenance_mismatch')`, providerAttemptID).Scan(&acceptedDecisions, &rejectedDecisions); err != nil {
+		t.Fatal(err)
+	}
+	if acceptedDecisions != 1 || rejectedDecisions != 1 {
+		t.Fatalf("provider result decisions accepted=%d rejected=%d", acceptedDecisions, rejectedDecisions)
 	}
 
 	var status domain.StepStatus

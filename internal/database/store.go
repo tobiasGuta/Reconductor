@@ -724,7 +724,32 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer rollbackResultTransaction(ctx, tx)
+	if err := persistResultTransaction(ctx, tx, programID, step, tool, artifacts, result, admission); err != nil {
+		rejection, semantic := resultFenceRejection(err)
+		if !semantic {
+			return err
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if rollbackErr := tx.Rollback(cleanupCtx); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("roll back rejected provider result: %w", rollbackErr))
+		}
+		if _, auditErr := s.recordProviderResultRejected(cleanupCtx, admission, rejection.reason); auditErr != nil {
+			return errors.Join(err, fmt.Errorf("persist provider result rejection: %w", auditErr))
+		}
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func rollbackResultTransaction(ctx context.Context, tx pgx.Tx) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	_ = tx.Rollback(cleanupCtx)
+}
+
+func persistResultTransaction(ctx context.Context, tx pgx.Tx, programID domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) error {
 	lineage, err := lockResultLineage(ctx, tx, programID, step)
 	if err != nil {
 		return err
@@ -732,17 +757,17 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 	switch step.Status {
 	case domain.StepSucceeded, domain.StepFailed, domain.StepRetryable:
 	default:
-		return resultConflict(lineage.scheduled, "result status is not persistable")
+		return resultConflict(lineage.scheduled, resultFenceInvalidResultState, "result status is not persistable")
 	}
 	if step.Status == domain.StepRetryable && step.CompletedAt != nil {
-		return resultConflict(lineage.scheduled, "retryable result is completed")
+		return resultConflict(lineage.scheduled, resultFenceInvalidResultState, "retryable result is completed")
 	}
 	if (step.Status == domain.StepSucceeded || step.Status == domain.StepFailed) && step.CompletedAt == nil {
-		return resultConflict(lineage.scheduled, "terminal result is not completed")
+		return resultConflict(lineage.scheduled, resultFenceInvalidResultState, "terminal result is not completed")
 	}
 	if tool != nil {
 		if tool.ID == "" || tool.StepRunID != step.ID || tool.Capability != step.Capability {
-			return resultConflict(lineage.scheduled, "tool lineage does not match result step")
+			return resultConflict(lineage.scheduled, resultFenceToolLineageMismatch, "tool lineage does not match result step")
 		}
 	}
 	if err := lockAndValidateProviderResult(ctx, tx, lineage, programID, step, tool, result, admission); err != nil {
@@ -750,7 +775,7 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 	}
 	exactProviderAttempt := admission != nil
 	if lineage.stepStatus != domain.StepRunning && (!exactProviderAttempt || lineage.stepStatus != domain.StepRetryable) {
-		return resultConflict(lineage.scheduled, "step does not admit this result")
+		return resultConflict(lineage.scheduled, resultFenceStepNotAdmittingResult, "step does not admit this result")
 	}
 	attemptCount := lineage.attemptCount
 	if exactProviderAttempt {
@@ -760,7 +785,7 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 		}
 		if stepAttempt != nil {
 			if *stepAttempt < attemptCount {
-				return resultConflict(lineage.scheduled, "provider step attempt is stale")
+				return resultConflict(lineage.scheduled, resultFenceStaleProviderStepAttempt, "provider step attempt is stale")
 			}
 			if *stepAttempt > attemptCount {
 				attemptCount = *stepAttempt
@@ -780,18 +805,24 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 		return err
 	}
 	if tag.RowsAffected() != 1 {
-		return resultConflict(lineage.scheduled, "step changed before result persistence")
+		return resultConflict(lineage.scheduled, resultFenceConcurrentStepChange, "step changed before result persistence")
 	}
 	if tool != nil {
-		_, err = tx.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,completed_at,exit_code,timed_out,stdout_artifact_id,stderr_artifact_id,provider_attempt_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, tool.ID, tool.StepRunID, tool.Capability, tool.Provider, tool.ToolVersion, tool.SanitizedArguments, tool.ExecutionEnvironment, tool.StartedAt, tool.CompletedAt, tool.ExitCode, tool.TimedOut, tool.StdoutArtifactID, tool.StderrArtifactID, tool.ProviderAttemptID)
+		tag, err := tx.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,completed_at,exit_code,timed_out,stdout_artifact_id,stderr_artifact_id,provider_attempt_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (id) DO NOTHING`, tool.ID, tool.StepRunID, tool.Capability, tool.Provider, tool.ToolVersion, tool.SanitizedArguments, tool.ExecutionEnvironment, tool.StartedAt, tool.CompletedAt, tool.ExitCode, tool.TimedOut, tool.StdoutArtifactID, tool.StderrArtifactID, tool.ProviderAttemptID)
 		if err != nil {
 			return err
 		}
+		if tag.RowsAffected() != 1 {
+			return resultConflict(lineage.scheduled, resultFenceToolResultConflict, "tool result already exists")
+		}
 	}
 	for _, a := range artifacts {
-		_, err = tx.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, a.ID, a.TaskID, a.WorkflowRunID, a.StepRunID, a.ToolRunID, a.Type, a.ContentType, a.Size, a.SHA256, a.StorageLocation, a.CreatedAt, a.ExpiresAt, a.RedactionState, a.Sensitive)
+		tag, err := tx.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (id) DO NOTHING`, a.ID, a.TaskID, a.WorkflowRunID, a.StepRunID, a.ToolRunID, a.Type, a.ContentType, a.Size, a.SHA256, a.StorageLocation, a.CreatedAt, a.ExpiresAt, a.RedactionState, a.Sensitive)
 		if err != nil {
 			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return resultConflict(lineage.scheduled, resultFenceArtifactResultConflict, "artifact metadata already exists")
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,tool_run_id,capability,provider,safe_message,details) VALUES($1,'artifact_retention_applied','retention','worker',$2,$3,$4,$5,$6,$7,$8,'artifact retention recorded',$9)`, domain.NewID(), a.TaskID, programID, a.WorkflowRunID, a.StepRunID, a.ToolRunID, step.Capability, providerName(tool), mustJSON(map[string]any{"artifact_id": a.ID, "expires_at": a.ExpiresAt}))
 		if err != nil {
@@ -830,7 +861,12 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 	if err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if exactProviderAttempt {
+		if err := persistProviderResultAccepted(ctx, tx, admission.ProviderAttemptID, tool.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func persistTargetDecisions(ctx context.Context, tx pgx.Tx, programID domain.ID, step domain.StepRun, tool *domain.ToolRun, raw json.RawMessage) error {
