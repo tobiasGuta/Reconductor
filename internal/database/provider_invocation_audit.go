@@ -98,7 +98,8 @@ func lockAndValidateProviderResult(ctx context.Context, tx pgx.Tx, lineage locke
 	return err
 }
 
-func persistProviderResultAccepted(ctx context.Context, tx pgx.Tx, providerAttemptID, toolRunID domain.ID) error {
+func persistProviderResultAccepted(ctx context.Context, tx pgx.Tx, providerAttemptID, toolRunID domain.ID) (domain.ID, error) {
+	eventID := domain.NewID()
 	tag, err := tx.Exec(ctx, `INSERT INTO audit_events(
 		id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,tool_run_id,
 		scheduled_execution_id,scheduler_attempt,action_request_id,step_attempt,queue_job_id,
@@ -120,14 +121,14 @@ func persistProviderResultAccepted(ctx context.Context, tx pgx.Tx, providerAttem
 			SELECT 1 FROM audit_events existing
 			WHERE existing.event_type='provider_result_accepted'
 			  AND existing.provider_attempt_id=provider_start.id
-		  )`, domain.NewID(), toolRunID, providerAttemptID)
+		  )`, eventID, toolRunID, providerAttemptID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("provider attempt %s cannot record one accepted result decision", providerAttemptID)
+		return "", fmt.Errorf("provider attempt %s cannot record one accepted result decision", providerAttemptID)
 	}
-	return nil
+	return eventID, nil
 }
 
 func completeResultAdmission(admission *capability.ResultAdmissionProvenance) bool {

@@ -829,8 +829,10 @@ func persistResultTransaction(ctx context.Context, tx pgx.Tx, programID domain.I
 			return err
 		}
 	}
+	observationIDs := []domain.ID{}
 	if step.Status == domain.StepSucceeded {
-		if err := persistObservations(ctx, tx, programID, step, result, artifacts); err != nil {
+		observationIDs, err = persistObservations(ctx, tx, programID, step, result, artifacts)
+		if err != nil {
 			return err
 		}
 		if step.Capability == "scan.nuclei" {
@@ -862,8 +864,14 @@ func persistResultTransaction(ctx context.Context, tx pgx.Tx, programID domain.I
 		return err
 	}
 	if exactProviderAttempt {
-		if err := persistProviderResultAccepted(ctx, tx, admission.ProviderAttemptID, tool.ID); err != nil {
+		acceptedEventID, err := persistProviderResultAccepted(ctx, tx, admission.ProviderAttemptID, tool.ID)
+		if err != nil {
 			return err
+		}
+		if step.Status == domain.StepSucceeded && len(observationIDs) > 0 {
+			if err := persistAssetObservationEmissions(ctx, tx, programID, observationIDs, acceptedEventID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -902,11 +910,13 @@ func persistTargetDecisions(ctx context.Context, tx pgx.Tx, programID domain.ID,
 	return nil
 }
 
-func persistObservations(ctx context.Context, tx pgx.Tx, programID domain.ID, step domain.StepRun, result domain.ActionResult, artifacts []domain.Artifact) error {
+func persistObservations(ctx context.Context, tx pgx.Tx, programID domain.ID, step domain.StepRun, result domain.ActionResult, artifacts []domain.Artifact) ([]domain.ID, error) {
 	assetType := map[string]string{"discover.subdomains": "subdomain", "resolve.dns": "subdomain", "scan.ports": "network_service", "probe.http": "http_service", "crawl.web": "url", "discover.archive_urls": "url"}[step.Capability]
 	if assetType == "" {
-		return nil
+		return []domain.ID{}, nil
 	}
+	observationIDs := make([]domain.ID, 0)
+	seenObservationIDs := make(map[domain.ID]struct{})
 	for _, line := range observationLines(result.Output) {
 		value := extractValue(line)
 		if value == "" {
@@ -914,15 +924,28 @@ func persistObservations(ctx context.Context, tx pgx.Tx, programID domain.ID, st
 		}
 		assetID := domain.NewID()
 		if err := tx.QueryRow(ctx, `INSERT INTO assets(id,program_id,type,canonical_value) VALUES($1,$2,$3,$4) ON CONFLICT(program_id,type,canonical_value) DO UPDATE SET updated_at=now() RETURNING id`, assetID, programID, assetType, value).Scan(&assetID); err != nil {
-			return err
+			return nil, err
 		}
 		metadata := json.RawMessage(line)
 		if !json.Valid(metadata) {
 			metadata, _ = json.Marshal(map[string]string{"value": line})
 		}
 		evidence := artifactStrings(artifacts)
-		_, err := tx.Exec(ctx, `INSERT INTO asset_observations(id,asset_id,workflow_run_id,source_capability,observed_value,metadata,first_seen_at,observed_at,confidence,evidence_artifact_ids) VALUES($1,$2,$3,$4,$5,$6,now(),now(),$7,$8) ON CONFLICT(asset_id,workflow_run_id,source_capability,observed_value) DO UPDATE SET metadata=EXCLUDED.metadata,observed_at=EXCLUDED.observed_at,evidence_artifact_ids=EXCLUDED.evidence_artifact_ids`, domain.NewID(), assetID, step.WorkflowRunID, step.Capability, value, metadata, 1.0, evidence)
-		if err != nil {
+		observationID := domain.NewID()
+		if err := tx.QueryRow(ctx, `INSERT INTO asset_observations(id,asset_id,workflow_run_id,source_capability,observed_value,metadata,first_seen_at,observed_at,confidence,evidence_artifact_ids) VALUES($1,$2,$3,$4,$5,$6,now(),now(),$7,$8) ON CONFLICT(asset_id,workflow_run_id,source_capability,observed_value) DO UPDATE SET metadata=EXCLUDED.metadata,observed_at=EXCLUDED.observed_at,evidence_artifact_ids=EXCLUDED.evidence_artifact_ids RETURNING id`, observationID, assetID, step.WorkflowRunID, step.Capability, value, metadata, 1.0, evidence).Scan(&observationID); err != nil {
+			return nil, err
+		}
+		if _, seen := seenObservationIDs[observationID]; !seen {
+			seenObservationIDs[observationID] = struct{}{}
+			observationIDs = append(observationIDs, observationID)
+		}
+	}
+	return observationIDs, nil
+}
+
+func persistAssetObservationEmissions(ctx context.Context, tx pgx.Tx, programID domain.ID, observationIDs []domain.ID, acceptedEventID domain.ID) error {
+	for _, observationID := range observationIDs {
+		if _, err := tx.Exec(ctx, `INSERT INTO asset_observation_emissions(program_id,asset_observation_id,provider_result_accepted_event_id) VALUES($1,$2,$3)`, programID, observationID, acceptedEventID); err != nil {
 			return err
 		}
 	}
