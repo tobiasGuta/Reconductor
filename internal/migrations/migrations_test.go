@@ -18,7 +18,7 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) != 11 {
+	if len(versions) != 12 {
 		t.Fatalf("migrations=%v", versions)
 	}
 	wantVersions := []string{
@@ -33,6 +33,7 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 		"0009_scheduler_recovery_protocol.sql",
 		"0010_structured_execution_provenance.sql",
 		"0011_provider_attempt_provenance.sql",
+		"0012_asset_observation_emissions.sql",
 	}
 	for index := range wantVersions {
 		if versions[index] != wantVersions[index] {
@@ -281,6 +282,76 @@ func TestProviderAttemptProvenanceMigrationConstraints(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `UPDATE audit_events SET provider_attempt_id=$2 WHERE id=$1`, legacyAuditID, providerID); err == nil || !strings.Contains(err.Error(), "audit_events are append-only") {
 		t.Fatalf("audit update error=%v", err)
+	}
+}
+
+func TestAssetObservationEmissionMigrationDoesNotBackfill(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.Close)
+	schema := "migration_observation_emissions_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	identifier := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP SCHEMA "+identifier+" CASCADE"); err != nil {
+			t.Errorf("drop migration test schema: %v", err)
+		}
+	})
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	pool, err := pgxpool.New(ctx, parsed.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	applyEmbeddedMigrationsThrough(t, ctx, pool, 11)
+
+	const (
+		programID     = "00000000-0000-4000-8000-000000003001"
+		definitionID  = "00000000-0000-4000-8000-000000003002"
+		taskID        = "00000000-0000-4000-8000-000000003003"
+		runID         = "00000000-0000-4000-8000-000000003004"
+		assetID       = "00000000-0000-4000-8000-000000003005"
+		observationID = "00000000-0000-4000-8000-000000003006"
+	)
+	for _, statement := range []string{
+		`INSERT INTO programs(id,name,platform,scope_reference,policy_reference) VALUES('` + programID + `','observation-emission-migration','integration','synthetic://local','integration')`,
+		`INSERT INTO workflow_definitions(id,name,version,definition) VALUES('` + definitionID + `','observation-emission-migration','1','{}')`,
+		`INSERT INTO tasks(id,program_id,objective,workflow_definition_id,status,requested_by) VALUES('` + taskID + `','` + programID + `','migration','` + definitionID + `','running','integration')`,
+		`INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,trigger_source) VALUES('` + runID + `','` + taskID + `','` + definitionID + `','1','completed','integration')`,
+		`INSERT INTO assets(id,program_id,type,canonical_value) VALUES('` + assetID + `','` + programID + `','http_service','https://historical.test/')`,
+		`INSERT INTO asset_observations(id,asset_id,workflow_run_id,source_capability,observed_value,first_seen_at,observed_at,confidence) VALUES('` + observationID + `','` + assetID + `','` + runID + `','probe.http','https://historical.test/',clock_timestamp(),clock_timestamp(),1)`,
+	} {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := Up(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	var observations, emissions int
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM asset_observations WHERE id=$1),
+		(SELECT count(*) FROM asset_observation_emissions)`, observationID).Scan(&observations, &emissions); err != nil {
+		t.Fatal(err)
+	}
+	if observations != 1 || emissions != 0 {
+		t.Fatalf("historical observations=%d emissions=%d", observations, emissions)
 	}
 }
 

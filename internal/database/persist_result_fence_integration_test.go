@@ -1120,7 +1120,7 @@ func TestProviderResultConcurrentGlobalIdentityCollisions(t *testing.T) {
 					results[index] <- env.store.PersistResult(ctx, candidate.fixture.env.programID, candidate.step, candidate.tool, candidate.artifacts, candidate.result, candidate.admission)
 				}()
 			}
-			waitForConcurrentResultInsertBarrier(t, runCtx, env.store, results[0], results[1], test.queryPattern)
+			waitForConcurrentResultInsertQueries(t, runCtx, env.store, results[0], results[1], test.queryPattern)
 			release()
 
 			errorsByCandidate := [2]error{}
@@ -1650,12 +1650,18 @@ func installResultIdentityInsertBarrier(t *testing.T, env recoveryTestEnvironmen
 
 func holdResultIdentityInsertBarrier(t *testing.T, env recoveryTestEnvironment, id domain.ID) func() {
 	t.Helper()
+	_, release := holdResultIdentityInsertBarrierWithPID(t, env, id)
+	return release
+}
+
+func holdResultIdentityInsertBarrierWithPID(t *testing.T, env recoveryTestEnvironment, id domain.ID) (int32, func()) {
+	t.Helper()
 	conn, err := env.store.Pool.Acquire(env.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var key int32
-	if err := conn.QueryRow(env.ctx, `SELECT hashtext($1::text)`, id).Scan(&key); err != nil {
+	var backendPID, key int32
+	if err := conn.QueryRow(env.ctx, `SELECT pg_backend_pid(),hashtext($1::text)`, id).Scan(&backendPID, &key); err != nil {
 		conn.Release()
 		t.Fatal(err)
 	}
@@ -1664,7 +1670,7 @@ func holdResultIdentityInsertBarrier(t *testing.T, env recoveryTestEnvironment, 
 		t.Fatal(err)
 	}
 	released := false
-	return func() {
+	release := func() {
 		if released {
 			return
 		}
@@ -1674,9 +1680,51 @@ func holdResultIdentityInsertBarrier(t *testing.T, env recoveryTestEnvironment, 
 		}
 		conn.Release()
 	}
+	return backendPID, release
 }
 
-func waitForConcurrentResultInsertBarrier(t *testing.T, ctx context.Context, store *Store, first, second <-chan error, queryPattern string) {
+func waitForConcurrentResultInsertBarrier(t *testing.T, ctx context.Context, store *Store, holderPID, firstPID, secondPID int32, first, second <-chan error) {
+	t.Helper()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting int
+		if err := store.Pool.QueryRow(ctx, `SELECT count(*)
+			FROM (VALUES ($1::integer),($2::integer)) target(pid)
+			WHERE EXISTS (
+				SELECT 1
+				FROM pg_locks waiting_lock
+				JOIN pg_locks held_lock
+				  ON held_lock.locktype=waiting_lock.locktype
+				 AND held_lock.database IS NOT DISTINCT FROM waiting_lock.database
+				 AND held_lock.classid IS NOT DISTINCT FROM waiting_lock.classid
+				 AND held_lock.objid IS NOT DISTINCT FROM waiting_lock.objid
+				 AND held_lock.objsubid IS NOT DISTINCT FROM waiting_lock.objsubid
+				 AND held_lock.mode=waiting_lock.mode
+				WHERE waiting_lock.pid=target.pid
+				  AND waiting_lock.locktype='advisory'
+				  AND NOT waiting_lock.granted
+				  AND held_lock.pid=$3
+				  AND held_lock.granted
+			)`, firstPID, secondPID, holderPID).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting == 2 {
+			return
+		}
+		select {
+		case err := <-first:
+			t.Fatalf("first observation emission transaction returned before both exact backends reached the advisory-lock barrier: %v", err)
+		case err := <-second:
+			t.Fatalf("second observation emission transaction returned before both exact backends reached the advisory-lock barrier: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("both exact observation emission backends did not reach the advisory-lock barrier: %v", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForConcurrentResultInsertQueries(t *testing.T, ctx context.Context, store *Store, first, second <-chan error, queryPattern string) {
 	t.Helper()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
@@ -1811,6 +1859,7 @@ func resultFenceSnapshot(t *testing.T, fixture scheduledResultFixture) string {
 		'artifacts',(SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.id),'[]'::jsonb) FROM artifacts a WHERE a.workflow_run_id=$3),
 		'assets',(SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.id),'[]'::jsonb) FROM assets a WHERE a.program_id=$5),
 		'observations',(SELECT COALESCE(jsonb_agg(to_jsonb(ao) ORDER BY ao.id),'[]'::jsonb) FROM asset_observations ao JOIN assets a ON a.id=ao.asset_id WHERE a.program_id=$5),
+		'observation_emissions',(SELECT COALESCE(jsonb_agg(to_jsonb(emission) ORDER BY emission.asset_observation_id,emission.provider_result_accepted_event_id),'[]'::jsonb) FROM asset_observation_emissions emission JOIN asset_observations observation ON observation.id=emission.asset_observation_id WHERE observation.workflow_run_id=$3),
 		'candidates',(SELECT COALESCE(jsonb_agg(to_jsonb(cf) ORDER BY cf.id),'[]'::jsonb) FROM candidate_findings cf WHERE cf.workflow_run_id=$3),
 		'changes',(SELECT COALESCE(jsonb_agg(to_jsonb(ci) ORDER BY ci.id),'[]'::jsonb) FROM change_items ci WHERE ci.workflow_run_id=$3),
 		'approvals',(SELECT COALESCE(jsonb_agg(to_jsonb(ap) ORDER BY ap.id),'[]'::jsonb) FROM approvals ap WHERE ap.task_id=$2),
