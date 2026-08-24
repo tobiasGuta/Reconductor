@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -846,7 +847,7 @@ func persistResultTransaction(ctx context.Context, tx pgx.Tx, programID domain.I
 			}
 		}
 		if step.Capability == "classify.endpoint" {
-			if err := persistEndpoints(ctx, tx, programID, result.Output); err != nil {
+			if err := persistEndpoints(ctx, tx, programID, step.CompletedAt, result.Output); err != nil {
 				return err
 			}
 		}
@@ -1117,18 +1118,80 @@ func validImpactVerdict(value findings.ImpactVerdict) bool {
 	}
 }
 
-func persistEndpoints(ctx context.Context, tx pgx.Tx, programID domain.ID, raw json.RawMessage) error {
-	var payload struct {
-		Endpoints []normalize.EndpointKey `json:"endpoints"`
+func persistEndpoints(ctx context.Context, tx pgx.Tx, programID domain.ID, completedAt *time.Time, raw json.RawMessage) error {
+	if completedAt == nil || completedAt.IsZero() {
+		return fmt.Errorf("classify.endpoint successful StepRun completion time is required")
 	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return err
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return fmt.Errorf("decode classify.endpoint result: %w", err)
 	}
-	for _, e := range payload.Endpoints {
-		params, _ := json.Marshal(e.QueryParameters)
-		_, err := tx.Exec(ctx, `INSERT INTO endpoints(id,program_id,exact_url,route_signature,method,content_type,parameter_schema,first_seen,last_seen) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,now(),now()) ON CONFLICT(program_id,route_signature,method,content_type,parameter_schema) DO UPDATE SET exact_url=EXCLUDED.exact_url,last_seen=now()`, domain.NewID(), programID, e.ExactURL, e.RouteSignature, e.Method, e.ContentType, string(params))
+	encodedEndpoints, ok := envelope["endpoints"]
+	if !ok || len(encodedEndpoints) == 0 || strings.TrimSpace(string(encodedEndpoints)) == "null" {
+		return fmt.Errorf("classify.endpoint result requires a non-null endpoints array")
+	}
+	var encodedKeys []json.RawMessage
+	if err := json.Unmarshal(encodedEndpoints, &encodedKeys); err != nil {
+		return fmt.Errorf("decode classify.endpoint endpoints: %w", err)
+	}
+	for index, encodedKey := range encodedKeys {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(encodedKey, &fields); err != nil {
+			return fmt.Errorf("decode classify.endpoint endpoint %d: %w", index, err)
+		}
+		for _, required := range []string{"exact_url", "route_signature", "method", "content_type", "query_parameters", "digest"} {
+			value, exists := fields[required]
+			if !exists || len(value) == 0 || strings.TrimSpace(string(value)) == "null" {
+				return fmt.Errorf("classify.endpoint endpoint %d requires field %s", index, required)
+			}
+		}
+		var serialized normalize.EndpointKey
+		if err := json.Unmarshal(encodedKey, &serialized); err != nil {
+			return fmt.Errorf("decode classify.endpoint endpoint %d: %w", index, err)
+		}
+		if strings.TrimSpace(serialized.ExactURL) == "" || strings.TrimSpace(serialized.RouteSignature) == "" || strings.TrimSpace(serialized.Method) == "" || strings.TrimSpace(serialized.Digest) == "" || serialized.QueryParameters == nil {
+			return fmt.Errorf("classify.endpoint endpoint %d is structurally incomplete", index)
+		}
+		canonical, origin, err := normalize.CanonicalEndpoint(serialized.ExactURL, serialized.Method, serialized.ContentType)
 		if err != nil {
-			return err
+			return fmt.Errorf("classify.endpoint endpoint %d canonicalization failed", index)
+		}
+		if canonical.ExactURL != serialized.ExactURL {
+			return fmt.Errorf("classify.endpoint endpoint %d exact_url does not match canonical identity", index)
+		}
+		if canonical.RouteSignature != serialized.RouteSignature {
+			return fmt.Errorf("classify.endpoint endpoint %d route_signature does not match canonical identity", index)
+		}
+		if canonical.Method != serialized.Method {
+			return fmt.Errorf("classify.endpoint endpoint %d method does not match canonical identity", index)
+		}
+		if canonical.ContentType != serialized.ContentType {
+			return fmt.Errorf("classify.endpoint endpoint %d content_type does not match canonical identity", index)
+		}
+		if !slices.Equal(canonical.QueryParameters, serialized.QueryParameters) {
+			return fmt.Errorf("classify.endpoint endpoint %d query_parameters do not match canonical identity", index)
+		}
+		if canonical.Digest != serialized.Digest {
+			return fmt.Errorf("classify.endpoint endpoint %d digest does not match canonical identity", index)
+		}
+		params, err := json.Marshal(canonical.QueryParameters)
+		if err != nil {
+			return fmt.Errorf("encode classify.endpoint endpoint %d parameters: %w", index, err)
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO endpoints(
+			id,program_id,exact_url,route_signature,method,content_type,parameter_schema,
+			origin_scheme,origin_host,origin_effective_port,first_seen,last_seen
+		) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$11)
+		ON CONFLICT(
+			program_id,origin_scheme,origin_host,origin_effective_port,route_signature,method,content_type,parameter_schema
+		) WHERE origin_scheme IS NOT NULL AND origin_host IS NOT NULL AND origin_effective_port IS NOT NULL
+		DO UPDATE SET
+			exact_url=LEAST(endpoints.exact_url COLLATE "C",EXCLUDED.exact_url COLLATE "C"),
+			first_seen=LEAST(endpoints.first_seen,EXCLUDED.first_seen),
+			last_seen=GREATEST(endpoints.last_seen,EXCLUDED.last_seen)`,
+			domain.NewID(), programID, canonical.ExactURL, canonical.RouteSignature, canonical.Method, canonical.ContentType, string(params), origin.Scheme, origin.Host, origin.EffectivePort, completedAt.UTC())
+		if err != nil {
+			return fmt.Errorf("persist classify.endpoint endpoint %d: %w", index, err)
 		}
 	}
 	return nil

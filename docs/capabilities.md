@@ -16,7 +16,7 @@ The internal `targeting.prepare` capability rechecks and deduplicates exact and 
 
 ## Endpoint intelligence
 
-`classify.endpoint` version 3 consumes only scope-authorized structured records. Provider outputs retain a separate `authorized_records` collection after the protocol, host, port, path, and exclusion checks; raw normalized records are never bound into the classifier workflow input.
+`classify.endpoint` version 4 consumes only scope-authorized structured records. Provider outputs retain a separate `authorized_records` collection after the protocol, host, port, path, and exclusion checks; raw normalized records are never bound into the classifier workflow input.
 
 Classification is deterministic and explainable. Each normalized endpoint contains labels, individual weighted signals, an interest score, source confidence, provider sources, technologies, statuses, redirects, JavaScript relationships, and historical behavior. Signals cover:
 

@@ -18,7 +18,7 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) != 12 {
+	if len(versions) != 13 {
 		t.Fatalf("migrations=%v", versions)
 	}
 	wantVersions := []string{
@@ -34,6 +34,7 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 		"0010_structured_execution_provenance.sql",
 		"0011_provider_attempt_provenance.sql",
 		"0012_asset_observation_emissions.sql",
+		"0013_endpoint_origin_identity.sql",
 	}
 	for index := range wantVersions {
 		if versions[index] != wantVersions[index] {
@@ -420,6 +421,132 @@ func TestSchedulerRecoveryProtocolBackfillsExistingExecutions(t *testing.T) {
 	}
 	if protocol != 0 {
 		t.Fatalf("backfilled recovery protocol=%d want=0", protocol)
+	}
+}
+
+func TestEndpointOriginIdentityMigrationPreservesLegacyRowsAndGuardsCorrectedIdentity(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.Close)
+	schema := "migration_endpoint_origin_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	identifier := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP SCHEMA "+identifier+" CASCADE"); err != nil {
+			t.Errorf("drop migration test schema: %v", err)
+		}
+	})
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	pool, err := pgxpool.New(ctx, parsed.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	applyEmbeddedMigrationsThrough(t, ctx, pool, 12)
+
+	const (
+		programID   = "00000000-0000-4000-8000-000000004001"
+		legacyID    = "00000000-0000-4000-8000-000000004002"
+		correctedID = "00000000-0000-4000-8000-000000004003"
+	)
+	if _, err := pool.Exec(ctx, `INSERT INTO programs(id,name,platform,scope_reference,policy_reference) VALUES($1,'endpoint-origin-migration','integration','synthetic://local','integration')`, programID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO endpoints(id,program_id,exact_url,route_signature,method,content_type,parameter_schema,first_seen,last_seen) VALUES($1,$2,'https://legacy.example/api/users/123','/api/users/{id}','GET','','["id"]','2026-01-01T00:00:00Z','2026-01-02T00:00:00Z')`, legacyID, programID); err != nil {
+		t.Fatal(err)
+	}
+	var before string
+	if err := pool.QueryRow(ctx, `SELECT to_jsonb(e)::text FROM endpoints e WHERE id=$1`, legacyID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if err := Up(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := Up(ctx, pool); err != nil {
+		t.Fatalf("second Up: %v", err)
+	}
+
+	var after string
+	var scheme, host *string
+	var port *int
+	if err := pool.QueryRow(ctx, `SELECT (to_jsonb(e)-'origin_scheme'-'origin_host'-'origin_effective_port')::text,origin_scheme,origin_host,origin_effective_port FROM endpoints e WHERE id=$1`, legacyID).Scan(&after, &scheme, &host, &port); err != nil {
+		t.Fatal(err)
+	}
+	if before != after || scheme != nil || host != nil || port != nil {
+		t.Fatalf("legacy row changed before=%s after=%s origin=%v/%v/%v", before, after, scheme, host, port)
+	}
+
+	var validated bool
+	if err := pool.QueryRow(ctx, `SELECT convalidated FROM pg_constraint WHERE conrelid='endpoints'::regclass AND conname='endpoints_corrected_row_ck'`).Scan(&validated); err != nil {
+		t.Fatal(err)
+	}
+	if validated {
+		t.Fatal("corrected endpoint constraint was unexpectedly validated")
+	}
+	var correctedIndex string
+	if err := pool.QueryRow(ctx, `SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname='endpoints_corrected_identity_uq'`).Scan(&correctedIndex); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"program_id", "origin_scheme", "origin_host", "origin_effective_port", "route_signature", "method", "content_type", "parameter_schema", "WHERE", "origin_scheme IS NOT NULL", "origin_host IS NOT NULL", "origin_effective_port IS NOT NULL"} {
+		if !strings.Contains(correctedIndex, required) {
+			t.Fatalf("corrected index %q missing %q", correctedIndex, required)
+		}
+	}
+	lastPosition := -1
+	for _, column := range []string{"program_id", "origin_scheme", "origin_host", "origin_effective_port", "route_signature", "method", "content_type", "parameter_schema"} {
+		position := strings.Index(correctedIndex, column)
+		if position <= lastPosition {
+			t.Fatalf("corrected index columns are out of order in %q at %q", correctedIndex, column)
+		}
+		lastPosition = position
+	}
+	var oldIndex, triggerCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='endpoints_identity_uq'`).Scan(&oldIndex); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_trigger WHERE tgrelid='endpoints'::regclass AND tgname='endpoints_identity_guard' AND NOT tgisinternal`).Scan(&triggerCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldIndex != 0 || triggerCount != 1 {
+		t.Fatalf("old index=%d identity triggers=%d", oldIndex, triggerCount)
+	}
+
+	if _, err := pool.Exec(ctx, `INSERT INTO endpoints(id,program_id,exact_url,route_signature,method,content_type,parameter_schema,first_seen,last_seen) VALUES(gen_random_uuid(),$1,'https://invalid.example/','/','GET','','[]',clock_timestamp(),clock_timestamp())`, programID); err == nil || !strings.Contains(err.Error(), "endpoints_corrected_row_ck") {
+		t.Fatalf("direct legacy-shaped insert error=%v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO endpoints(id,program_id,exact_url,route_signature,method,content_type,parameter_schema,origin_scheme,origin_host,first_seen,last_seen) VALUES(gen_random_uuid(),$1,'https://partial.example/','/','GET','','[]','https','partial.example',clock_timestamp(),clock_timestamp())`, programID); err == nil {
+		t.Fatal("partial origin row was accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO endpoints(id,program_id,exact_url,route_signature,method,content_type,parameter_schema,origin_scheme,origin_host,origin_effective_port,first_seen,last_seen) VALUES($1,$2,'https://corrected.example/api/users/456','/api/users/{id}','GET','','["id"]','https','corrected.example',443,'2026-01-03T00:00:00Z','2026-01-03T00:00:00Z')`, correctedID, programID); err != nil {
+		t.Fatalf("corrected same-route row: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE endpoints SET origin_scheme='https',origin_host='legacy.example',origin_effective_port=443 WHERE id=$1`, legacyID); err == nil || !strings.Contains(err.Error(), "endpoint identity fields are immutable") {
+		t.Fatalf("legacy conversion error=%v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE endpoints SET origin_host='other.example' WHERE id=$1`, correctedID); err == nil || !strings.Contains(err.Error(), "endpoint identity fields are immutable") {
+		t.Fatalf("corrected identity mutation error=%v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE endpoints SET exact_url='https://corrected.example/api/users/123',first_seen='2026-01-02T00:00:00Z',last_seen='2026-01-04T00:00:00Z' WHERE id=$1`, correctedID); err != nil {
+		t.Fatalf("corrected aggregate update: %v", err)
+	}
+	var migrationCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations WHERE version=13 AND name='0013_endpoint_origin_identity.sql'`).Scan(&migrationCount); err != nil || migrationCount != 1 {
+		t.Fatalf("migration ledger count=%d err=%v", migrationCount, err)
 	}
 }
 

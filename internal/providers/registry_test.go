@@ -38,6 +38,37 @@ func executeProviderTest(registry *capability.Registry, req capability.Request) 
 	return registry.Execute(context.Background(), req)
 }
 
+func TestEndpointClassifierVersionAndStableSchemas(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := Registry(cfg)
+	classifier, ok := registry.Get("classify.endpoint")
+	if !ok {
+		t.Fatal("classify.endpoint capability is missing")
+	}
+	classifierManifest := classifier.Manifest()
+	if classifierManifest.Version != "4" {
+		t.Fatalf("classify.endpoint version=%q want=4", classifierManifest.Version)
+	}
+	if strings.Contains(string(classifierManifest.OutputSchema), "origin_scheme") || strings.Contains(string(classifierManifest.OutputSchema), "origin_host") || strings.Contains(string(classifierManifest.OutputSchema), "origin_effective_port") {
+		t.Fatalf("classify.endpoint serialized origin fields changed: %s", classifierManifest.OutputSchema)
+	}
+	reporter, ok := registry.Get("report.changes")
+	if !ok {
+		t.Fatal("report.changes capability is missing")
+	}
+	if got := reporter.Manifest().Version; got != "3" {
+		t.Fatalf("report.changes version=%q want=3", got)
+	}
+}
+
 func TestCompareAssetsStatusRouting(t *testing.T) {
 	cfg, err := config.LoadWith(func(k string) string {
 		if k == "DATABASE_URL" {
