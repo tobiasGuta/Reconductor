@@ -184,7 +184,7 @@ func internalCapabilities() []capability.Capability {
 	}{
 		{"targeting.prepare", "Filter and prepare scope-authorized active targets", "2", targetingPrepareInputSchema, targetingPrepareOutputSchema},
 		{"compare.assets", "Compare current and previous HTTP asset observations", "2", compareAssetsInputSchema, compareAssetsOutputSchema},
-		{"classify.endpoint", "Classify endpoint intelligence with deterministic evidence", "3", classifyEndpointInputSchema, classifyEndpointOutputSchema},
+		{"classify.endpoint", "Classify endpoint intelligence with deterministic evidence", "4", classifyEndpointInputSchema, classifyEndpointOutputSchema},
 		{"report.changes", "Produce a typed changes-only report", "3", reportChangesInputSchema, reportChangesOutputSchema},
 	}
 	out := make([]capability.Capability, 0, len(definitions))

@@ -70,7 +70,13 @@ type observation struct {
 type parsedObservation struct {
 	observation
 	key     normalize.EndpointKey
+	origin  normalize.EndpointOrigin
 	details recordDetails
+}
+
+type schemaRouteKey struct {
+	Origin         normalize.EndpointOrigin
+	RouteSignature string
 }
 
 type aggregate struct {
@@ -110,11 +116,11 @@ func Classify(input Input) (Output, error) {
 	}
 	parsed := make([]parsedObservation, 0, len(current))
 	for index, item := range current {
-		key, details, err := endpointFromRecord(item.record)
+		key, origin, details, err := endpointFromRecord(item.record)
 		if err != nil {
 			return Output{}, fmt.Errorf("%s observation %d: %w", item.source, index, err)
 		}
-		parsed = append(parsed, parsedObservation{observation: item, key: key, details: details})
+		parsed = append(parsed, parsedObservation{observation: item, key: key, origin: origin, details: details})
 	}
 	sort.Slice(parsed, func(i, j int) bool {
 		left, right := parsed[i], parsed[j]
@@ -131,7 +137,7 @@ func Classify(input Input) (Output, error) {
 			aggregates[key.Digest] = entry
 		}
 		applyObservation(entry, item.observation, details)
-		if apiExact[key.ExactURL] || apiRoutes[key.RouteSignature] {
+		if apiExact[key.ExactURL] || apiRoutes[schemaRouteKey{Origin: item.origin, RouteSignature: key.RouteSignature}] {
 			entry.addLabel("api_schema_member")
 			entry.addSignal("api_schema_membership", key.RouteSignature, 3, "api_schema")
 		}
@@ -183,19 +189,19 @@ type recordDetails struct {
 	technologies                                    []string
 }
 
-func endpointFromRecord(record provideroutput.Record) (normalize.EndpointKey, recordDetails, error) {
+func endpointFromRecord(record provideroutput.Record) (normalize.EndpointKey, normalize.EndpointOrigin, recordDetails, error) {
 	if strings.TrimSpace(record.Provider) == "" {
-		return normalize.EndpointKey{}, recordDetails{}, fmt.Errorf("record provider is required")
+		return normalize.EndpointKey{}, normalize.EndpointOrigin{}, recordDetails{}, fmt.Errorf("record provider is required")
 	}
 	if record.Kind != provideroutput.URLRecord {
-		return normalize.EndpointKey{}, recordDetails{}, fmt.Errorf("record kind %q is not a URL", record.Kind)
+		return normalize.EndpointKey{}, normalize.EndpointOrigin{}, recordDetails{}, fmt.Errorf("record kind %q is not a URL", record.Kind)
 	}
 	if record.StatusCode < 0 || record.StatusCode > 599 {
-		return normalize.EndpointKey{}, recordDetails{}, fmt.Errorf("record status code %d is outside 0-599", record.StatusCode)
+		return normalize.EndpointKey{}, normalize.EndpointOrigin{}, recordDetails{}, fmt.Errorf("record status code %d is outside 0-599", record.StatusCode)
 	}
 	parsedTarget, err := url.Parse(strings.TrimSpace(record.Target))
 	if err != nil || parsedTarget.Hostname() == "" || (parsedTarget.Scheme != "http" && parsedTarget.Scheme != "https") {
-		return normalize.EndpointKey{}, recordDetails{}, fmt.Errorf("record target must be an absolute HTTP URL")
+		return normalize.EndpointKey{}, normalize.EndpointOrigin{}, recordDetails{}, fmt.Errorf("record target must be an absolute HTTP URL")
 	}
 	requestFields := nestedObject(record.Fields, "request")
 	responseFields := nestedObject(record.Fields, "response")
@@ -230,14 +236,14 @@ func endpointFromRecord(record provideroutput.Record) (normalize.EndpointKey, re
 		details.status = firstNestedInt(record.Fields, "status_code", "status-code", "status")
 	}
 	details.technologies = append(details.technologies, firstNestedStrings(record.Fields, "tech", "technologies")...)
-	key, err := normalize.Endpoint(record.Target, details.method, details.requestContentType)
+	key, origin, err := normalize.CanonicalEndpoint(record.Target, details.method, details.requestContentType)
 	if err != nil {
-		return normalize.EndpointKey{}, recordDetails{}, err
+		return normalize.EndpointKey{}, normalize.EndpointOrigin{}, recordDetails{}, err
 	}
 	details.redirect = normalizedOptionalURL(details.redirect)
 	details.sourceURL = normalizedOptionalURL(details.sourceURL)
 	details.technologies = normalizedStrings(details.technologies)
-	return key, details, nil
+	return key, origin, details, nil
 }
 
 func applyObservation(entry *aggregate, item observation, details recordDetails) {
@@ -336,7 +342,7 @@ func applyURLSignals(entry *aggregate, endpoint normalize.EndpointKey, source st
 func historicalIndex(records []provideroutput.Record) (map[string][]recordDetails, error) {
 	out := map[string][]recordDetails{}
 	for index, record := range records {
-		key, details, err := endpointFromRecord(record)
+		key, _, details, err := endpointFromRecord(record)
 		if err != nil {
 			return nil, fmt.Errorf("historical observation %d: %w", index, err)
 		}
@@ -431,18 +437,18 @@ func appendRecords(out []observation, records []provideroutput.Record, source st
 	return out
 }
 
-func schemaMembership(items []string) (map[string]bool, map[string]bool, error) {
-	exact, routes := map[string]bool{}, map[string]bool{}
+func schemaMembership(items []string) (map[string]bool, map[schemaRouteKey]bool, error) {
+	exact, routes := map[string]bool{}, map[schemaRouteKey]bool{}
 	for index, raw := range items {
 		parsed, err := url.Parse(strings.TrimSpace(raw))
 		if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			return nil, nil, fmt.Errorf("api schema endpoint %d must be an absolute HTTP URL", index)
 		}
-		key, err := normalize.Endpoint(raw, "GET", "")
+		key, origin, err := normalize.CanonicalEndpoint(raw, "GET", "")
 		if err != nil {
 			return nil, nil, fmt.Errorf("api schema endpoint %d: %w", index, err)
 		}
-		exact[key.ExactURL], routes[key.RouteSignature] = true, true
+		exact[key.ExactURL], routes[schemaRouteKey{Origin: origin, RouteSignature: key.RouteSignature}] = true, true
 	}
 	return exact, routes, nil
 }

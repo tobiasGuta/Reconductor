@@ -109,6 +109,61 @@ func TestClassifyRejectsMalformedOrNonURLRecords(t *testing.T) {
 	}
 }
 
+func TestClassifyAPISchemaRouteMembershipIsOriginLocal(t *testing.T) {
+	tests := []struct {
+		name        string
+		schema      string
+		observation string
+		fields      map[string]any
+		wantMember  bool
+	}{
+		{name: "same origin", schema: "https://a.example/api/users?schema=1", observation: "https://a.example/api/users?observed=1", wantMember: true},
+		{name: "different host", schema: "https://a.example/api/users", observation: "https://b.example/api/users", wantMember: false},
+		{name: "different scheme", schema: "https://a.example/api/users", observation: "http://a.example/api/users", wantMember: false},
+		{name: "different non-default port", schema: "https://a.example:8443/api/users", observation: "https://a.example:9443/api/users", wantMember: false},
+		{name: "default port equivalence", schema: "https://a.example/api/users?schema=1", observation: "https://a.example:443/api/users?observed=1", wantMember: true},
+		{name: "method and content type independent", schema: "https://a.example/api/users?schema=1", observation: "https://a.example/api/users?observed=1", fields: map[string]any{"method": "POST", "request_content_type": "application/json"}, wantMember: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fields := test.fields
+			if fields == nil {
+				fields = map[string]any{}
+			}
+			output, err := Classify(Input{
+				HTTPObservations:   []provideroutput.Record{{Provider: "httpx", Kind: provideroutput.URLRecord, Target: test.observation, Fields: fields}},
+				APISchemaEndpoints: []string{test.schema},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(output.Classifications) != 1 {
+				t.Fatalf("classifications=%#v", output.Classifications)
+			}
+			got := contains(output.Classifications[0].Labels, "api_schema_member")
+			if got != test.wantMember {
+				t.Fatalf("api_schema_member=%t want=%t labels=%v", got, test.wantMember, output.Classifications[0].Labels)
+			}
+		})
+	}
+}
+
+func TestClassifySeparatesOtherwiseEquivalentOrigins(t *testing.T) {
+	output, err := Classify(Input{HTTPObservations: []provideroutput.Record{
+		{Provider: "httpx", Kind: provideroutput.URLRecord, Target: "https://a.example/api/users/123", Fields: map[string]any{}},
+		{Provider: "httpx", Kind: provideroutput.URLRecord, Target: "https://b.example/api/users/456", Fields: map[string]any{}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(output.Endpoints) != 2 || len(output.Classifications) != 2 {
+		t.Fatalf("cross-origin endpoints were aggregated: %#v", output)
+	}
+	if output.Endpoints[0].Digest == output.Endpoints[1].Digest {
+		t.Fatal("cross-origin endpoint digests are equal")
+	}
+}
+
 func contains(items []string, value string) bool {
 	for _, item := range items {
 		if item == value {

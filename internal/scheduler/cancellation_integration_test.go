@@ -77,10 +77,15 @@ func (p *fakeProvider) Validate(ctx context.Context, req capability.Request) err
 }
 
 func (p *fakeProvider) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
+	var result capability.Result
+	var err error
 	if p.onExecute != nil {
-		return p.onExecute(ctx)
+		result, err = p.onExecute(ctx)
 	}
-	return capability.Result{}, nil
+	if err == nil && p.name == "classify.endpoint" {
+		result.Action.Output = json.RawMessage(`{"endpoints":[],"classifications":[],"interesting_endpoints":[],"relationships":[]}`)
+	}
+	return result, err
 }
 func (p *fakeProvider) Manifest() capability.Manifest {
 	r := p.risk

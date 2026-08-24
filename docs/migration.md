@@ -14,6 +14,22 @@ Migration `0006_verification_verdicts.sql` adds persisted `evidence_verdict` and
 
 Migration `0007_scheduled_reconnaissance.sql` adds `schedules`, `scheduled_executions`, immutable `change_items`, and mutable `change_reviews`. It does not drop, truncate, or delete findings, endpoint records, artifacts, workflow runs, or scope history.
 
+### Endpoint origin identity migration 0013
+
+Migration `0013_endpoint_origin_identity.sql` adds the normalized Endpoint origin tuple, an unvalidated corrected-row structural gate, immutable corrected identity, and origin-local uniqueness. It does not backfill, split, merge, delete, or reinterpret historical Endpoint rows. Existing rows remain legacy origin-null records and cannot receive ordinary aggregate updates or be converted in place.
+
+Migration 0013 requires a coordinated writer drain; mixed pre-Slice-2 and Slice-2 Endpoint writers are unsupported:
+
+1. Stop new workflow admission.
+2. Drain and stop old workers and scheduler execution.
+3. Stop old in-flight `platform workflow run` and `platform run retry` processes.
+4. Prevent old migration-capable processes from starting and auto-migrating.
+5. Apply 0013 once with the new binary using explicit `platform migrate`.
+6. Inspect the Endpoint origin columns, `endpoints_corrected_row_ck`, `endpoints_identity_guard`, `endpoints_corrected_identity_uq`, removal of `endpoints_identity_uq`, and migration ledger entry.
+7. Start only Slice-2-aware binaries and then resume admission.
+
+Any pre-Slice-2 Endpoint writer that reaches the migrated schema must fail closed and create or mutate no Endpoint state. The exact PostgreSQL error may be the corrected-row constraint or failure to infer the removed coarse conflict arbiter; no compatibility shim is provided.
+
 ## Environment and Compose
 
 Replace `RATE_LIMIT` with `NUCLEI_RATE_LIMIT` and `CONCURRENCY` with explicit host/template/headless concurrency variables. Add `DATABASE_URL` and `REDIS_PASSWORD`. Compare the complete new `.env.example`; duplicated per-binary parsers no longer exist.

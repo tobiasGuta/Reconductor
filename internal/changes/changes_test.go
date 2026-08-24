@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tobiasGuta/Reconductor/internal/normalize"
 )
 
 func TestFromReportRawSuppressesUnchangedInterestingEndpoint(t *testing.T) {
@@ -67,6 +69,60 @@ func TestFromReportRawPreservesStructuredAssetEvidence(t *testing.T) {
 	}
 }
 
+func TestEndpointChangeEntityKeyUsesCorrectedEndpointDigest(t *testing.T) {
+	key, _, err := normalize.CanonicalEndpoint("https://app.example.test/api/users/123?x=1", "GET", "application/json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := FromReportRaw(reportWithCanonicalEndpoint(t, key), time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].EntityKey != key.Digest {
+		t.Fatalf("change items=%#v digest=%q", items, key.Digest)
+	}
+}
+
+func TestEndpointChangeEntityKeysPreserveCorrectedIdentityBoundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		leftURL   string
+		rightURL  string
+		wantEqual bool
+	}{
+		{name: "different origins", leftURL: "https://a.example/api/users/123?x=1", rightURL: "https://b.example/api/users/456?x=2"},
+		{name: "query values excluded", leftURL: "https://a.example/api/users/123?x=1", rightURL: "https://a.example/api/users/456?x=2", wantEqual: true},
+		{name: "parameter framing", leftURL: "https://a.example/api/users/123?a%2Cb=1&c=1", rightURL: "https://a.example/api/users/456?a=1&b%2Cc=1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			left, _, err := normalize.CanonicalEndpoint(test.leftURL, "GET", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			right, _, err := normalize.CanonicalEndpoint(test.rightURL, "GET", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			leftItems, err := FromReportRaw(reportWithCanonicalEndpoint(t, left), time.Now().UTC())
+			if err != nil {
+				t.Fatal(err)
+			}
+			rightItems, err := FromReportRaw(reportWithCanonicalEndpoint(t, right), time.Now().UTC())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(leftItems) != 1 || len(rightItems) != 1 {
+				t.Fatalf("left=%#v right=%#v", leftItems, rightItems)
+			}
+			gotEqual := leftItems[0].EntityKey == rightItems[0].EntityKey
+			if gotEqual != test.wantEqual {
+				t.Fatalf("entity keys equal=%t want=%t left=%q right=%q", gotEqual, test.wantEqual, leftItems[0].EntityKey, rightItems[0].EntityKey)
+			}
+		})
+	}
+}
+
 func reportWithEndpoint(t *testing.T, history historical) json.RawMessage {
 	return reportEndpoint(t, history, "POST", []string{"admin"})
 }
@@ -92,6 +148,37 @@ func reportEndpoint(t *testing.T, history historical, method string, labels []st
 			StatusCodes:     []int{200},
 			MatchedKeywords: []string{},
 			Historical:      history,
+		}},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func reportWithCanonicalEndpoint(t *testing.T, key normalize.EndpointKey) json.RawMessage {
+	t.Helper()
+	payload := reportPayload{
+		Changes:          []AssetChange{},
+		CandidateMatches: []string{},
+		TargetPlanDigest: "plan",
+		Endpoints: []endpointClassification{{
+			Endpoint: endpoint{
+				ExactURL:        key.ExactURL,
+				RouteSignature:  key.RouteSignature,
+				Method:          key.Method,
+				ContentType:     key.ContentType,
+				QueryParameters: append([]string(nil), key.QueryParameters...),
+				Digest:          key.Digest,
+			},
+			Labels:          []string{"api"},
+			Signals:         []signal{},
+			Sources:         []string{"classify.endpoint"},
+			Technologies:    []string{},
+			StatusCodes:     []int{200},
+			MatchedKeywords: []string{},
+			Historical:      historical{},
 		}},
 	}
 	raw, err := json.Marshal(payload)
