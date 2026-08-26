@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
@@ -523,6 +524,16 @@ func TestProbeHTTPCanonicalResourceAcquisitionOrderIsAttemptIndependent(t *testi
 		t.Fatalf("test resource advisory keys collided: %d", firstBarrierKey)
 	}
 	installConcreteHTTPResourceAcquisitionBarrier(t, env)
+	observerConfig := env.store.Pool.Config().ConnConfig.Copy()
+	observer, err := pgx.ConnectConfig(env.ctx, observerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := observer.Close(context.Background()); err != nil {
+			t.Errorf("close concrete HTTP resource acquisition observer: %v", err)
+		}
+	}()
 	firstHolderPID, releaseFirstBarrier := holdResultIdentityInsertBarrierWithPID(t, env, domain.ID(firstResource.ConcreteEscapedPath))
 	defer releaseFirstBarrier()
 	secondHolderPID, releaseSecondBarrier := holdResultIdentityInsertBarrierWithPID(t, env, domain.ID(secondResource.ConcreteEscapedPath))
@@ -620,7 +631,7 @@ func TestProbeHTTPCanonicalResourceAcquisitionOrderIsAttemptIndependent(t *testi
 		}
 	}
 	releaseWorkers()
-	firstWaitHolder, secondWaitHolder := waitForConcreteHTTPResourceAcquisition(t, runCtx, env.store, firstHolderPID, secondHolderPID, firstPID, secondPID, results)
+	firstWaitHolder, secondWaitHolder := waitForConcreteHTTPResourceAcquisition(t, runCtx, observer, firstHolderPID, secondHolderPID, firstPID, secondPID, results)
 	releaseFirstBarrier()
 	releaseSecondBarrier()
 	for range 2 {
@@ -1278,13 +1289,13 @@ func installConcreteHTTPResourceAcquisitionBarrier(t *testing.T, env recoveryTes
 	})
 }
 
-func waitForConcreteHTTPResourceAcquisition(t *testing.T, ctx context.Context, store *Store, firstHolderPID, secondHolderPID, firstPID, secondPID int32, results <-chan error) (int32, int32) {
+func waitForConcreteHTTPResourceAcquisition(t *testing.T, ctx context.Context, observer *pgx.Conn, firstHolderPID, secondHolderPID, firstPID, secondPID int32, results <-chan error) (int32, int32) {
 	t.Helper()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		var firstWaitHolder, secondWaitHolder int32
-		if err := store.Pool.QueryRow(ctx, `SELECT
+		if err := observer.QueryRow(ctx, `SELECT
 			COALESCE(max(held_lock.pid) FILTER (WHERE waiting_lock.pid=$1),0),
 			COALESCE(max(held_lock.pid) FILTER (WHERE waiting_lock.pid=$2),0)
 			FROM pg_locks waiting_lock
