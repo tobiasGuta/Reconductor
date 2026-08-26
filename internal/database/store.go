@@ -830,6 +830,10 @@ func persistResultTransaction(ctx context.Context, tx pgx.Tx, programID domain.I
 			return err
 		}
 	}
+	probeSources, err := prepareProbeHTTPSourceRecords(programID, step, result, admission)
+	if err != nil {
+		return err
+	}
 	observationIDs := []domain.ID{}
 	if step.Status == domain.StepSucceeded {
 		observationIDs, err = persistObservations(ctx, tx, programID, step, result, artifacts)
@@ -871,6 +875,11 @@ func persistResultTransaction(ctx context.Context, tx pgx.Tx, programID domain.I
 		}
 		if step.Status == domain.StepSucceeded && len(observationIDs) > 0 {
 			if err := persistAssetObservationEmissions(ctx, tx, programID, observationIDs, acceptedEventID); err != nil {
+				return err
+			}
+		}
+		if probeSources != nil {
+			if err := persistProbeHTTPSourceRecords(ctx, tx, programID, step, artifacts, *probeSources, acceptedEventID); err != nil {
 				return err
 			}
 		}
@@ -951,6 +960,179 @@ func persistAssetObservationEmissions(ctx context.Context, tx pgx.Tx, programID 
 		}
 	}
 	return nil
+}
+
+func prepareProbeHTTPSourceRecords(programID domain.ID, step domain.StepRun, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) (*normalize.ProbeHTTPSourceOutput, error) {
+	if step.Capability != "probe.http" {
+		return nil, nil
+	}
+	// Failed and retryable provider output is retained as ordinary result
+	// evidence, but no serialized lineage from it is eligible for trusted 3A
+	// persistence.
+	if step.Status != domain.StepSucceeded {
+		return nil, nil
+	}
+	providerAttemptID := ""
+	if admission != nil {
+		providerAttemptID = string(admission.ProviderAttemptID)
+	}
+	payload, present, err := normalize.ParseProbeHTTPSourceOutput(result.Output, string(programID), providerAttemptID)
+	if err != nil {
+		return nil, fmt.Errorf("validate probe HTTP source lineage: %w", err)
+	}
+	if !present {
+		return nil, nil
+	}
+	if admission == nil {
+		return nil, fmt.Errorf("validate probe HTTP source lineage: %w", normalize.ErrProbeHTTPSourceContract)
+	}
+	return &payload, nil
+}
+
+type concreteHTTPResourceKey struct {
+	identityNamespace string
+	scheme            string
+	host              string
+	effectivePort     int
+	escapedPath       string
+	canonicalQuery    string
+}
+
+func keyForConcreteHTTPResource(resource normalize.CanonicalConcreteHTTPResource) concreteHTTPResourceKey {
+	return concreteHTTPResourceKey{
+		identityNamespace: resource.IdentityNamespace,
+		scheme:            resource.Scheme,
+		host:              resource.Host,
+		effectivePort:     resource.EffectivePort,
+		escapedPath:       resource.ConcreteEscapedPath,
+		canonicalQuery:    resource.CanonicalQuery,
+	}
+}
+
+func lessConcreteHTTPResourceKey(left, right concreteHTTPResourceKey) bool {
+	if left.identityNamespace != right.identityNamespace {
+		return left.identityNamespace < right.identityNamespace
+	}
+	if left.scheme != right.scheme {
+		return left.scheme < right.scheme
+	}
+	if left.host != right.host {
+		return left.host < right.host
+	}
+	if left.effectivePort != right.effectivePort {
+		return left.effectivePort < right.effectivePort
+	}
+	if left.escapedPath != right.escapedPath {
+		return left.escapedPath < right.escapedPath
+	}
+	return left.canonicalQuery < right.canonicalQuery
+}
+
+func persistProbeHTTPSourceRecords(ctx context.Context, tx pgx.Tx, programID domain.ID, step domain.StepRun, artifacts []domain.Artifact, payload normalize.ProbeHTTPSourceOutput, acceptedEventID domain.ID) error {
+	normalizedArtifactID, err := normalizedResultArtifactID(artifacts)
+	if err != nil {
+		return fmt.Errorf("persist probe HTTP source lineage: %w", err)
+	}
+	type sourcePersistence struct {
+		source normalize.AuthorizedSourceRecord
+		target string
+		key    concreteHTTPResourceKey
+	}
+	entries := make([]sourcePersistence, 0, len(payload.AuthorizedSourceRecords))
+	resources := make(map[concreteHTTPResourceKey]normalize.CanonicalConcreteHTTPResource, len(payload.AuthorizedSourceRecords))
+	for _, source := range payload.AuthorizedSourceRecords {
+		if source.AuthorizedRecordIndex < 0 || source.AuthorizedRecordIndex >= len(payload.AuthorizedRecords) {
+			return fmt.Errorf("persist probe HTTP source lineage: %w", normalize.ErrProbeHTTPSourceContract)
+		}
+		record := payload.AuthorizedRecords[source.AuthorizedRecordIndex]
+		resource, err := normalize.ConcreteHTTPResource(record.Target)
+		if err != nil {
+			return fmt.Errorf("persist probe HTTP source lineage: %w", normalize.ErrProbeHTTPSourceContract)
+		}
+		key := keyForConcreteHTTPResource(resource)
+		resources[key] = resource
+		entries = append(entries, sourcePersistence{source: source, target: record.Target, key: key})
+	}
+	resourceKeys := make([]concreteHTTPResourceKey, 0, len(resources))
+	for key := range resources {
+		resourceKeys = append(resourceKeys, key)
+	}
+	sort.Slice(resourceKeys, func(i, j int) bool { return lessConcreteHTTPResourceKey(resourceKeys[i], resourceKeys[j]) })
+	resourceIDs := make(map[concreteHTTPResourceKey]domain.ID, len(resourceKeys))
+	for _, key := range resourceKeys {
+		resource := resources[key]
+		resourceID := domain.NewID()
+		if err := tx.QueryRow(ctx, `INSERT INTO canonical_concrete_http_resources(
+			id,program_id,identity_namespace,scheme,host,effective_port,concrete_escaped_path,canonical_query
+		) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+		ON CONFLICT(program_id,identity_namespace,scheme,host,effective_port,concrete_escaped_path,canonical_query)
+		DO UPDATE SET id=canonical_concrete_http_resources.id
+		RETURNING id`, resourceID, programID, resource.IdentityNamespace, resource.Scheme, resource.Host, resource.EffectivePort, resource.ConcreteEscapedPath, resource.CanonicalQuery).Scan(&resourceID); err != nil {
+			return err
+		}
+		resourceIDs[key] = resourceID
+	}
+	for _, entry := range entries {
+		source := entry.source
+		resourceID := resourceIDs[entry.key]
+		var observationID domain.ID
+		err = tx.QueryRow(ctx, `SELECT observation.id
+			FROM asset_observations observation
+			JOIN assets asset ON asset.id=observation.asset_id
+			JOIN asset_observation_emissions emission ON emission.asset_observation_id=observation.id
+			WHERE asset.program_id=$1
+			  AND asset.type='http_service'
+			  AND asset.canonical_value=$2
+			  AND observation.observed_value=$2
+			  AND observation.workflow_run_id=$3
+			  AND observation.source_capability='probe.http'
+			  AND emission.program_id=$1
+			  AND emission.provider_result_accepted_event_id=$4
+			FOR SHARE OF observation,asset,emission`, programID, entry.target, step.WorkflowRunID, acceptedEventID).Scan(&observationID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("persist probe HTTP source lineage: %w", normalize.ErrProbeHTTPSourceContract)
+			}
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO probe_http_source_records(
+			source_locator,program_id,concrete_http_resource_id,asset_observation_id,provider_result_accepted_event_id,
+			provider_attempt_id,normalized_result_artifact_id,authorized_record_index,record_digest,
+			request_method_state,request_method_value,request_content_type_state,request_content_type_value,
+			identity_namespace,derivation_version
+		) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+			source.SourceLocator, programID, resourceID, observationID, acceptedEventID, source.ProviderAttemptID,
+			normalizedArtifactID, source.AuthorizedRecordIndex, source.RecordDigest,
+			source.RequestMethod.State, nullableSourceValue(source.RequestMethod), source.RequestContentType.State, nullableSourceValue(source.RequestContentType),
+			source.IdentityNamespace, source.DerivationVersion); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizedResultArtifactID(artifacts []domain.Artifact) (any, error) {
+	var artifactID domain.ID
+	for _, artifact := range artifacts {
+		if artifact.Type != "normalized-result" {
+			continue
+		}
+		if artifactID != "" {
+			return nil, fmt.Errorf("multiple normalized result artifacts")
+		}
+		artifactID = artifact.ID
+	}
+	if artifactID == "" {
+		return nil, nil
+	}
+	return artifactID, nil
+}
+
+func nullableSourceValue(value normalize.ValueSemantics) any {
+	if value.Value == nil {
+		return nil
+	}
+	return *value.Value
 }
 func persistCandidates(ctx context.Context, tx pgx.Tx, programID domain.ID, step domain.StepRun, result domain.ActionResult, artifacts []domain.Artifact) error {
 	for _, line := range outputLines(result.Output) {

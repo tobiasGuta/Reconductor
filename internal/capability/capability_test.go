@@ -150,6 +150,16 @@ type boundaryCapability struct {
 	called      bool
 }
 
+type malformedProbeCapability struct{}
+
+func (malformedProbeCapability) Manifest() Manifest {
+	return Manifest{Name: "probe.http", Version: "4", Risk: policy.Low}
+}
+func (malformedProbeCapability) Validate(context.Context, Request) error { return nil }
+func (malformedProbeCapability) Execute(context.Context, Request) (Result, error) {
+	return Result{Action: domain.ActionResult{Status: "succeeded", Output: json.RawMessage(`{"authorized_records":[{"provider":"httpx","kind":"url","target":"not-a-url"}]}`)}}, nil
+}
+
 func (*boundaryCapability) Manifest() Manifest {
 	return Manifest{Name: "boundary", Version: "1", Risk: policy.Low}
 }
@@ -221,6 +231,30 @@ func TestProviderInvocationBoundaryGatesAndPropagatesExactIDs(t *testing.T) {
 	}
 	if result.ProviderAttemptID == nil || *result.ProviderAttemptID != invocations.startIDs[0] || len(invocations.terminals) != 1 || invocations.terminals[0].ProviderAttemptID != invocations.startIDs[0] || invocations.terminals[0].Outcome != ProviderInvocationSucceeded {
 		t.Fatalf("result=%#v terminals=%#v", result, invocations.terminals)
+	}
+}
+
+func TestMalformedProbeSourceHasNoResultAdmissionProvenance(t *testing.T) {
+	registry := NewRegistry()
+	if err := registry.Register(malformedProbeCapability{}); err != nil {
+		t.Fatal(err)
+	}
+	decisions := &capturedDecision{}
+	invocations := &capturedInvocations{}
+	result, err := registry.Execute(context.Background(), Request{
+		ProgramID: domain.ID("00000000-0000-4000-8000-000000000001"),
+		Action:    domain.ActionRequest{ID: domain.NewID(), Capability: "probe.http", Input: json.RawMessage(`{}`)},
+		Policy:    policy.Policy{AllowedCapabilities: []string{"probe.http"}}, Scope: allowAllScope{},
+		DecisionRecorder: decisions, InvocationRecorder: invocations,
+	})
+	if err == nil || result.Action.Error == nil || result.Action.Error.Classification != "source_contract" {
+		t.Fatalf("result=%#v error=%v", result, err)
+	}
+	if result.ProviderAttemptID != nil || result.AdmissionProvenance != nil {
+		t.Fatalf("source contract failure exposed result admission provenance: %#v", result)
+	}
+	if len(invocations.starts) != 1 || len(invocations.terminals) != 1 || invocations.terminals[0].Outcome != ProviderInvocationFailed {
+		t.Fatalf("provider audit=%#v", invocations)
 	}
 }
 

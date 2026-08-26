@@ -32,7 +32,7 @@ func Registry(cfg config.Config) *capability.Registry {
 	defs := []commandprovider.Definition{
 		{Name: "resolve.dns", Description: "Resolve scope-authorized names", Provider: "dnsx", Executable: cfg.Tools.DNSx, Version: "3", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "dnsx", Probe: probes["dnsx"], BuildInvocation: dnsxInvocation},
 		{Name: "scan.ports", Description: "Discover scope-authorized network ports", Provider: "naabu", Executable: cfg.Tools.Naabu, Version: "2", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "naabu", Probe: probes["naabu"], BuildArgs: func(i commandprovider.Input, p policy.Policy) ([]string, error) { return naabuArgs(i, p, cfg.Recon) }},
-		{Name: "probe.http", Description: "Probe authorized HTTP services", Provider: "httpx", Executable: cfg.Tools.HTTPX, Version: "3", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "httpx", Probe: probes["httpx"], BuildInvocation: func(i commandprovider.Input, p policy.Policy) (commandprovider.Invocation, error) {
+		{Name: "probe.http", Description: "Probe authorized HTTP services", Provider: "httpx", Executable: cfg.Tools.HTTPX, Version: "4", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "httpx", Probe: probes["httpx"], BuildInvocation: func(i commandprovider.Input, p policy.Policy) (commandprovider.Invocation, error) {
 			return httpxInvocation(i, p, cfg.Recon)
 		}},
 		{Name: "crawl.web", Description: "Crawl an authorized web target", Provider: "katana", Executable: cfg.Tools.Katana, Version: "2", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "katana", Probe: probes["katana"], BuildArgs: func(i commandprovider.Input, p policy.Policy) ([]string, error) {
@@ -93,8 +93,19 @@ func httpxInvocation(i commandprovider.Input, p policy.Policy, c config.Recon) (
 	if len(i.Targets) == 0 {
 		return commandprovider.Invocation{}, fmt.Errorf("targets are required")
 	}
+	args := []string{"-silent", "-json", "-status-code", "-content-type", "-location", "-tech-detect", "-threads", fmt.Sprint(bounded(c.Concurrency, p.Concurrency))}
+	if method := strings.ToUpper(strings.TrimSpace(i.Method)); method != "" {
+		args = append(args, "-x", method)
+	}
+	if i.RequestContentType != nil {
+		if strings.ContainsAny(*i.RequestContentType, "\r\n") {
+			return commandprovider.Invocation{}, fmt.Errorf("request content type contains a line break")
+		}
+		contentType := strings.ToLower(strings.TrimSpace(strings.Split(*i.RequestContentType, ";")[0]))
+		args = append(args, "-H", "Content-Type: "+contentType)
+	}
 	return commandprovider.Invocation{
-		Args:  []string{"-silent", "-json", "-status-code", "-content-type", "-location", "-tech-detect", "-threads", fmt.Sprint(bounded(c.Concurrency, p.Concurrency))},
+		Args:  args,
 		Stdin: []byte(strings.Join(i.Targets, "\n") + "\n"),
 	}, nil
 }

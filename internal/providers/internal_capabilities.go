@@ -61,6 +61,7 @@ func (values *HTTPObservationValues) UnmarshalJSON(raw []byte) error {
 		}
 		var record provideroutput.Record
 		decoder := json.NewDecoder(bytes.NewReader(item))
+		decoder.UseNumber()
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&record); err != nil {
 			return fmt.Errorf("item %d must be a string or structured URL record: %w", index, err)
@@ -103,18 +104,25 @@ type CompareAssetsOutput struct {
 }
 
 type ClassifyEndpointInput struct {
-	Active                 []string                `json:"active"`
-	Passive                []string                `json:"passive"`
-	HTTPObservations       []provideroutput.Record `json:"http_observations"`
-	CrawlObservations      []provideroutput.Record `json:"crawl_observations"`
-	PassiveObservations    []provideroutput.Record `json:"passive_observations"`
-	HistoricalObservations []provideroutput.Record `json:"historical_observations"`
-	APISchemaEndpoints     []string                `json:"api_schema_endpoints"`
-	TargetPlanDigest       string                  `json:"target_plan_digest"`
+	Active                 []string                           `json:"active"`
+	Passive                []string                           `json:"passive"`
+	HTTPObservations       []provideroutput.Record            `json:"http_observations"`
+	HTTPSourceRecords      []normalize.AuthorizedSourceRecord `json:"http_source_records,omitempty"`
+	CrawlObservations      []provideroutput.Record            `json:"crawl_observations"`
+	PassiveObservations    []provideroutput.Record            `json:"passive_observations"`
+	HistoricalObservations []provideroutput.Record            `json:"historical_observations"`
+	APISchemaEndpoints     []string                           `json:"api_schema_endpoints"`
+	TargetPlanDigest       string                             `json:"target_plan_digest"`
 }
 
 type InterestingEndpoint = intelligence.EndpointClassification
-type ClassifyEndpointOutput = intelligence.Output
+type ClassifyEndpointOutput struct {
+	Endpoints            []normalize.EndpointKey               `json:"endpoints"`
+	Classifications      []intelligence.EndpointClassification `json:"classifications"`
+	InterestingEndpoints []intelligence.EndpointClassification `json:"interesting_endpoints"`
+	Relationships        []intelligence.Relationship           `json:"relationships"`
+	SourceDerivations    []normalize.SourceDerivation          `json:"source_derivations"`
+}
 
 type ReportChangesInput struct {
 	Changes          []AssetChange         `json:"changes"`
@@ -143,6 +151,15 @@ func (c internalCap) Validate(_ context.Context, r capability.Request) error {
 	if err := validateInternalInput(c.m.Name, r.Action.Input); err != nil {
 		return err
 	}
+	if c.m.Name == "classify.endpoint" {
+		input, sourceRecordsPresent, err := decodeClassifyEndpointInput(r.Action.Input)
+		if err != nil {
+			return fmt.Errorf("classify.endpoint input: %w", err)
+		}
+		if _, err := classifyEndpoints(input, string(r.ProgramID), sourceRecordsPresent); err != nil {
+			return fmt.Errorf("classify.endpoint input: %w", err)
+		}
+	}
 	if c.m.Name == "targeting.prepare" {
 		if _, ok := r.Scope.(targeting.DetailedScope); !ok {
 			return fmt.Errorf("target preparation requires detailed scope evaluation")
@@ -161,7 +178,7 @@ func (c internalCap) Execute(_ context.Context, r capability.Request) (capabilit
 	case "compare.assets":
 		output, summary, err = executeCompareAssets(r.Action.Input)
 	case "classify.endpoint":
-		output, summary, err = executeClassifyEndpoint(r.Action.Input)
+		output, summary, err = executeClassifyEndpoint(r)
 	case "report.changes":
 		output, summary, err = executeReportChanges(r.Action.Input)
 	default:
@@ -184,7 +201,7 @@ func internalCapabilities() []capability.Capability {
 	}{
 		{"targeting.prepare", "Filter and prepare scope-authorized active targets", "2", targetingPrepareInputSchema, targetingPrepareOutputSchema},
 		{"compare.assets", "Compare current and previous HTTP asset observations", "2", compareAssetsInputSchema, compareAssetsOutputSchema},
-		{"classify.endpoint", "Classify endpoint intelligence with deterministic evidence", "4", classifyEndpointInputSchema, classifyEndpointOutputSchema},
+		{"classify.endpoint", "Classify endpoint intelligence with deterministic evidence", "5", classifyEndpointInputSchema, classifyEndpointOutputSchema},
 		{"report.changes", "Produce a typed changes-only report", "3", reportChangesInputSchema, reportChangesOutputSchema},
 	}
 	out := make([]capability.Capability, 0, len(definitions))
@@ -226,8 +243,8 @@ func validateInternalInput(name string, raw json.RawMessage) error {
 			return fmt.Errorf("compare.assets input: %w", err)
 		}
 	case "classify.endpoint":
-		var input ClassifyEndpointInput
-		if err := strictInternal(raw, &input, "active", "passive", "http_observations", "crawl_observations", "passive_observations", "historical_observations", "api_schema_endpoints", "target_plan_digest"); err != nil {
+		input, _, err := decodeClassifyEndpointInput(raw)
+		if err != nil {
 			return fmt.Errorf("classify.endpoint input: %w", err)
 		}
 		if err := requireDigest(input.TargetPlanDigest); err != nil {
@@ -236,7 +253,10 @@ func validateInternalInput(name string, raw json.RawMessage) error {
 		if err := validateObservationURLs(append(append([]string{}, input.Active...), input.Passive...)); err != nil {
 			return fmt.Errorf("classify.endpoint input: %w", err)
 		}
-		if _, err := classifyEndpoints(input); err != nil {
+		// Definition validation deliberately has no program identity. Trusted
+		// source lineage is validated with that identity by Validate and Execute.
+		input.HTTPSourceRecords = nil
+		if _, err := classifyEndpoints(input, "", false); err != nil {
 			return fmt.Errorf("classify.endpoint input: %w", err)
 		}
 	case "report.changes":
@@ -375,30 +395,75 @@ func executeCompareAssets(raw json.RawMessage) (CompareAssetsOutput, string, err
 	return output, fmt.Sprintf("asset comparison found %d new or changed and %d removed", len(changed), len(removed)), nil
 }
 
-func executeClassifyEndpoint(raw json.RawMessage) (ClassifyEndpointOutput, string, error) {
-	var input ClassifyEndpointInput
-	if err := strictInternal(raw, &input, "active", "passive", "http_observations", "crawl_observations", "passive_observations", "historical_observations", "api_schema_endpoints", "target_plan_digest"); err != nil {
+func executeClassifyEndpoint(r capability.Request) (ClassifyEndpointOutput, string, error) {
+	input, sourceRecordsPresent, err := decodeClassifyEndpointInput(r.Action.Input)
+	if err != nil {
 		return ClassifyEndpointOutput{}, "", err
 	}
-	output, err := classifyEndpoints(input)
+	output, err := classifyEndpoints(input, string(r.ProgramID), sourceRecordsPresent)
 	if err != nil {
 		return ClassifyEndpointOutput{}, "", err
 	}
 	return output, fmt.Sprintf("classified %d unique endpoints (%d interesting)", len(output.Endpoints), len(output.InterestingEndpoints)), nil
 }
 
-func classifyEndpoints(input ClassifyEndpointInput) (ClassifyEndpointOutput, error) {
+func decodeClassifyEndpointInput(raw json.RawMessage) (ClassifyEndpointInput, bool, error) {
+	var input ClassifyEndpointInput
+	if err := strictInternal(raw, &input, "active", "passive", "http_observations", "crawl_observations", "passive_observations", "historical_observations", "api_schema_endpoints", "target_plan_digest"); err != nil {
+		return ClassifyEndpointInput{}, false, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return ClassifyEndpointInput{}, false, err
+	}
+	const sourceRecordsField = "http_source_records"
+	for field := range fields {
+		if field != sourceRecordsField && strings.EqualFold(field, sourceRecordsField) {
+			return ClassifyEndpointInput{}, false, fmt.Errorf("%w: HTTP source records field must use canonical spelling %q", normalize.ErrProbeHTTPSourceContract, sourceRecordsField)
+		}
+	}
+	sources, present := fields[sourceRecordsField]
+	if present && bytes.Equal(bytes.TrimSpace(sources), []byte("null")) {
+		return ClassifyEndpointInput{}, true, fmt.Errorf("%w: HTTP source records must be a non-null array", normalize.ErrProbeHTTPSourceContract)
+	}
+	return input, present, nil
+}
+
+func classifyEndpoints(input ClassifyEndpointInput, programID string, sourceRecordsPresent bool) (ClassifyEndpointOutput, error) {
 	crawl := append([]provideroutput.Record{}, input.CrawlObservations...)
 	crawl = append(crawl, recordsFromStrings("katana", input.Active)...)
 	passive := append([]provideroutput.Record{}, input.PassiveObservations...)
 	passive = append(passive, recordsFromStrings("gau", input.Passive)...)
-	return intelligence.Classify(intelligence.Input{
+	classified, err := intelligence.Classify(intelligence.Input{
 		HTTPObservations:       input.HTTPObservations,
 		CrawlObservations:      crawl,
 		PassiveObservations:    passive,
 		HistoricalObservations: input.HistoricalObservations,
 		APISchemaEndpoints:     input.APISchemaEndpoints,
 	})
+	if err != nil {
+		return ClassifyEndpointOutput{}, err
+	}
+	derivations := []normalize.SourceDerivation{}
+	if sourceRecordsPresent {
+		if input.HTTPSourceRecords == nil {
+			return ClassifyEndpointOutput{}, fmt.Errorf("%w: HTTP source records must be a non-null array", normalize.ErrProbeHTTPSourceContract)
+		}
+		if strings.TrimSpace(programID) == "" && len(input.HTTPSourceRecords) > 0 {
+			return ClassifyEndpointOutput{}, fmt.Errorf("trusted program identity is required for HTTP source derivations")
+		}
+		derivations, err = normalize.DeriveProbeHTTPSourceRecords(programID, input.HTTPObservations, input.HTTPSourceRecords)
+		if err != nil {
+			return ClassifyEndpointOutput{}, err
+		}
+	}
+	return ClassifyEndpointOutput{
+		Endpoints:            classified.Endpoints,
+		Classifications:      classified.Classifications,
+		InterestingEndpoints: classified.InterestingEndpoints,
+		Relationships:        classified.Relationships,
+		SourceDerivations:    derivations,
+	}, nil
 }
 
 func recordsFromStrings(provider string, values []string) []provideroutput.Record {
@@ -427,6 +492,7 @@ func strictInternal(raw json.RawMessage, destination any, required ...string) er
 		return fmt.Errorf("structured input is required")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
 		return err
@@ -542,8 +608,8 @@ func extractStatus(raw string) int {
 }
 
 func observationFingerprint(raw string) string {
-	var value map[string]any
-	if json.Unmarshal([]byte(raw), &value) != nil {
+	value, ok := observationObject(raw)
+	if !ok {
 		return raw
 	}
 	if len(value) == 1 {
@@ -562,8 +628,7 @@ func observationFingerprint(raw string) string {
 }
 
 func structuredObservation(raw string) json.RawMessage {
-	var object map[string]any
-	if json.Unmarshal([]byte(raw), &object) == nil && object != nil {
+	if object, ok := observationObject(raw); ok {
 		value, _ := json.Marshal(object)
 		return value
 	}
@@ -576,8 +641,9 @@ func comparisonReasons(previous, current string) []string {
 	if extractStatus(previous) != extractStatus(current) {
 		reasons = append(reasons, "HTTP status changed")
 	}
-	var before, after map[string]any
-	if json.Unmarshal([]byte(previous), &before) == nil && json.Unmarshal([]byte(current), &after) == nil {
+	before, beforeOK := observationObject(previous)
+	after, afterOK := observationObject(current)
+	if beforeOK && afterOK {
 		for _, key := range []string{"tech", "technologies", "webserver"} {
 			if fmt.Sprint(before[key]) != fmt.Sprint(after[key]) {
 				reasons = append(reasons, "technology changed")
@@ -591,19 +657,35 @@ func comparisonReasons(previous, current string) []string {
 	return reasons
 }
 
+func observationObject(raw string) (map[string]any, bool) {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var object map[string]any
+	if err := decoder.Decode(&object); err != nil || object == nil {
+		return nil, false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, false
+	}
+	return object, true
+}
+
 const targetingPrepareInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["exact_urls","discovered_urls","ports","target_plan_digest"],"properties":{"exact_urls":{"type":"array","items":{"type":"string"}},"discovered_urls":{"type":"array","items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer","minimum":1,"maximum":65535},"uniqueItems":true},"target_plan_digest":{"type":"string","minLength":1}}}`
 const targetingPrepareOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["urls","port_targets","filtered","accepted_count","filtered_count","target_plan_digest"],"properties":{"urls":{"type":"array","items":{"type":"string","format":"uri"}},"port_targets":{"type":"array","items":{"type":"string","format":"uri"}},"filtered":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["target","accepted","reason"],"properties":{"target":{"type":"string"},"accepted":{"type":"boolean"},"reason":{"type":"string"},"authorized_urls":{"type":"array","items":{"type":"string","format":"uri"}},"source_rule_ids":{"type":"array","items":{"type":"string"}}}}},"accepted_count":{"type":"integer","minimum":0},"filtered_count":{"type":"integer","minimum":0},"target_plan_digest":{"type":"string","minLength":1}}}`
 const compareAssetsInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["current","previous","coverage_complete","target_plan_digest"],"properties":{"current":{"type":"array","items":{"oneOf":[{"type":"string"},{"$ref":"#/$defs/record"}]}},"previous":{"type":"array","items":{"type":"string"}},"coverage_complete":{"type":"boolean"},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"record":` + providerURLRecordSchema + `}}`
 const assetChangeSchema = `{"type":"object","additionalProperties":false,"required":["kind","value","reasons"],"properties":{"kind":{"enum":["new_or_changed","removed"]},"value":{"type":"string","minLength":1},"previous":{"type":"object"},"current":{"type":"object"},"reasons":{"type":"array","items":{"type":"string","minLength":1},"minItems":1}}}`
 const compareAssetsOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["new_or_changed","crawl_targets","scan_targets","status_routes","removed","changes"],"properties":{"new_or_changed":{"type":"array","items":{"type":"string","format":"uri"}},"crawl_targets":{"type":"array","items":{"type":"string","format":"uri"}},"scan_targets":{"type":"array","items":{"type":"string","format":"uri"}},"status_routes":{"type":"object","additionalProperties":false,"required":["active","redirects","authentication","ignored"],"properties":{"active":{"type":"array","items":{"type":"string","format":"uri"}},"redirects":{"type":"array","items":{"type":"string","format":"uri"}},"authentication":{"type":"array","items":{"type":"string","format":"uri"}},"ignored":{"type":"array","items":{"type":"string","format":"uri"}}}},"removed":{"type":"array","items":{"type":"string","format":"uri"}},"changes":{"type":"array","items":{"$ref":"#/$defs/change"}}},"$defs":{"change":` + assetChangeSchema + `}}`
 const providerURLRecordSchema = `{"type":"object","additionalProperties":false,"required":["provider","kind","target"],"properties":{"provider":{"type":"string","minLength":1},"kind":{"const":"url"},"target":{"type":"string","format":"uri"},"host":{"type":"string"},"port":{"type":"integer","minimum":0,"maximum":65535},"status_code":{"type":"integer","minimum":0,"maximum":599},"technologies":{"type":"array","items":{"type":"string"}},"fields":{"type":"object"}}}`
-const classifyEndpointInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["active","passive","http_observations","crawl_observations","passive_observations","historical_observations","api_schema_endpoints","target_plan_digest"],"properties":{"active":{"type":"array","items":{"type":"string"}},"passive":{"type":"array","items":{"type":"string"}},"http_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"crawl_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"passive_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"historical_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"api_schema_endpoints":{"type":"array","items":{"type":"string","format":"uri"}},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"record":` + providerURLRecordSchema + `}}`
+const sourceValueSemanticsSchema = `{"type":"object","additionalProperties":false,"required":["state","value"],"properties":{"state":{"enum":["known","defaulted","unknown"]},"value":{"type":["string","null"]}}}`
+const authorizedSourceRecordSchema = `{"type":"object","additionalProperties":false,"required":["authorized_record_index","record_digest","source_locator","identity_namespace","derivation_version","provider_attempt_id","request_method","request_content_type"],"properties":{"authorized_record_index":{"type":"integer","minimum":0},"record_digest":{"type":"string","pattern":"^[a-f0-9]{64}$"},"source_locator":{"type":"string","pattern":"^[a-f0-9]{64}$"},"identity_namespace":{"const":"http-uri-resource-v1"},"derivation_version":{"const":"http-resource-derivation-v1"},"provider_attempt_id":{"type":"string","minLength":1},"request_method":{"$ref":"#/$defs/value_semantics"},"request_content_type":{"$ref":"#/$defs/value_semantics"}}}`
+const sourceDerivationSchema = `{"type":"object","additionalProperties":false,"required":["source_locator","identity_namespace","endpoint","effective_method","effective_request_content_type","derivation_version"],"properties":{"source_locator":{"type":"string","pattern":"^[a-f0-9]{64}$"},"identity_namespace":{"const":"http-uri-resource-v1"},"endpoint":{"$ref":"#/$defs/endpoint"},"effective_method":{"$ref":"#/$defs/value_semantics"},"effective_request_content_type":{"$ref":"#/$defs/value_semantics"},"derivation_version":{"const":"http-resource-derivation-v1"}}}`
+const classifyEndpointInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["active","passive","http_observations","crawl_observations","passive_observations","historical_observations","api_schema_endpoints","target_plan_digest"],"properties":{"active":{"type":"array","items":{"type":"string"}},"passive":{"type":"array","items":{"type":"string"}},"http_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"http_source_records":{"type":"array","items":{"$ref":"#/$defs/source_record"}},"crawl_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"passive_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"historical_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"api_schema_endpoints":{"type":"array","items":{"type":"string","format":"uri"}},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"record":` + providerURLRecordSchema + `,"value_semantics":` + sourceValueSemanticsSchema + `,"source_record":` + authorizedSourceRecordSchema + `}}`
 const endpointSchema = `{"type":"object","additionalProperties":false,"required":["exact_url","route_signature","method","content_type","query_parameters","digest"],"properties":{"exact_url":{"type":"string","format":"uri"},"route_signature":{"type":"string"},"method":{"type":"string"},"content_type":{"type":"string"},"query_parameters":{"type":"array","items":{"type":"string"}},"digest":{"type":"string","minLength":1}}}`
 const signalSchema = `{"type":"object","additionalProperties":false,"required":["type","value","weight","source"],"properties":{"type":{"type":"string","minLength":1},"value":{"type":"string","minLength":1},"weight":{"type":"integer","minimum":0},"source":{"type":"string","minLength":1}}}`
 const relationshipSchema = `{"type":"object","additionalProperties":false,"required":["source","target","kind"],"properties":{"source":{"type":"string","format":"uri"},"target":{"type":"string","format":"uri"},"kind":{"type":"string","minLength":1}}}`
 const historicalBehaviorSchema = `{"type":"object","additionalProperties":false,"required":["seen_before","status_changed","technology_changed"],"properties":{"seen_before":{"type":"boolean"},"status_changed":{"type":"boolean"},"technology_changed":{"type":"boolean"}}}`
 const endpointClassificationSchema = `{"type":"object","additionalProperties":false,"required":["endpoint","labels","matched_keywords","signals","interest_score","confidence","sources","technologies","status_codes","redirect_destinations","relationships","historical"],"properties":{"endpoint":` + endpointSchema + `,"labels":{"type":"array","items":{"type":"string","minLength":1}},"matched_keywords":{"type":"array","items":{"type":"string","minLength":1}},"signals":{"type":"array","items":` + signalSchema + `},"interest_score":{"type":"integer","minimum":0},"confidence":{"type":"number","minimum":0,"maximum":1},"sources":{"type":"array","items":{"type":"string","minLength":1}},"technologies":{"type":"array","items":{"type":"string","minLength":1}},"status_codes":{"type":"array","items":{"type":"integer","minimum":100,"maximum":599}},"redirect_destinations":{"type":"array","items":{"type":"string","format":"uri"}},"relationships":{"type":"array","items":` + relationshipSchema + `},"historical":` + historicalBehaviorSchema + `}}`
-const classifyEndpointOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["endpoints","classifications","interesting_endpoints","relationships"],"properties":{"endpoints":{"type":"array","items":` + endpointSchema + `},"classifications":{"type":"array","items":` + endpointClassificationSchema + `},"interesting_endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"relationships":{"type":"array","items":` + relationshipSchema + `}}}`
+const classifyEndpointOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["endpoints","classifications","interesting_endpoints","relationships","source_derivations"],"properties":{"endpoints":{"type":"array","items":` + endpointSchema + `},"classifications":{"type":"array","items":` + endpointClassificationSchema + `},"interesting_endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"relationships":{"type":"array","items":` + relationshipSchema + `},"source_derivations":{"type":"array","items":{"$ref":"#/$defs/source_derivation"}}},"$defs":{"endpoint":` + endpointSchema + `,"value_semantics":` + sourceValueSemanticsSchema + `,"source_derivation":` + sourceDerivationSchema + `}}`
 const reportChangesInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["changes","endpoints","candidate_matches","target_plan_digest"],"properties":{"changes":{"type":"array","items":{"$ref":"#/$defs/change"}},"endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"candidate_matches":{"type":"array","items":{"type":"string","minLength":1}},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"change":` + assetChangeSchema + `}}`
 const changeItemSchema = `{"type":"object","additionalProperties":false,"required":["kind","entity_type","entity_key","priority","title","summary","reasons","source_capabilities","observed_at"],"properties":{"kind":{"type":"string","minLength":1},"entity_type":{"type":"string","minLength":1},"entity_key":{"type":"string","minLength":1},"priority":{"enum":["high","medium","low"]},"title":{"type":"string","minLength":1},"summary":{"type":"string"},"reasons":{"type":"array","items":{"type":"string","minLength":1}},"previous":{"type":"object"},"current":{"type":"object"},"source_capabilities":{"type":"array","items":{"type":"string","minLength":1}},"evidence_artifact_ids":{"type":"array","items":{"type":"string"}},"observed_at":{"type":"string","format":"date-time"}}}`
 const reportChangesOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["changes","endpoints","candidate_matches","target_plan_digest","change_items"],"properties":{"changes":{"type":"array","items":{"$ref":"#/$defs/change"}},"endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"candidate_matches":{"type":"array","items":{"type":"string","minLength":1}},"target_plan_digest":{"type":"string","minLength":1},"change_items":{"type":"array","items":` + changeItemSchema + `}},"$defs":{"change":` + assetChangeSchema + `}}`

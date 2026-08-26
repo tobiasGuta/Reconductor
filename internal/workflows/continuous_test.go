@@ -33,6 +33,7 @@ type provenanceRegistryExecutor struct{ registry *capability.Registry }
 
 func (e provenanceRegistryExecutor) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
 	recorder := workflowProvenanceRecorder{}
+	req.ProgramID = domain.ID("00000000-0000-4000-8000-000000000001")
 	req.DecisionRecorder = recorder
 	req.InvocationRecorder = recorder
 	return e.registry.Execute(ctx, req)
@@ -52,29 +53,56 @@ func TestBuiltInWorkflowSatisfiesRegisteredCapabilitySchemas(t *testing.T) {
 		DiscoveryRoots:   []targeting.DiscoveryRoot{{Domain: "x.test", Source: "test"}},
 		ExactActiveSeeds: []targeting.ActiveSeed{{Host: "x.test", Endpoints: []targeting.Endpoint{{Protocol: "https", Port: 443, URL: "https://x.test/"}}}},
 	}
-	definition := ContinuousWebRecon(plan, false)
-	if err := workflow.Validate(definition, providers.Registry(cfg)); err != nil {
-		t.Fatal(err)
+	definitions := []struct {
+		definition     workflow.Definition
+		wantVersion    string
+		wantEnrichment bool
+	}{
+		{definition: ContinuousWebRecon(plan, false), wantVersion: "2.3.0", wantEnrichment: true},
+		{definition: AuthorizedWebBaseline(plan, false), wantVersion: "1.3.0"},
 	}
-	var classifier *workflow.Step
-	for index := range definition.Steps {
-		if definition.Steps[index].Capability == "classify.endpoint" {
-			classifier = &definition.Steps[index]
-			break
-		}
-	}
-	if classifier == nil {
-		t.Fatal("classifier step missing")
-	}
-	want := map[string]string{
-		"http_observations":    "probe-http.output.authorized_records",
-		"crawl_observations":   "crawl-new-or-changed-web-assets.output.authorized_records",
-		"passive_observations": "discover-archive-urls.output.authorized_records",
-	}
-	for field, binding := range want {
-		if classifier.Bindings[field] != binding {
-			t.Fatalf("classifier binding %s=%q want %q", field, classifier.Bindings[field], binding)
-		}
+	for _, test := range definitions {
+		t.Run(test.definition.Name, func(t *testing.T) {
+			if test.definition.Version != test.wantVersion {
+				t.Fatalf("version=%q want %q", test.definition.Version, test.wantVersion)
+			}
+			if err := workflow.Validate(test.definition, providers.Registry(cfg)); err != nil {
+				t.Fatal(err)
+			}
+			var classifier *workflow.Step
+			for index := range test.definition.Steps {
+				if test.definition.Steps[index].Capability == "classify.endpoint" {
+					classifier = &test.definition.Steps[index]
+					break
+				}
+			}
+			if classifier == nil {
+				t.Fatal("classifier step missing")
+			}
+			want := map[string]string{
+				"http_observations":   "probe-http.output.authorized_records",
+				"http_source_records": "probe-http.output.authorized_source_records",
+			}
+			if test.wantEnrichment {
+				want["crawl_observations"] = "crawl-new-or-changed-web-assets.output.authorized_records"
+				want["passive_observations"] = "discover-archive-urls.output.authorized_records"
+			}
+			for field, binding := range want {
+				if classifier.Bindings[field] != binding {
+					t.Fatalf("classifier binding %s=%q want %q", field, classifier.Bindings[field], binding)
+				}
+			}
+			var compare *workflow.Step
+			for index := range test.definition.Steps {
+				if test.definition.Steps[index].Capability == "compare.assets" {
+					compare = &test.definition.Steps[index]
+					break
+				}
+			}
+			if compare == nil || compare.Bindings["current"] != "probe-http.output.authorized_records" {
+				t.Fatalf("compare.assets current binding=%#v", compare)
+			}
+		})
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/normalize"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/providercheck"
 	"github.com/tobiasGuta/Reconductor/internal/provideroutput"
@@ -27,25 +28,27 @@ import (
 )
 
 type Input struct {
-	Domain     string   `json:"domain,omitempty"`
-	Domains    []string `json:"domains,omitempty"`
-	Targets    []string `json:"targets,omitempty"`
-	Headless   bool     `json:"headless,omitempty"`
-	Ports      string   `json:"ports,omitempty"`
-	Method     string   `json:"method,omitempty"`
-	PlanDigest string   `json:"target_plan_digest,omitempty"`
+	Domain             string   `json:"domain,omitempty"`
+	Domains            []string `json:"domains,omitempty"`
+	Targets            []string `json:"targets,omitempty"`
+	Headless           bool     `json:"headless,omitempty"`
+	Ports              string   `json:"ports,omitempty"`
+	Method             string   `json:"method,omitempty"`
+	RequestContentType *string  `json:"request_content_type,omitempty"`
+	PlanDigest         string   `json:"target_plan_digest,omitempty"`
 }
 
 type ProviderOutput struct {
-	Lines             []string                   `json:"lines"`
-	Authorized        []string                   `json:"authorized"`
-	AuthorizedURLs    []string                   `json:"authorized_urls"`
-	AuthorizedRecords []provideroutput.Record    `json:"authorized_records"`
-	Filtered          []targeting.FilterDecision `json:"filtered"`
-	Records           []provideroutput.Record    `json:"records"`
-	Warnings          []provideroutput.Warning   `json:"warnings"`
-	AcceptedCount     int                        `json:"accepted_count"`
-	FilteredCount     int                        `json:"filtered_count"`
+	Lines                   []string                           `json:"lines"`
+	Authorized              []string                           `json:"authorized"`
+	AuthorizedURLs          []string                           `json:"authorized_urls"`
+	AuthorizedRecords       []provideroutput.Record            `json:"authorized_records"`
+	AuthorizedSourceRecords []normalize.AuthorizedSourceRecord `json:"authorized_source_records,omitempty"`
+	Filtered                []targeting.FilterDecision         `json:"filtered"`
+	Records                 []provideroutput.Record            `json:"records"`
+	Warnings                []provideroutput.Warning           `json:"warnings"`
+	AcceptedCount           int                                `json:"accepted_count"`
+	FilteredCount           int                                `json:"filtered_count"`
 }
 
 type Invocation struct {
@@ -115,15 +118,19 @@ func New(def Definition, runner Runner, r *redaction.Redactor) *Provider {
 	return &Provider{def: def, runner: runner, redactor: r}
 }
 func (p *Provider) Manifest() capability.Manifest {
-	return capability.Manifest{Name: p.def.Name, Description: p.def.Description, Version: p.def.Version, Risk: p.def.Risk, InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"domain":{"type":"string"},"domains":{"type":"array","items":{"type":"string"}},"targets":{"type":"array","items":{"type":"string"}},"headless":{"type":"boolean"},"ports":{"type":"string"},"method":{"type":"string"},"target_plan_digest":{"type":"string"}}}`), OutputSchema: json.RawMessage(providerOutputSchema), RequiredScopeType: p.def.ScopeType, ApprovalRequired: p.def.Risk == policy.Moderate || p.def.Risk == policy.High, RetrySafe: p.def.RetrySafe, Idempotent: p.def.Idempotent, SupportedProviders: []string{p.def.Provider}, ProducedArtifactTypes: []string{"raw-provider-output", "normalized-json"}, RequiredSecrets: p.def.RequiredSecrets, PolicyRequirements: p.def.PolicyRequirements, DefaultTimeout: p.def.Timeout}
+	outputSchema := providerOutputSchema
+	if p.def.Name == "probe.http" {
+		outputSchema = probeHTTPProviderOutputSchema
+	}
+	return capability.Manifest{Name: p.def.Name, Description: p.def.Description, Version: p.def.Version, Risk: p.def.Risk, InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"domain":{"type":"string"},"domains":{"type":"array","items":{"type":"string"}},"targets":{"type":"array","items":{"type":"string"}},"headless":{"type":"boolean"},"ports":{"type":"string"},"method":{"type":"string"},"request_content_type":{"type":"string"},"target_plan_digest":{"type":"string"}}}`), OutputSchema: json.RawMessage(outputSchema), RequiredScopeType: p.def.ScopeType, ApprovalRequired: p.def.Risk == policy.Moderate || p.def.Risk == policy.High, RetrySafe: p.def.RetrySafe, Idempotent: p.def.Idempotent, SupportedProviders: []string{p.def.Provider}, ProducedArtifactTypes: []string{"raw-provider-output", "normalized-json"}, RequiredSecrets: p.def.RequiredSecrets, PolicyRequirements: p.def.PolicyRequirements, DefaultTimeout: p.def.Timeout}
 }
 func (p *Provider) ValidateDefinition(raw json.RawMessage) error {
-	var in Input
-	return strict(raw, &in)
+	_, err := decodeInput(raw)
+	return err
 }
 func (p *Provider) Validate(_ context.Context, req capability.Request) error {
-	var in Input
-	if err := strict(req.Action.Input, &in); err != nil {
+	in, err := decodeInput(req.Action.Input)
+	if err != nil {
 		return fmt.Errorf("%s input: %w", p.def.Name, err)
 	}
 	domains := append([]string{}, in.Domains...)
@@ -147,6 +154,9 @@ func (p *Provider) Validate(_ context.Context, req capability.Request) error {
 			return err
 		}
 	}
+	if in.RequestContentType != nil && strings.ContainsAny(*in.RequestContentType, "\r\n") {
+		return fmt.Errorf("request content type contains a line break")
+	}
 	if len(domains) > 0 && !p.def.PassiveInput {
 		return fmt.Errorf("bare domains are permitted only for passive discovery providers")
 	}
@@ -163,13 +173,18 @@ func (p *Provider) Validate(_ context.Context, req capability.Request) error {
 			return fmt.Errorf("target %q is outside authorized scope", target)
 		}
 	}
-	_, err := p.def.invocation(in, req.Policy)
+	_, err = p.def.invocation(in, req.Policy)
 	return err
 }
 func (p *Provider) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
-	var in Input
-	if err := json.Unmarshal(req.Action.Input, &in); err != nil {
+	in, err := decodeInput(req.Action.Input)
+	if err != nil {
 		return capability.Result{}, err
+	}
+	if in.Method != "" {
+		if err := policy.ValidateHTTPMethod(req.Policy, in.Method); err != nil {
+			return capability.Result{}, err
+		}
 	}
 	invocation, err := p.def.invocation(in, req.Policy)
 	if err != nil {
@@ -216,10 +231,28 @@ func (p *Provider) Execute(ctx context.Context, req capability.Request) (capabil
 		normalized = ProviderOutput{Lines: accepted, Authorized: accepted, AuthorizedURLs: authorizedURLs, AuthorizedRecords: authorizedRecords, Filtered: filtered, Records: batch.Records, Warnings: batch.Warnings, AcceptedCount: len(accepted), FilteredCount: len(filtered)}
 		lines = accepted
 	}
+	if p.def.Name == "probe.http" {
+		normalized.AuthorizedSourceRecords = []normalize.AuthorizedSourceRecord{}
+	}
 	if err := validateProviderOutput(normalized); err != nil {
 		return capability.Result{}, err
 	}
 	output, _ := json.Marshal(normalized)
+	if p.def.Name == "probe.http" {
+		var envelope map[string]json.RawMessage
+		if err := json.Unmarshal(output, &envelope); err != nil {
+			return capability.Result{}, err
+		}
+		sources, err := json.Marshal(normalized.AuthorizedSourceRecords)
+		if err != nil {
+			return capability.Result{}, err
+		}
+		envelope["authorized_source_records"] = sources
+		output, err = json.Marshal(envelope)
+		if err != nil {
+			return capability.Result{}, err
+		}
+	}
 	tool := &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: p.def.Name, Provider: p.def.Provider, ToolVersion: p.redactor.Text(version), SanitizedArguments: safeArgs, ExecutionEnvironment: json.RawMessage(`{"kind":"local-process","shell":false}`), StartedAt: started, CompletedAt: &completed, ExitCode: &exit, TimedOut: errors.Is(runCtx.Err(), context.DeadlineExceeded)}
 	result := capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: fmt.Sprintf("%s accepted %d normalized records", p.def.Provider, len(lines)), Output: output}, ToolRun: tool, RawStdout: []byte(safeStdout), RawStderr: []byte(safeStderr)}
 	if runErr != nil {
@@ -279,6 +312,22 @@ func strict(raw []byte, v any) error {
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
 	return d.Decode(v)
+}
+
+func decodeInput(raw json.RawMessage) (Input, error) {
+	var input Input
+	if err := strict(raw, &input); err != nil {
+		return Input{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return Input{}, err
+	}
+	method, present := fields["method"]
+	if present && (bytes.Equal(bytes.TrimSpace(method), []byte("null")) || strings.TrimSpace(input.Method) == "") {
+		return Input{}, fmt.Errorf("method must be a non-empty string when present")
+	}
+	return input, nil
 }
 func splitLines(s string) []string {
 	raw := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
@@ -462,3 +511,5 @@ func dedupe(items []string) []string {
 }
 
 const providerOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["lines","authorized","authorized_urls","authorized_records","filtered","records","warnings","accepted_count","filtered_count"],"properties":{"lines":{"type":"array","items":{"type":"string"}},"authorized":{"type":"array","items":{"type":"string"}},"authorized_urls":{"type":"array","items":{"type":"string","format":"uri"}},"authorized_records":{"type":"array","items":{"$ref":"#/$defs/record"}},"filtered":{"type":"array","items":{"$ref":"#/$defs/filter_decision"}},"records":{"type":"array","items":{"$ref":"#/$defs/record"}},"warnings":{"type":"array","items":{"$ref":"#/$defs/warning"}},"accepted_count":{"type":"integer","minimum":0},"filtered_count":{"type":"integer","minimum":0}},"$defs":{"record":{"type":"object","additionalProperties":false,"required":["provider","kind","target"],"properties":{"provider":{"type":"string","minLength":1},"kind":{"enum":["host","port","url"]},"target":{"type":"string","minLength":1},"host":{"type":"string"},"port":{"type":"integer","minimum":0,"maximum":65535},"status_code":{"type":"integer","minimum":0,"maximum":599},"technologies":{"type":"array","items":{"type":"string"}},"fields":{"type":"object"}}},"filter_decision":{"type":"object","additionalProperties":false,"required":["target","accepted","reason"],"properties":{"target":{"type":"string"},"accepted":{"type":"boolean"},"reason":{"type":"string"},"authorized_urls":{"type":"array","items":{"type":"string","format":"uri"}},"source_rule_ids":{"type":"array","items":{"type":"string"}}}},"warning":{"type":"object","additionalProperties":false,"required":["line","reason"],"properties":{"line":{"type":"integer","minimum":1},"reason":{"type":"string","minLength":1}}}}}`
+
+const probeHTTPProviderOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["lines","authorized","authorized_urls","authorized_records","authorized_source_records","filtered","records","warnings","accepted_count","filtered_count"],"properties":{"lines":{"type":"array","items":{"type":"string"}},"authorized":{"type":"array","items":{"type":"string"}},"authorized_urls":{"type":"array","items":{"type":"string","format":"uri"}},"authorized_records":{"type":"array","items":{"$ref":"#/$defs/record"}},"authorized_source_records":{"type":"array","items":{"$ref":"#/$defs/source_record"}},"filtered":{"type":"array","items":{"$ref":"#/$defs/filter_decision"}},"records":{"type":"array","items":{"$ref":"#/$defs/record"}},"warnings":{"type":"array","items":{"$ref":"#/$defs/warning"}},"accepted_count":{"type":"integer","minimum":0},"filtered_count":{"type":"integer","minimum":0}},"$defs":{"record":{"type":"object","additionalProperties":false,"required":["provider","kind","target"],"properties":{"provider":{"type":"string","minLength":1},"kind":{"enum":["host","port","url"]},"target":{"type":"string","minLength":1},"host":{"type":"string"},"port":{"type":"integer","minimum":0,"maximum":65535},"status_code":{"type":"integer","minimum":0,"maximum":599},"technologies":{"type":"array","items":{"type":"string"}},"fields":{"type":"object"}}},"value_semantics":{"type":"object","additionalProperties":false,"required":["state","value"],"properties":{"state":{"enum":["known","defaulted","unknown"]},"value":{"type":["string","null"]}}},"source_record":{"type":"object","additionalProperties":false,"required":["authorized_record_index","record_digest","source_locator","identity_namespace","derivation_version","provider_attempt_id","request_method","request_content_type"],"properties":{"authorized_record_index":{"type":"integer","minimum":0},"record_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"},"source_locator":{"type":"string","pattern":"^[0-9a-f]{64}$"},"identity_namespace":{"const":"http-uri-resource-v1"},"derivation_version":{"const":"http-resource-derivation-v1"},"provider_attempt_id":{"type":"string","format":"uuid"},"request_method":{"$ref":"#/$defs/value_semantics"},"request_content_type":{"$ref":"#/$defs/value_semantics"}}},"filter_decision":{"type":"object","additionalProperties":false,"required":["target","accepted","reason"],"properties":{"target":{"type":"string"},"accepted":{"type":"boolean"},"reason":{"type":"string"},"authorized_urls":{"type":"array","items":{"type":"string","format":"uri"}},"source_rule_ids":{"type":"array","items":{"type":"string"}}}},"warning":{"type":"object","additionalProperties":false,"required":["line","reason"],"properties":{"line":{"type":"integer","minimum":1},"reason":{"type":"string","minLength":1}}}}}`

@@ -164,6 +164,36 @@ func TestValidationRejectsUndeclaredOutputBindingsAndConditions(t *testing.T) {
 		t.Fatal("undeclared array item output binding was accepted")
 	}
 }
+
+func TestResolveInputPreservesJSONNumbersInBoundProviderOutput(t *testing.T) {
+	state := &State{Steps: map[string]*StepState{
+		"probe": {Run: domain.StepRun{Output: json.RawMessage(`{"authorized_records":[{"fields":{"status_code":200,"confidence":2e-1,"large":9007199254740993}}]}`)}},
+	}}
+	resolved, err := resolveInput(Step{
+		Input:    json.RawMessage(`{"http_observations":[]}`),
+		Bindings: map[string]string{"http_observations": "probe.output.authorized_records"},
+	}, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(resolved)))
+	decoder.UseNumber()
+	var input map[string]any
+	if err := decoder.Decode(&input); err != nil {
+		t.Fatal(err)
+	}
+	records, ok := input["http_observations"].([]any)
+	if !ok || len(records) != 1 {
+		t.Fatalf("resolved records=%#v", input)
+	}
+	fields := records[0].(map[string]any)["fields"].(map[string]any)
+	for key, want := range map[string]string{"status_code": "200", "confidence": "2e-1", "large": "9007199254740993"} {
+		value, ok := fields[key].(json.Number)
+		if !ok || value.String() != want {
+			t.Fatalf("%s=%#v want json.Number(%q)", key, fields[key], want)
+		}
+	}
+}
 func TestRetryIdempotencyAndResume(t *testing.T) {
 	calls := 0
 	r := registryFor(t, testCap{"x", &calls, true})

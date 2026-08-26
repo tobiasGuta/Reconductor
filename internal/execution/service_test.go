@@ -14,7 +14,9 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/normalize"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
+	"github.com/tobiasGuta/Reconductor/internal/provideroutput"
 	"github.com/tobiasGuta/Reconductor/internal/providers"
 	commandprovider "github.com/tobiasGuta/Reconductor/internal/providers/command"
 	"github.com/tobiasGuta/Reconductor/internal/redaction"
@@ -97,7 +99,7 @@ func TestHistoricalRecordsPreserveStructuredEvidenceAndUpgradeLegacyValues(t *te
 		t.Fatalf("plain HTTP observation was not upgraded: %#v", plainHTTP)
 	}
 	structured := records[2].(map[string]any)
-	if structured["provider"] != "httpx" || structured["status_code"] != float64(200) {
+	if structured["provider"] != "httpx" || structured["status_code"] != json.Number("200") {
 		t.Fatalf("structured evidence was lost: %#v", structured)
 	}
 	legacy := records[3].(map[string]any)
@@ -105,15 +107,15 @@ func TestHistoricalRecordsPreserveStructuredEvidenceAndUpgradeLegacyValues(t *te
 		t.Fatalf("legacy observation was not upgraded: %#v", legacy)
 	}
 	oldHTTPX := records[4].(map[string]any)
-	if oldHTTPX["target"] != "https://x.test/old-httpx" || oldHTTPX["status_code"] != float64(403) {
+	if oldHTTPX["target"] != "https://x.test/old-httpx" || oldHTTPX["status_code"] != json.Number("403") {
 		t.Fatalf("legacy HTTPX evidence was not upgraded: %#v", oldHTTPX)
 	}
 	input := records[5].(map[string]any)
-	if input["target"] != "https://x.test/input" || input["status_code"] != float64(204) {
+	if input["target"] != "https://x.test/input" || input["status_code"] != json.Number("204") {
 		t.Fatalf("legacy input evidence was not upgraded: %#v", input)
 	}
 	host := records[6].(map[string]any)
-	if host["target"] != "https://x.test/" || host["status_code"] != float64(302) {
+	if host["target"] != "https://x.test/" || host["status_code"] != json.Number("302") {
 		t.Fatalf("legacy host evidence was not upgraded: %#v", host)
 	}
 }
@@ -124,7 +126,7 @@ func TestHistoricalRecordsPreserveNormalizedTargetRecords(t *testing.T) {
 		t.Fatalf("records=%#v err=%v", records, err)
 	}
 	record := records[0].(map[string]any)
-	if record["provider"] != "httpx" || record["kind"] != "url" || record["target"] != "https://x.test/api?a=1&b=2" || record["status_code"] != float64(201) {
+	if record["provider"] != "httpx" || record["kind"] != "url" || record["target"] != "https://x.test/api?a=1&b=2" || record["status_code"] != json.Number("201") {
 		t.Fatalf("normalized record evidence was not preserved: %#v", record)
 	}
 }
@@ -239,6 +241,66 @@ func TestClassifyExecutionLoadsPriorProbeEvidence(t *testing.T) {
 		t.Fatalf("platform-synthesized provider ToolRun lost attempt identity: tool=%#v start=%s", store.tool, store.startID)
 	}
 }
+
+func TestClassifyExecutionPreservesExactSourceNumbersThroughEnrichment(t *testing.T) {
+	cfg, err := config.LoadWith(func(key string) string {
+		if key == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	programID := domain.NewID()
+	attemptID := domain.NewID()
+	store := &capturedStore{startID: attemptID}
+	batch := provideroutput.Parse("httpx", []string{`{"url":"https://exact.example.test/api/users/123","status_code":200,"meta":{"large":9007199254740993,"decimal":0.10000000000000001}}`})
+	if len(batch.Records) != 1 || len(batch.Warnings) != 0 {
+		t.Fatalf("provider records=%#v warnings=%#v", batch.Records, batch.Warnings)
+	}
+	sources, err := normalize.BuildProbeHTTPSourceRecords(string(programID), string(attemptID), batch.Records, normalize.RequestSemantics{
+		Method:      normalize.ValueSemantics{State: normalize.ValueDefaulted, Value: executionString("GET")},
+		ContentType: normalize.ValueSemantics{State: normalize.ValueUnknown},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := json.Marshal(map[string]any{
+		"active":                  []string{},
+		"passive":                 []string{},
+		"http_observations":       batch.Records,
+		"http_source_records":     sources,
+		"crawl_observations":      []provideroutput.Record{},
+		"passive_observations":    []provideroutput.Record{},
+		"historical_observations": []provideroutput.Record{},
+		"api_schema_endpoints":    []string{},
+		"target_plan_digest":      "plan",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := capability.Request{
+		Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "classify.endpoint", Input: input},
+		Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}},
+		Scope:  allowedScope{},
+	}
+	result, err := (Service{Registry: providers.Registry(cfg), Store: store, Artifacts: &capturedArtifacts{}, ProgramID: programID}).Execute(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output struct {
+		SourceDerivations []normalize.SourceDerivation `json:"source_derivations"`
+	}
+	if err := json.Unmarshal(result.Action.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.SourceDerivations) != 1 || output.SourceDerivations[0].SourceLocator != sources[0].SourceLocator {
+		t.Fatalf("source verification did not survive production enrichment: output=%s", result.Action.Output)
+	}
+}
+
+func executionString(value string) *string { return &value }
 
 func TestClassifyExecutionConvertsMixedPriorProbeValues(t *testing.T) {
 	cfg, err := config.LoadWith(func(k string) string {

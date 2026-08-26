@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/normalize"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 )
 
@@ -255,18 +256,32 @@ func (r *Registry) Execute(ctx context.Context, req Request) (Result, error) {
 	executionReq := req
 	executionReq.QueueJobID = copyIDPointer(trustedQueueJobID)
 	result, providerErr := c.Execute(ctx, executionReq)
+	sourceContractFailure := false
+	if providerErr == nil && result.Action.Status == "succeeded" && req.Action.Capability == "probe.http" {
+		decorated, decorateErr := normalize.AttachProbeHTTPSourceRecords(result.Action.Output, string(req.ProgramID), string(attemptID), req.Action.Input)
+		if decorateErr != nil {
+			result.Action.Status = "failed"
+			result.Action.Error = &domain.StructuredError{Classification: "source_contract", Message: "probe HTTP source lineage could not be derived", Retryable: false}
+			providerErr = fmt.Errorf("decorate probe.http source lineage: %w", decorateErr)
+			sourceContractFailure = true
+		} else {
+			result.Action.Output = decorated
+		}
+	}
 	result.Action.RequestID = req.Action.ID
 	if result.ToolRun != nil {
 		result.ToolRun.Provider = req.Provider
 	}
-	result.ProviderAttemptID = &attemptID
-	result.AdmissionProvenance = &ResultAdmissionProvenance{
-		ProviderAttemptID:             attemptID,
-		ActionRequestID:               req.Action.ID,
-		StepAttempt:                   req.Action.StepAttempt,
-		QueueJobID:                    copyIDPointer(trustedQueueJobID),
-		ExecutionAuthorizationEventID: authorizationEventID,
-		Provider:                      req.Provider,
+	if !sourceContractFailure {
+		result.ProviderAttemptID = &attemptID
+		result.AdmissionProvenance = &ResultAdmissionProvenance{
+			ProviderAttemptID:             attemptID,
+			ActionRequestID:               req.Action.ID,
+			StepAttempt:                   req.Action.StepAttempt,
+			QueueJobID:                    copyIDPointer(trustedQueueJobID),
+			ExecutionAuthorizationEventID: authorizationEventID,
+			Provider:                      req.Provider,
+		}
 	}
 	result.TerminalAuditError = nil
 	terminalErr := req.InvocationRecorder.RecordProviderInvocationTerminal(ctx, ProviderInvocationTerminalRecord{
