@@ -1,11 +1,36 @@
 package intelligence
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
 	"github.com/tobiasGuta/Reconductor/internal/provideroutput"
 )
+
+func TestClassifyAcceptsExactJSONNumberEvidence(t *testing.T) {
+	output, err := Classify(Input{HTTPObservations: []provideroutput.Record{{
+		Provider: "httpx", Kind: provideroutput.URLRecord, Target: "https://api.example.test/v1/users/123",
+		Fields: map[string]any{"status_code": json.Number("2e2"), "confidence": json.Number("0.75")},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(output.Classifications) != 1 || !reflect.DeepEqual(output.Classifications[0].StatusCodes, []int{200}) || output.Classifications[0].Confidence < 0.75 {
+		t.Fatalf("JSON number evidence was not retained: %#v", output)
+	}
+}
+
+func TestClassifierIntegerEvidenceUsesBoundedExactParsing(t *testing.T) {
+	if got := firstNestedInt(map[string]any{"status_code": json.Number("2e2")}, "status_code"); got != 200 {
+		t.Fatalf("exact integral status=%d want=200", got)
+	}
+	for _, raw := range []string{"1.25", "1e1000000", "1e-1000000", "999999999999999999999999999999999"} {
+		if got := firstNestedInt(map[string]any{"status_code": json.Number(raw)}, "status_code"); got != 0 {
+			t.Fatalf("invalid or unbounded status %q became %d", raw, got)
+		}
+	}
+}
 
 func TestClassifyCombinesResponseRequestSchemaJavaScriptAndHistoryEvidence(t *testing.T) {
 	target := "https://api.example.test/v1/users/123?token=redacted"

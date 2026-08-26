@@ -82,6 +82,15 @@ func (p *fakeProvider) Execute(ctx context.Context, req capability.Request) (cap
 	if p.onExecute != nil {
 		result, err = p.onExecute(ctx)
 	}
+	if err == nil && p.name == "probe.http" {
+		var output map[string]json.RawMessage
+		if json.Unmarshal(result.Action.Output, &output) == nil && string(output["authorized_records"]) == "[]" {
+			// The shared scheduler success fixture has no authorized records. probe.http v4
+			// nevertheless requires its explicitly non-null, platform-derived source collection.
+			output["authorized_source_records"] = json.RawMessage(`[]`)
+			result.Action.Output, err = json.Marshal(output)
+		}
+	}
 	if err == nil && p.name == "classify.endpoint" {
 		result.Action.Output = json.RawMessage(`{"endpoints":[],"classifications":[],"interesting_endpoints":[],"relationships":[]}`)
 	}

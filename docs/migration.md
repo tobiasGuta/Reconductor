@@ -30,6 +30,12 @@ Migration 0013 requires a coordinated writer drain; mixed pre-Slice-2 and Slice-
 
 Any pre-Slice-2 Endpoint writer that reaches the migrated schema must fail closed and create or mutate no Endpoint state. The exact PostgreSQL error may be the corrected-row constraint or failure to infer the removed coarse conflict arbiter; no compatibility shim is provided.
 
+### Concrete HTTP resource lineage migration 0014
+
+Migration `0014_concrete_http_resource_lineage.sql` adds Program-local `canonical_concrete_http_resources` and append-only `probe_http_source_records`. It does not backfill or reinterpret historical observations, accepted results, artifacts, or Endpoint rows. The source table has structural lineage checks from the Program through the emitted HTTP observation, accepted result event, provider attempt, `probe.http` capability, and optional normalized-result artifact; it is not a semantic graph or relationship table.
+
+Deploy 0014 with the Slice-3A binary as one coordinated writer transition: stop new admission, drain old workers and in-flight executions, apply `platform migrate` once, verify the two new tables, source-lineage and immutability triggers, and migration-ledger entry, then start only Slice-3A-aware workers before resuming admission. Pre-v4 `probe.http` outputs remain readable as legacy results with no source rows. A present but malformed v4 source collection fails its result transaction without an accepted or rejected result-fence decision.
+
 ## Environment and Compose
 
 Replace `RATE_LIMIT` with `NUCLEI_RATE_LIMIT` and `CONCURRENCY` with explicit host/template/headless concurrency variables. Add `DATABASE_URL` and `REDIS_PASSWORD`. Compare the complete new `.env.example`; duplicated per-binary parsers no longer exist.

@@ -16,15 +16,15 @@ Every definition receives a deterministic target-plan digest. Exact host rules y
 
 ## `continuous-web-recon`
 
-Version `2.2.0` runs passive discovery only for planned roots, filters each result, merges authorized discovered URLs with exact seeds, then runs DNSx, an optional authorized port intersection in Naabu, HTTPX, asset comparison, crawling, GAU, endpoint classification, a preliminary recon brief, an optional approved safe Nuclei profile, and a scanner-enriched brief. It supports multiple unrelated domains without `--domain`.
+Version `2.3.0` runs passive discovery only for planned roots, filters each result, merges authorized discovered URLs with exact seeds, then runs DNSx, an optional authorized port intersection in Naabu, HTTPX, asset comparison, crawling, GAU, endpoint classification, a preliminary recon brief, an optional approved safe Nuclei profile, and a scanner-enriched brief. It supports multiple unrelated domains without `--domain`.
 
 ## `authorized-web-baseline`
 
-Version `1.2.0` starts only from scope-derived exact seeds, then resolves, optionally scans a common authorized port intersection, probes, compares, crawls changed assets, classifies endpoints, emits a preliminary recon brief, pauses for optional Nuclei approval, and emits a scanner-enriched brief after approved scanner evidence exists. It needs no discovery root.
+Version `1.3.0` starts only from scope-derived exact seeds, then resolves, optionally scans a common authorized port intersection, probes, compares, crawls changed assets, classifies endpoints, emits a preliminary recon brief, pauses for optional Nuclei approval, and emits a scanner-enriched brief after approved scanner evidence exists. It needs no discovery root.
 
 HTTP observations are routed deterministically: 2xx assets may be crawled, 2xx/redirect/authentication responses may enter the approved safe scan profile, and other statuses are retained as observations but not scanned.
 
-The classifier receives only each provider's post-scope-filter `authorized_records`. HTTPX supplies response status, content type, redirect, and technology evidence; Katana supplies request and JavaScript relationship evidence; GAU supplies lower-confidence passive observations. Structured HTTP observations from the latest prior completed run are loaded by the shared execution service for route-normalized historical comparisons in both local and Redis worker modes. The complete evidence classification is persisted in the step result and forwarded into the preliminary and enriched reports.
+The classifier receives only each provider's post-scope-filter `authorized_records`. For `probe.http` it also receives the parallel platform-owned `authorized_source_records` collection, which is used only for concrete source derivations. HTTPX supplies response status, content type, redirect, and technology evidence; its response content type is never promoted to request semantics. Katana supplies request and JavaScript relationship evidence; GAU supplies lower-confidence passive observations. Structured HTTP observations from the latest prior completed run are loaded by the shared execution service for route-normalized historical comparisons in both local and Redis worker modes. The complete evidence classification is persisted in the step result and forwarded into the preliminary and enriched reports.
 
 Every scheduled invocation creates a new Task execution and WorkflowRun through the shared orchestration service. Run Now uses the same persistent scheduled-execution queue as cron. The first run treats observed HTTP assets as new. Negative transitions require a complete successful source step; a failed or incomplete scan never marks an asset removed or a finding resolved.
 

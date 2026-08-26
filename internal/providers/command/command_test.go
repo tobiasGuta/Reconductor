@@ -121,7 +121,7 @@ func TestProviderManifestPublishesCompleteClosedOutputSchema(t *testing.T) {
 	for _, field := range schema.Required {
 		required[field] = true
 	}
-	for _, field := range []string{"lines", "authorized", "authorized_urls", "authorized_records", "filtered", "records", "warnings", "accepted_count", "filtered_count"} {
+	for _, field := range []string{"lines", "authorized", "authorized_urls", "authorized_records", "authorized_source_records", "filtered", "records", "warnings", "accepted_count", "filtered_count"} {
 		if _, ok := schema.Properties[field]; !ok || !required[field] {
 			t.Fatalf("output schema does not declare required field %q: %s", field, manifest.OutputSchema)
 		}
@@ -172,9 +172,66 @@ func TestProviderValidationAndExecution(t *testing.T) {
 	if !runner.called || result.ToolRun == nil {
 		t.Fatal("provider did not run")
 	}
+	var output map[string]json.RawMessage
+	if err := json.Unmarshal(result.Action.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := output["authorized_source_records"]; !ok || string(got) != "[]" {
+		t.Fatalf("authorized_source_records=%s present=%v", got, ok)
+	}
 	req.Scope = allowScope(false)
 	if err := p.Validate(context.Background(), req); err == nil {
 		t.Fatal("out-of-scope target accepted")
+	}
+}
+
+func TestExplicitEmptyOrNullMethodRejectsBeforeProviderExecution(t *testing.T) {
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"targets":["https://example.test"],"method":""}`),
+		json.RawMessage(`{"targets":["https://example.test"],"method":null}`),
+	} {
+		t.Run(string(raw), func(t *testing.T) {
+			runner := &fakeRunner{}
+			p := New(Definition{Name: "probe.http", Provider: "httpx", Executable: "httpx", Version: "1", Risk: policy.Low, BuildArgs: func(Input, policy.Policy) ([]string, error) { return []string{"-silent"}, nil }}, runner, nil)
+			req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), StepRunID: domain.NewID(), Capability: "probe.http", Input: raw}, Policy: policy.Policy{AllowedCapabilities: []string{"probe.http"}, AllowedHTTPMethods: []string{"GET", "POST"}}, Scope: allowScope(true)}
+			if err := p.Validate(context.Background(), req); err == nil {
+				t.Fatal("invalid explicit method passed validation")
+			}
+			if _, err := p.Execute(context.Background(), req); err == nil {
+				t.Fatal("invalid explicit method executed")
+			}
+			if runner.called {
+				t.Fatal("runner was invoked for an invalid method")
+			}
+		})
+	}
+}
+
+func TestMethodPresenceAllowsAbsentAndNormalizesKnownMethod(t *testing.T) {
+	for _, test := range []struct {
+		name, raw, want string
+	}{
+		{name: "absent", raw: `{"targets":["https://example.test"]}`, want: ""},
+		{name: "lowercase", raw: `{"targets":["https://example.test"],"method":"post"}`, want: "post"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var got string
+			runner := &fakeRunner{}
+			p := New(Definition{Name: "probe.http", Provider: "httpx", Executable: "httpx", Version: "1", Risk: policy.Low, BuildInvocation: func(input Input, _ policy.Policy) (Invocation, error) {
+				got = input.Method
+				return Invocation{Args: []string{"-silent"}}, nil
+			}}, runner, nil)
+			req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), StepRunID: domain.NewID(), Capability: "probe.http", Input: json.RawMessage(test.raw)}, Policy: policy.Policy{AllowedCapabilities: []string{"probe.http"}, AllowedHTTPMethods: []string{"GET", "POST"}}, Scope: allowScope(true)}
+			if err := p.Validate(context.Background(), req); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := p.Execute(context.Background(), req); err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want || !runner.called {
+				t.Fatalf("method=%q runner=%v", got, runner.called)
+			}
+		})
 	}
 }
 func TestRejectsUnknownInput(t *testing.T) {

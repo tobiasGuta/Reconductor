@@ -54,8 +54,8 @@ func TestEndpointClassifierVersionAndStableSchemas(t *testing.T) {
 		t.Fatal("classify.endpoint capability is missing")
 	}
 	classifierManifest := classifier.Manifest()
-	if classifierManifest.Version != "4" {
-		t.Fatalf("classify.endpoint version=%q want=4", classifierManifest.Version)
+	if classifierManifest.Version != "5" {
+		t.Fatalf("classify.endpoint version=%q want=5", classifierManifest.Version)
 	}
 	if strings.Contains(string(classifierManifest.OutputSchema), "origin_scheme") || strings.Contains(string(classifierManifest.OutputSchema), "origin_host") || strings.Contains(string(classifierManifest.OutputSchema), "origin_effective_port") {
 		t.Fatalf("classify.endpoint serialized origin fields changed: %s", classifierManifest.OutputSchema)

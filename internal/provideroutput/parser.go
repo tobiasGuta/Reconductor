@@ -3,6 +3,7 @@ package provideroutput
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"strconv"
@@ -57,9 +58,17 @@ func parseOne(provider, line string) (Record, error) {
 	}
 	switch provider {
 	case "subfinder", "chaos":
-		return hostRecord(provider, plainOrStringField(line, "host", "name", "domain"))
+		host, err := plainOrStringField(line, "host", "name", "domain")
+		if err != nil {
+			return Record{}, err
+		}
+		return hostRecord(provider, host)
 	case "dnsx":
-		return hostRecord(provider, plainOrStringField(line, "host", "input", "name"))
+		host, err := plainOrStringField(line, "host", "input", "name")
+		if err != nil {
+			return Record{}, err
+		}
+		return hostRecord(provider, host)
 	case "naabu":
 		return parseNaabu(line)
 	case "httpx":
@@ -91,11 +100,13 @@ func hostRecord(provider, raw string) (Record, error) {
 }
 
 func parseNaabu(line string) (Record, error) {
-	var v map[string]any
-	if json.Unmarshal([]byte(line), &v) == nil {
+	if v, err := decodeJSONObject(line); err == nil {
 		host := firstString(v, "host", "ip", "input")
-		port := firstInt(v, "port")
-		if host == "" || port == 0 {
+		port, present, err := firstInt(v, "port")
+		if err != nil {
+			return Record{}, fmt.Errorf("invalid naabu port")
+		}
+		if host == "" || !present {
 			return Record{}, fmt.Errorf("naabu record requires host and port")
 		}
 		return portObservation("naabu", host, port, v)
@@ -123,8 +134,8 @@ func portObservation(provider, host string, port int, fields map[string]any) (Re
 }
 
 func parseKatana(line string) (Record, error) {
-	var v map[string]any
-	if json.Unmarshal([]byte(line), &v) != nil {
+	v, err := decodeJSONObject(line)
+	if err != nil {
 		return parseURLValue("katana", line, nil)
 	}
 	raw := firstString(v, "url", "endpoint")
@@ -135,8 +146,7 @@ func parseKatana(line string) (Record, error) {
 }
 
 func parseURLJSON(provider, line string, keys ...string) (Record, error) {
-	var v map[string]any
-	if json.Unmarshal([]byte(line), &v) == nil {
+	if v, err := decodeJSONObject(line); err == nil {
 		raw := firstString(v, keys...)
 		if raw == "" && provider == "httpx" {
 			host, scheme := firstString(v, "host", "input"), firstString(v, "scheme")
@@ -146,7 +156,13 @@ func parseURLJSON(provider, line string, keys ...string) (Record, error) {
 		}
 		record, err := parseURLValue(provider, raw, v)
 		if err == nil {
-			record.StatusCode = firstInt(v, "status_code", "status-code", "status")
+			status, present, statusErr := firstInt(v, "status_code", "status-code", "status")
+			if statusErr != nil || present && (status < 100 || status > 599) {
+				return Record{}, fmt.Errorf("invalid HTTP status code")
+			}
+			if present {
+				record.StatusCode = status
+			}
 			record.Technologies = stringSlice(v["tech"])
 			if len(record.Technologies) == 0 {
 				record.Technologies = stringSlice(v["technologies"])
@@ -166,12 +182,16 @@ func parseURLValue(provider, raw string, fields map[string]any) (Record, error) 
 	return Record{Provider: provider, Kind: URLRecord, Target: u.String(), Host: strings.ToLower(u.Hostname()), Fields: fields}, nil
 }
 
-func plainOrStringField(line string, keys ...string) string {
-	var v map[string]any
-	if json.Unmarshal([]byte(line), &v) == nil {
-		return firstString(v, keys...)
+func plainOrStringField(line string, keys ...string) (string, error) {
+	if v, err := decodeJSONObject(line); err == nil {
+		return firstString(v, keys...), nil
+	} else {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "null" || strings.HasPrefix(trimmed, "{") {
+			return "", err
+		}
 	}
-	return line
+	return line, nil
 }
 func firstString(v map[string]any, keys ...string) string {
 	for _, key := range keys {
@@ -181,20 +201,152 @@ func firstString(v map[string]any, keys ...string) string {
 	}
 	return ""
 }
-func firstInt(v map[string]any, keys ...string) int {
+func firstInt(v map[string]any, keys ...string) (int, bool, error) {
 	for _, key := range keys {
-		switch n := v[key].(type) {
-		case float64:
-			return int(n)
+		raw, present := v[key]
+		if !present {
+			continue
+		}
+		switch n := raw.(type) {
 		case json.Number:
-			value, _ := strconv.Atoi(n.String())
-			return value
+			if value, ok := ExactJSONInteger(n.String()); ok {
+				return value, true, nil
+			}
 		case string:
-			value, _ := strconv.Atoi(n)
-			return value
+			value, err := strconv.Atoi(n)
+			if err == nil {
+				return value, true, nil
+			}
+		}
+		return 0, true, fmt.Errorf("field %s is not an exact integer", key)
+	}
+	return 0, false, nil
+}
+
+const (
+	maxExactIntegerTokenLength = 64
+	maxExactIntegerDigits      = 32
+	maxExactIntegerExponent    = 64
+)
+
+// ExactJSONInteger parses the integral JSON forms used by bounded provider
+// domains without expanding attacker-controlled arbitrary-precision values.
+func ExactJSONInteger(raw string) (int, bool) {
+	if raw == "" || len(raw) > maxExactIntegerTokenLength {
+		return 0, false
+	}
+	index := 0
+	negative := false
+	if raw[index] == '-' {
+		negative = true
+		index++
+		if index == len(raw) {
+			return 0, false
 		}
 	}
-	return 0
+	digits := make([]byte, 0, min(len(raw), maxExactIntegerDigits))
+	if raw[index] == '0' {
+		digits = append(digits, '0')
+		index++
+		if index < len(raw) && raw[index] >= '0' && raw[index] <= '9' {
+			return 0, false
+		}
+	} else if raw[index] >= '1' && raw[index] <= '9' {
+		for index < len(raw) && raw[index] >= '0' && raw[index] <= '9' {
+			digits = append(digits, raw[index])
+			index++
+		}
+	} else {
+		return 0, false
+	}
+	fractionDigits := 0
+	if index < len(raw) && raw[index] == '.' {
+		index++
+		fractionStart := index
+		for index < len(raw) && raw[index] >= '0' && raw[index] <= '9' {
+			digits = append(digits, raw[index])
+			fractionDigits++
+			index++
+		}
+		if index == fractionStart {
+			return 0, false
+		}
+	}
+	if len(digits) > maxExactIntegerDigits {
+		return 0, false
+	}
+	exponent := 0
+	if index < len(raw) && (raw[index] == 'e' || raw[index] == 'E') {
+		index++
+		exponentNegative := false
+		if index < len(raw) && (raw[index] == '+' || raw[index] == '-') {
+			exponentNegative = raw[index] == '-'
+			index++
+		}
+		exponentStart := index
+		exponentDigits := 0
+		for index < len(raw) && raw[index] >= '0' && raw[index] <= '9' {
+			exponentDigits++
+			if exponentDigits > 3 {
+				return 0, false
+			}
+			exponent = exponent*10 + int(raw[index]-'0')
+			if exponent > maxExactIntegerExponent {
+				return 0, false
+			}
+			index++
+		}
+		if index == exponentStart {
+			return 0, false
+		}
+		if exponentNegative {
+			exponent = -exponent
+		}
+	}
+	if index != len(raw) {
+		return 0, false
+	}
+	firstNonZero := 0
+	for firstNonZero < len(digits) && digits[firstNonZero] == '0' {
+		firstNonZero++
+	}
+	if firstNonZero == len(digits) {
+		return 0, true
+	}
+	digits = digits[firstNonZero:]
+	scale := exponent - fractionDigits
+	if scale < 0 {
+		remove := -scale
+		if remove > len(digits) {
+			return 0, false
+		}
+		for _, digit := range digits[len(digits)-remove:] {
+			if digit != '0' {
+				return 0, false
+			}
+		}
+		digits = digits[:len(digits)-remove]
+	} else if scale > 0 {
+		if len(digits)+scale > 19 {
+			return 0, false
+		}
+		digits = append(digits, strings.Repeat("0", scale)...)
+	}
+	if len(digits) == 0 {
+		return 0, true
+	}
+	integer := string(digits)
+	if negative {
+		integer = "-" + integer
+	}
+	value, err := strconv.ParseInt(integer, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if int64(int(value)) != value {
+		return 0, false
+	}
+	return int(value), true
 }
 func stringSlice(v any) []string {
 	raw, ok := v.([]any)
@@ -208,4 +360,24 @@ func stringSlice(v any) []string {
 		}
 	}
 	return out
+}
+
+func decodeJSONObject(raw string) (map[string]any, error) {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var value map[string]any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("multiple JSON values")
+		}
+		return nil, err
+	}
+	if value == nil {
+		return nil, fmt.Errorf("JSON object is required")
+	}
+	return value, nil
 }

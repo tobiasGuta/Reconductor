@@ -1,10 +1,12 @@
 package execution
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"time"
@@ -47,9 +49,9 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 		if s.Store == nil {
 			return capability.Result{}, fmt.Errorf("result store is required")
 		}
-		var input map[string]any
+		var input map[string]json.RawMessage
 		if err := json.Unmarshal(req.Action.Input, &input); err == nil {
-			if previous, ok := input["previous"].([]any); ok && len(previous) == 0 {
+			if previous, ok := input["previous"]; ok && emptyJSONArray(previous) {
 				values, loadErr := s.Store.PreviousObservationValues(ctx, s.ProgramID, req.Action.WorkflowRunID, "probe.http")
 				if loadErr != nil {
 					return capability.Result{}, loadErr
@@ -57,7 +59,11 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 				if values == nil {
 					values = []string{}
 				}
-				input["previous"] = values
+				encodedPrevious, marshalErr := json.Marshal(values)
+				if marshalErr != nil {
+					return capability.Result{}, fmt.Errorf("marshal compare.assets history: %w", marshalErr)
+				}
+				input["previous"] = encodedPrevious
 				enriched, marshalErr := json.Marshal(input)
 				if marshalErr != nil {
 					return capability.Result{}, fmt.Errorf("marshal compare.assets history: %w", marshalErr)
@@ -70,9 +76,9 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 		if s.Store == nil {
 			return capability.Result{}, fmt.Errorf("result store is required")
 		}
-		var input map[string]any
+		var input map[string]json.RawMessage
 		if err := json.Unmarshal(req.Action.Input, &input); err == nil {
-			if previous, ok := input["historical_observations"].([]any); !ok || len(previous) == 0 {
+			if previous, ok := input["historical_observations"]; !ok || !nonEmptyJSONArray(previous) {
 				values, loadErr := s.Store.PreviousObservationValues(ctx, s.ProgramID, req.Action.WorkflowRunID, "probe.http")
 				if loadErr != nil {
 					return capability.Result{}, loadErr
@@ -81,8 +87,15 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 				if historyErr != nil {
 					return capability.Result{}, historyErr
 				}
-				input["historical_observations"] = history
-				req.Action.Input, _ = json.Marshal(input)
+				encodedHistory, marshalErr := json.Marshal(history)
+				if marshalErr != nil {
+					return capability.Result{}, fmt.Errorf("marshal classify.endpoint history: %w", marshalErr)
+				}
+				input["historical_observations"] = encodedHistory
+				req.Action.Input, marshalErr = json.Marshal(input)
+				if marshalErr != nil {
+					return capability.Result{}, fmt.Errorf("marshal classify.endpoint input: %w", marshalErr)
+				}
 			}
 		}
 	}
@@ -203,7 +216,15 @@ func historicalRecord(raw string) (map[string]any, error) {
 		return map[string]any{"provider": "httpx", "kind": "url", "target": target, "fields": map[string]any{"value": trimmed}}, nil
 	}
 	var item map[string]any
-	if err := json.Unmarshal([]byte(trimmed), &item); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	decoder.UseNumber()
+	if err := decoder.Decode(&item); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("multiple JSON values")
+		}
 		return nil, err
 	}
 	if target, _ := item["target"].(string); target != "" {
@@ -243,6 +264,24 @@ func historicalRecord(raw string) (map[string]any, error) {
 		upgraded["technologies"] = technologies
 	}
 	return upgraded, nil
+}
+
+func emptyJSONArray(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return false
+	}
+	var items []json.RawMessage
+	return json.Unmarshal(trimmed, &items) == nil && len(items) == 0
+}
+
+func nonEmptyJSONArray(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return false
+	}
+	var items []json.RawMessage
+	return json.Unmarshal(trimmed, &items) == nil && len(items) > 0
 }
 
 func historicalHTTPURL(raw string) (string, error) {

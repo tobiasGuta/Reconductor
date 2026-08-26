@@ -36,11 +36,11 @@ func Build(name string, plan targeting.TargetPlan, headless bool) (workflow.Defi
 }
 
 func ContinuousWebRecon(plan targeting.TargetPlan, headless bool) workflow.Definition {
-	return webReconDefinition(domain.ID("d0e5e6a3-bd8a-4b4b-a76b-f6452c30179a"), ContinuousName, "2.2.0", "Scope-driven continuous web reconnaissance with preliminary briefs and optional scanner enrichment", plan, headless, true)
+	return webReconDefinition(domain.ID("d0e5e6a3-bd8a-4b4b-a76b-f6452c30179a"), ContinuousName, "2.3.0", "Scope-driven continuous web reconnaissance with preliminary briefs and optional scanner enrichment", plan, headless, true)
 }
 
 func AuthorizedWebBaseline(plan targeting.TargetPlan, headless bool) workflow.Definition {
-	return webReconDefinition(domain.ID("c9479711-b203-4fe1-8528-718888e5a5d2"), BaselineName, "1.2.0", "Scope-derived exact-seed authorized web baseline with preliminary briefs and optional scanner enrichment", plan, headless, false)
+	return webReconDefinition(domain.ID("c9479711-b203-4fe1-8528-718888e5a5d2"), BaselineName, "1.3.0", "Scope-derived exact-seed authorized web baseline with preliminary briefs and optional scanner enrichment", plan, headless, false)
 }
 
 func webReconDefinition(id domain.ID, name, version, description string, plan targeting.TargetPlan, headless, allowDiscovery bool) workflow.Definition {
@@ -67,8 +67,9 @@ func webReconDefinition(id domain.ID, name, version, description string, plan ta
 	)
 	classifyDeps := []string{"crawl-new-or-changed-web-assets"}
 	classifyBindings := map[string]string{
-		"http_observations":  "probe-http.output.authorized_records",
-		"crawl_observations": "crawl-new-or-changed-web-assets.output.authorized_records",
+		"http_observations":   "probe-http.output.authorized_records",
+		"http_source_records": "probe-http.output.authorized_source_records",
+		"crawl_observations":  "crawl-new-or-changed-web-assets.output.authorized_records",
 	}
 	if allowDiscovery && len(plan.DiscoveryRoots) > 0 {
 		steps = append(steps, workflow.Step{ID: "discover-archive-urls", Capability: "discover.archive_urls", Provider: "gau", DependsOn: []string{"prepare-authorized-targets"}, Input: raw(map[string]any{"domains": plan.DiscoveryDomains(), "target_plan_digest": plan.Digest}), Retry: retry(), Timeout: 15 * time.Minute})
@@ -76,7 +77,7 @@ func webReconDefinition(id domain.ID, name, version, description string, plan ta
 		classifyBindings["passive_observations"] = "discover-archive-urls.output.authorized_records"
 	}
 	steps = append(steps,
-		workflow.Step{ID: "classify-interesting-endpoints", Capability: "classify.endpoint", DependsOn: classifyDeps, Input: raw(map[string]any{"active": []string{}, "passive": []string{}, "http_observations": []any{}, "crawl_observations": []any{}, "passive_observations": []any{}, "historical_observations": []any{}, "api_schema_endpoints": []string{}, "target_plan_digest": plan.Digest}), Bindings: classifyBindings, Retry: retry(), Timeout: time.Minute},
+		workflow.Step{ID: "classify-interesting-endpoints", Capability: "classify.endpoint", DependsOn: classifyDeps, Input: raw(map[string]any{"active": []string{}, "passive": []string{}, "http_observations": []any{}, "http_source_records": []any{}, "crawl_observations": []any{}, "passive_observations": []any{}, "historical_observations": []any{}, "api_schema_endpoints": []string{}, "target_plan_digest": plan.Digest}), Bindings: classifyBindings, Retry: retry(), Timeout: time.Minute},
 		workflow.Step{ID: "generate-recon-brief", Capability: "report.changes", DependsOn: []string{"classify-interesting-endpoints"}, Input: raw(map[string]any{"changes": []any{}, "endpoints": []any{}, "candidate_matches": []any{}, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"changes": "compare-assets.output.changes", "endpoints": "classify-interesting-endpoints.output.interesting_endpoints"}, Retry: retry(), Timeout: time.Minute},
 		workflow.Step{ID: "run-safe-nuclei-profile", Capability: "scan.nuclei", Provider: "nuclei", DependsOn: []string{"classify-interesting-endpoints"}, Condition: "nonempty:compare-assets.output.scan_targets", Input: raw(map[string]any{"targets": []string{}, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"targets": "compare-assets.output.scan_targets"}, Retry: workflow.RetryPolicy{MaxAttempts: 2, BaseDelay: 5 * time.Second}, Timeout: 45 * time.Minute, ApprovalRequired: true},
 		workflow.Step{ID: "enrich-recon-brief", Capability: "report.changes", DependsOn: []string{"generate-recon-brief", "run-safe-nuclei-profile"}, Input: raw(map[string]any{"changes": []any{}, "endpoints": []any{}, "candidate_matches": []any{}, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"changes": "compare-assets.output.changes", "endpoints": "classify-interesting-endpoints.output.interesting_endpoints", "candidate_matches": "run-safe-nuclei-profile.output.lines"}, Retry: retry(), Timeout: time.Minute},

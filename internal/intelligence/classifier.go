@@ -1,6 +1,7 @@
 package intelligence
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"net/url"
@@ -532,6 +533,10 @@ func firstNestedInt(fields map[string]any, keys ...string) int {
 		switch number := value.(type) {
 		case float64:
 			return int(number)
+		case json.Number:
+			if parsed, ok := provideroutput.ExactJSONInteger(number.String()); ok {
+				return parsed
+			}
 		case int:
 			return number
 		case string:
@@ -595,8 +600,14 @@ func nestedValues(fields map[string]any, keys ...string) []any {
 
 func nestedFloat(fields map[string]any, key string) (float64, bool) {
 	for _, value := range nestedValues(fields, key) {
-		if number, ok := value.(float64); ok {
+		switch number := value.(type) {
+		case float64:
 			return number, true
+		case json.Number:
+			parsed, err := number.Float64()
+			if err == nil {
+				return parsed, true
+			}
 		}
 	}
 	return 0, false

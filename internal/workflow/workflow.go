@@ -1,12 +1,14 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -787,7 +789,7 @@ func condition(expr string, state *State) bool {
 }
 func resolveInput(s Step, state *State) (json.RawMessage, error) {
 	var target map[string]any
-	if err := json.Unmarshal(s.Input, &target); err != nil {
+	if err := decodeBindingJSON(s.Input, &target); err != nil {
 		return nil, err
 	}
 	for field, binding := range s.Bindings {
@@ -800,7 +802,7 @@ func resolveInput(s Step, state *State) (json.RawMessage, error) {
 			continue
 		}
 		var value any
-		if err := json.Unmarshal(source.Run.Output, &value); err != nil {
+		if err := decodeBindingJSON(source.Run.Output, &value); err != nil {
 			return nil, err
 		}
 		for _, part := range parts[2:] {
@@ -822,7 +824,7 @@ func resolveInput(s Step, state *State) (json.RawMessage, error) {
 				for _, item := range arr {
 					if raw, ok := item.(string); ok {
 						var parsed map[string]any
-						if json.Unmarshal([]byte(raw), &parsed) == nil {
+						if decodeBindingJSON([]byte(raw), &parsed) == nil {
 							if v, ok := parsed[part]; ok {
 								extracted = append(extracted, v)
 								continue
@@ -850,6 +852,18 @@ func resolveInput(s Step, state *State) (json.RawMessage, error) {
 		target[field] = value
 	}
 	return json.Marshal(target)
+}
+
+func decodeBindingJSON(raw []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("binding JSON must contain exactly one value")
+	}
+	return nil
 }
 func topological(d Definition) []Step {
 	byID := map[string]Step{}
