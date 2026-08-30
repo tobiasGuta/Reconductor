@@ -11,9 +11,29 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tobiasGuta/Reconductor/internal/capability"
+	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/execution"
 	"github.com/tobiasGuta/Reconductor/internal/findings"
+	"github.com/tobiasGuta/Reconductor/internal/policy"
+	"github.com/tobiasGuta/Reconductor/internal/providers"
+	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
+
+type consoleProviderOutputCapability struct{}
+
+func (consoleProviderOutputCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "test.console-provider-output", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true, SupportedProviders: []string{"sentinel-provider"}}
+}
+
+func (consoleProviderOutputCapability) Validate(context.Context, capability.Request) error {
+	return nil
+}
+
+func (consoleProviderOutputCapability) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+	return capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "provider output persisted", Output: json.RawMessage(`{"marker":"PROVIDER_OUTPUT_SENTINEL"}`)}}, nil
+}
 
 func TestVerificationVerdictsPersistAndGatePromotion(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
@@ -65,14 +85,14 @@ func TestVerificationVerdictsPersistAndGatePromotion(t *testing.T) {
 	if err := store.CreateProgram(ctx, program, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CreateWorkflowDefinition(ctx, definitionID, "verification-"+string(definitionID), "1", "synthetic", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
-	}
+	ensureSyntheticWorkflowTemplate(t, store, ctx, definitionID, "verification-"+string(definitionID))
 	task := domain.Task{ID: taskID, ProgramID: programID, Objective: "verify verdict persistence", WorkflowDefinitionID: definitionID, Status: domain.TaskRunning, RequestedBy: "integration-test", CreatedAt: now, UpdatedAt: now}
 	if err := store.CreateTask(ctx, task); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CreateWorkflowRun(ctx, domain.WorkflowRun{ID: runID, TaskID: taskID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunCompleted, StartedAt: &now, CompletedAt: &now, TriggerSource: "integration-test", Summary: json.RawMessage(`{}`)}); err != nil {
+	state := &workflow.State{Run: domain.WorkflowRun{ID: runID, TaskID: taskID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunCompleted, StartedAt: &now, CompletedAt: &now, TriggerSource: "integration-test", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{}}
+	materializeSyntheticWorkflowState(t, store, ctx, state)
+	if err := store.CreateWorkflowRun(ctx, state.Run); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Pool.Exec(ctx, `INSERT INTO assets(id,program_id,type,canonical_value) VALUES($1,$2,'url','https://app.example.test/openapi.json')`, assetID, programID); err != nil {
@@ -121,5 +141,232 @@ func TestVerificationVerdictsPersistAndGatePromotion(t *testing.T) {
 	}
 	if len(console.VerifiedFindings) != 1 || console.VerifiedFindings[0].ID != verifiedID {
 		t.Fatalf("console verified finding mismatch: %#v", console.VerifiedFindings)
+	}
+	topology := console.WorkflowTopologies[runID]
+	if topology.Availability != "materialized" || len(topology.Steps) != 0 {
+		t.Fatalf("console topology=%#v", topology)
+	}
+	encodedConsole, err := json.Marshal(console)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encodedConsole), "materialized_definition") || strings.Contains(string(encodedConsole), `"target_plan":`) {
+		t.Fatalf("console response exposed raw materialization: %s", encodedConsole)
+	}
+	if !strings.Contains(string(encodedConsole), `"target_plan_digest":"plan"`) {
+		t.Fatalf("console response omitted legitimate target plan digest: %s", encodedConsole)
+	}
+}
+
+func TestConsoleUsesPerRunSanitizedTopology(t *testing.T) {
+	store, ctx := pre0015IntegrationStore(t, "console_topology")
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	programID, scopeID, legacyDefinitionID, legacyTaskID, legacyRunID, legacyStepID := domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID()
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO programs(id,name,platform,scope_reference,policy_reference) VALUES($1,$2,'integration','synthetic://console','integration')`, []any{programID, "console-" + string(programID)}},
+		{`INSERT INTO scope_versions(id,program_id,scope_reference,scope_digest,target_plan_digest,target_plan) VALUES($1,$2,'synthetic://console','scope','plan','{}')`, []any{scopeID, programID}},
+		{`INSERT INTO workflow_definitions(id,name,version,description,definition,default_policy_requirements) VALUES($1,'legacy-console','1','legacy','{}','{}')`, []any{legacyDefinitionID}},
+		{`INSERT INTO tasks(id,program_id,objective,workflow_definition_id,status,requested_by,created_at,updated_at) VALUES($1,$2,'legacy console',$3,'completed','integration',$4,$4)`, []any{legacyTaskID, programID, legacyDefinitionID, now.Add(-3 * time.Hour)}},
+		{`INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,trigger_source,summary) VALUES($1,$2,$3,'1','completed',$4,$4,'integration','{}')`, []any{legacyRunID, legacyTaskID, legacyDefinitionID, now.Add(-3 * time.Hour)}},
+		{`INSERT INTO step_runs(id,workflow_run_id,step_definition_id,capability,status,attempt_count,input,output,idempotency_key,approval_state,started_at,completed_at) VALUES($1,$2,'legacy-recorded','legacy.capability','succeeded',1,'{}','{}','legacy-key','not_required',$3,$3)`, []any{legacyStepID, legacyRunID, now.Add(-3 * time.Hour)}},
+	} {
+		if _, err := store.Pool.Exec(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	template := workflow.Template{ID: domain.NewID(), Name: "console-modern-" + string(domain.NewID()), Version: "1", Description: "console modern", Materializer: "web-recon/v1", DefaultPolicyRequirements: json.RawMessage(`{}`), CreatedAt: now}
+	if err := store.EnsureWorkflowTemplate(ctx, template); err != nil {
+		t.Fatal(err)
+	}
+	createRun := func(program domain.ID, label string, started time.Time, steps []workflow.Step) domain.ID {
+		t.Helper()
+		var localScopeID domain.ID
+		if err := store.Pool.QueryRow(ctx, `SELECT id FROM scope_versions WHERE program_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1`, program).Scan(&localScopeID); err != nil {
+			t.Fatal(err)
+		}
+		task := domain.Task{ID: domain.NewID(), ProgramID: program, Objective: label, WorkflowDefinitionID: template.ID, Status: domain.TaskRunning, RequestedBy: "integration", CreatedAt: started, UpdatedAt: started}
+		if err := store.CreateTask(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+		definition := workflow.Definition{ID: template.ID, Name: template.Name, Version: template.Version, Materializer: template.Materializer, Description: template.Description, Steps: steps, DefaultPolicyRequirements: template.DefaultPolicyRequirements, CreatedAt: template.CreatedAt}
+		materialized, digest, err := workflow.Materialize(definition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runID := domain.NewID()
+		state := &workflow.State{Run: domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: template.ID, WorkflowVersion: template.Version, Status: domain.RunCompleted, StartedAt: &started, CompletedAt: &started, TriggerSource: "integration", Summary: json.RawMessage(`{}`), MaterializedDefinition: materialized, MaterializationDigest: digest, OriginalScopeVersionID: &localScopeID}, Steps: map[string]*workflow.StepState{}}
+		if err := store.SaveWorkflowState(ctx, state); err != nil {
+			t.Fatal(err)
+		}
+		return runID
+	}
+	olderRunID := createRun(programID, "older", now.Add(-2*time.Hour), []workflow.Step{{ID: "older-only", Capability: "older.capability", Input: json.RawMessage(`{"secret":"CONSOLE_MATERIALIZED_INPUT_SENTINEL"}`), Bindings: map[string]string{"target": "CONSOLE_MATERIALIZED_BINDING_SENTINEL"}, ApprovalRequired: true}})
+	latestRunID := createRun(programID, "latest", now.Add(-time.Hour), []workflow.Step{{ID: "latest-only", Capability: "latest.capability", DependsOn: []string{"prior"}, Input: json.RawMessage(`{"secret":"LATEST_RAW_INPUT_MARKER"}`)}})
+	toolID, artifactID := domain.NewID(), domain.NewID()
+	if _, err := store.Pool.Exec(ctx, `UPDATE scope_versions SET target_plan=$2 WHERE id=$1`, scopeID, json.RawMessage(`{"raw":"CONSOLE_RAW_TARGET_PLAN_SENTINEL"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Pool.Exec(ctx, `UPDATE step_runs SET output=$2 WHERE id=$1`, legacyStepID, json.RawMessage(`{"raw":"CONSOLE_PROVIDER_OUTPUT_SENTINEL"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Pool.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,completed_at,exit_code,timed_out) VALUES($1,$2,'legacy.capability','sentinel-provider','1',$3,'{}',$4,$4,0,false)`, toolID, legacyStepID, json.RawMessage(`{"raw":"CONSOLE_PROVIDER_ARGS_SENTINEL"}`), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Pool.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,'raw-provider-output','text/plain',1,'sentinel-sha',$6,$7,'redacted',false)`, artifactID, legacyTaskID, legacyRunID, legacyStepID, toolID, "synthetic://CONSOLE_ARTIFACT_PATH_SENTINEL", now); err != nil {
+		t.Fatal(err)
+	}
+
+	otherProgramID, otherScopeID := domain.NewID(), domain.NewID()
+	if _, err := store.Pool.Exec(ctx, `INSERT INTO programs(id,name,platform,scope_reference,policy_reference) VALUES($1,$2,'integration','synthetic://other','integration')`, otherProgramID, "other-"+string(otherProgramID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Pool.Exec(ctx, `INSERT INTO scope_versions(id,program_id,scope_reference,scope_digest,target_plan_digest,target_plan) VALUES($1,$2,'synthetic://other','scope','plan','{}')`, otherScopeID, otherProgramID); err != nil {
+		t.Fatal(err)
+	}
+	otherRunID := createRun(otherProgramID, "other", now, []workflow.Step{{ID: "other-program", Capability: "isolated.capability", Input: json.RawMessage(`{"secret":"OTHER_PROGRAM_MARKER"}`)}})
+
+	console, err := store.ConsoleSnapshot(ctx, programID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	older := console.WorkflowTopologies[olderRunID]
+	latest := console.WorkflowTopologies[latestRunID]
+	legacy := console.WorkflowTopologies[legacyRunID]
+	if older.Availability != "materialized" || len(older.Steps) != 1 || older.Steps[0].ID != "older-only" || !older.Steps[0].ApprovalRequired {
+		t.Fatalf("older topology=%#v", older)
+	}
+	if latest.Availability != "materialized" || len(latest.Steps) != 1 || latest.Steps[0].ID != "latest-only" || len(latest.Steps[0].DependsOn) != 1 || latest.Steps[0].DependsOn[0] != "prior" {
+		t.Fatalf("latest topology=%#v", latest)
+	}
+	if legacy.Availability != "legacy_unavailable" || len(legacy.Steps) != 0 {
+		t.Fatalf("legacy topology=%#v", legacy)
+	}
+	legacyRecorded := false
+	for _, step := range console.Steps {
+		if step.WorkflowRunID == legacyRunID && step.StepDefinitionID == "legacy-recorded" {
+			legacyRecorded = true
+		}
+	}
+	if !legacyRecorded {
+		t.Fatalf("legacy persisted StepRun missing: %#v", console.Steps)
+	}
+	if _, leaked := console.WorkflowTopologies[otherRunID]; leaked {
+		t.Fatalf("other Program topology %s leaked", otherRunID)
+	}
+	encoded, err := json.Marshal(console)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		"materialized_definition", `"target_plan":`, `"sanitized_arguments":`, `"storage_location":`,
+		"CONSOLE_MATERIALIZED_INPUT_SENTINEL", "CONSOLE_MATERIALIZED_BINDING_SENTINEL", "CONSOLE_RAW_TARGET_PLAN_SENTINEL",
+		"CONSOLE_PROVIDER_ARGS_SENTINEL", "CONSOLE_ARTIFACT_PATH_SENTINEL", "CONSOLE_PROVIDER_OUTPUT_SENTINEL",
+		"LATEST_RAW_INPUT_MARKER", "OTHER_PROGRAM_MARKER",
+	} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("console response leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestConsoleProjectionOmitsProviderDerivedPersistencePayloads(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "console-provider-derived-projection")
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "console provider-derived projection")
+	definition, scopeVersionID := syntheticWorkflowDefinition(t, env.store, env.ctx, task.ID)
+	reportInput := json.RawMessage(`{"changes":[],"endpoints":[],"candidate_matches":[],"target_plan_digest":"WORKFLOW_SUMMARY_SENTINEL"}`)
+	definition.Steps = []workflow.Step{
+		{ID: "provider-output", Capability: "test.console-provider-output", Provider: "sentinel-provider", Input: json.RawMessage(`{}`), Retry: workflow.RetryPolicy{MaxAttempts: 1}},
+		{ID: "report", Capability: "report.changes", Provider: "platform", DependsOn: []string{"provider-output"}, Input: reportInput, Retry: workflow.RetryPolicy{MaxAttempts: 1}},
+	}
+	cfg, err := config.LoadWith(func(key string) string {
+		if key == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := providers.Registry(cfg)
+	if err := registry.Register(consoleProviderOutputCapability{}); err != nil {
+		t.Fatal(err)
+	}
+	engine := workflow.Engine{
+		Registry:  registry,
+		Executor:  execution.Service{Registry: registry, Store: env.store, Artifacts: postgresWorkflowRetryArtifacts{}, ProgramID: env.programID},
+		Persister: WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: t.TempDir()}},
+		Policy:    policy.Policy{ID: "console-projection", AllowedCapabilities: []string{"test.console-provider-output", "report.changes"}},
+		Scope:     integrationAllowScope{}, OriginalScopeVersionID: scopeVersionID,
+	}
+	state, err := engine.Run(env.ctx, definition, nil, task, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Run.Status != domain.RunCompleted {
+		t.Fatalf("workflow status=%s", state.Run.Status)
+	}
+	if _, err := env.store.RecordPolicyDecision(env.ctx, capability.PolicyDecisionRecord{
+		ProgramID: env.programID,
+		Action:    domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: state.Run.ID, RequestedBy: "integration", Capability: "test.console-provider-output", StepAttempt: 1},
+		Provider:  "sentinel-provider", PolicyID: "console-projection", Phase: "execution",
+		Evaluation: policy.Evaluation{Decision: policy.Allow, Reason: "AUDIT_DETAILS_SENTINEL"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var providerAuditRows, arbitraryAuditRows int
+	var storedSummary json.RawMessage
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT summary FROM workflow_runs WHERE id=$1`, state.Run.ID).Scan(&storedSummary); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT count(*) FROM audit_events WHERE workflow_run_id=$1 AND event_type='tool_execution' AND details::text LIKE '%PROVIDER_OUTPUT_SENTINEL%'`, state.Run.ID).Scan(&providerAuditRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT count(*) FROM audit_events WHERE workflow_run_id=$1 AND details::text LIKE '%AUDIT_DETAILS_SENTINEL%'`, state.Run.ID).Scan(&arbitraryAuditRows); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(storedSummary), "WORKFLOW_SUMMARY_SENTINEL") || providerAuditRows != 1 || arbitraryAuditRows != 1 {
+		t.Fatalf("persistence evidence summary=%s provider_audits=%d arbitrary_audits=%d", storedSummary, providerAuditRows, arbitraryAuditRows)
+	}
+
+	snapshot, err := env.store.ConsoleSnapshot(env.ctx, env.programID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range []string{"PROVIDER_OUTPUT_SENTINEL", "WORKFLOW_SUMMARY_SENTINEL", "AUDIT_DETAILS_SENTINEL"} {
+		if strings.Contains(string(encoded), sentinel) {
+			t.Fatalf("console projection exposed %q: %s", sentinel, encoded)
+		}
+	}
+	var shape map[string]any
+	if err := json.Unmarshal(encoded, &shape); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := shape["latest_changes"]; present {
+		t.Fatal("console projection retained raw latest_changes")
+	}
+	for _, rawRun := range shape["runs"].([]any) {
+		if _, present := rawRun.(map[string]any)["summary"]; present {
+			t.Fatal("console run retained raw summary")
+		}
+	}
+	for _, rawEvent := range shape["audit_events"].([]any) {
+		if _, present := rawEvent.(map[string]any)["details"]; present {
+			t.Fatal("console audit event retained raw details")
+		}
+	}
+	if len(snapshot.Runs) == 0 || snapshot.Runs[0].ID != state.Run.ID || snapshot.Runs[0].Status != domain.RunCompleted || snapshot.Scope == nil || snapshot.Scope.TargetPlanDigest != "plan" || len(snapshot.Tools) < 2 || len(snapshot.AuditEvents) == 0 || snapshot.AuditEvents[0].ID == "" || snapshot.AuditEvents[0].EventType == "" || snapshot.AuditEvents[0].OccurredAt.Before(now.Add(-time.Hour)) {
+		t.Fatalf("fixed console metadata missing: runs=%#v scope=%#v tools=%#v audits=%#v", snapshot.Runs, snapshot.Scope, snapshot.Tools, snapshot.AuditEvents)
 	}
 }

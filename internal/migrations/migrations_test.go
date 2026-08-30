@@ -18,7 +18,7 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) != 14 {
+	if len(versions) != 15 {
 		t.Fatalf("migrations=%v", versions)
 	}
 	wantVersions := []string{
@@ -36,6 +36,7 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 		"0012_asset_observation_emissions.sql",
 		"0013_endpoint_origin_identity.sql",
 		"0014_concrete_http_resource_lineage.sql",
+		"0015_workflow_template_materialization_integrity.sql",
 	}
 	for index := range wantVersions {
 		if versions[index] != wantVersions[index] {
@@ -548,6 +549,156 @@ func TestEndpointOriginIdentityMigrationPreservesLegacyRowsAndGuardsCorrectedIde
 	var migrationCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations WHERE version=13 AND name='0013_endpoint_origin_identity.sql'`).Scan(&migrationCount); err != nil || migrationCount != 1 {
 		t.Fatalf("migration ledger count=%d err=%v", migrationCount, err)
+	}
+}
+
+func TestWorkflowTemplateMaterializationIntegrityMigration(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.Close)
+	schema := "migration_workflow_materialization_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	identifier := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP SCHEMA "+identifier+" CASCADE"); err != nil {
+			t.Errorf("drop migration test schema: %v", err)
+		}
+	})
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	pool, err := pgxpool.New(ctx, parsed.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	applyEmbeddedMigrationsThrough(t, ctx, pool, 14)
+
+	const (
+		programID       = "00000000-0000-4000-8000-000000015001"
+		scopeVersionID  = "00000000-0000-4000-8000-000000015002"
+		baselineOldID   = "c9479711-b203-4fe1-8528-718888e5a5d2"
+		continuousOldID = "d0e5e6a3-bd8a-4b4b-a76b-f6452c30179a"
+		baselineTaskID  = "00000000-0000-4000-8000-000000015003"
+		continuousTask  = "00000000-0000-4000-8000-000000015004"
+		baselineRunID   = "00000000-0000-4000-8000-000000015005"
+		continuousRunID = "00000000-0000-4000-8000-000000015006"
+		currentDefID    = "3e62ed2c-ab49-421d-a4ce-5fdfead60f4a"
+		currentTaskID   = "00000000-0000-4000-8000-000000015007"
+		currentRunID    = "00000000-0000-4000-8000-000000015008"
+	)
+	for _, statement := range []string{
+		`INSERT INTO programs(id,name,platform,scope_reference,policy_reference) VALUES('` + programID + `','workflow-materialization-migration','integration','synthetic://local','integration')`,
+		`INSERT INTO scope_versions(id,program_id,scope_reference,scope_digest,target_plan_digest,target_plan) VALUES('` + scopeVersionID + `','` + programID + `','synthetic://local','scope','plan','{}')`,
+		`INSERT INTO workflow_definitions(id,name,version,description,definition,default_policy_requirements) VALUES('` + baselineOldID + `','authorized-web-baseline','1.2.0','historical baseline','{}','{}')`,
+		`INSERT INTO workflow_definitions(id,name,version,description,definition,default_policy_requirements) VALUES('` + continuousOldID + `','continuous-web-recon','2.2.0','historical continuous','{}','{}')`,
+		`INSERT INTO tasks(id,program_id,objective,workflow_definition_id,status,requested_by) VALUES('` + baselineTaskID + `','` + programID + `','legacy baseline','` + baselineOldID + `','completed','integration')`,
+		`INSERT INTO tasks(id,program_id,objective,workflow_definition_id,status,requested_by) VALUES('` + continuousTask + `','` + programID + `','legacy continuous','` + continuousOldID + `','completed','integration')`,
+		`INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,trigger_source) VALUES('` + baselineRunID + `','` + baselineTaskID + `','` + baselineOldID + `','1.2.0','completed','integration')`,
+		`INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,trigger_source) VALUES('` + continuousRunID + `','` + continuousTask + `','` + continuousOldID + `','2.2.0','completed','integration')`,
+	} {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Up(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+
+	var legacyDefinitions, legacyRuns, legacyNullRuns int
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM workflow_definitions WHERE id IN ($1,$2)),
+		(SELECT count(*) FROM workflow_runs WHERE id IN ($3,$4)),
+		(SELECT count(*) FROM workflow_runs WHERE id IN ($3,$4) AND materialized_definition IS NULL AND materialization_digest IS NULL AND original_scope_version_id IS NULL)`, baselineOldID, continuousOldID, baselineRunID, continuousRunID).Scan(&legacyDefinitions, &legacyRuns, &legacyNullRuns); err != nil {
+		t.Fatal(err)
+	}
+	if legacyDefinitions != 2 || legacyRuns != 2 || legacyNullRuns != 2 {
+		t.Fatalf("legacy definitions=%d runs=%d null_runs=%d", legacyDefinitions, legacyRuns, legacyNullRuns)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO workflow_definitions(id,name,version,description,definition,default_policy_requirements) VALUES($1,'continuous-web-recon','2.4.0','current','{"schema_version":1,"kind":"built-in","materializer":"web-recon/v1"}','{}')`, currentDefID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO tasks(id,program_id,objective,workflow_definition_id,status,requested_by) VALUES($1,$2,'current',$3,'running','integration')`, currentTaskID, programID, currentDefID); err != nil {
+		t.Fatal(err)
+	}
+	materialized := `{"id":"` + currentDefID + `","name":"continuous-web-recon","version":"2.4.0","materializer":"web-recon/v1","description":"current","steps":[],"default_policy_requirements":{},"created_at":"2026-07-21T00:00:00Z"}`
+	if _, err := pool.Exec(ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,trigger_source,materialized_definition,materialization_digest,original_scope_version_id) VALUES($1,$2,$3,'2.4.0','running','integration',$4,$5,$6)`, currentRunID, currentTaskID, currentDefID, materialized, strings.Repeat("a", 64), scopeVersionID); err != nil {
+		t.Fatal(err)
+	}
+	assertImmutable := func(name, statement string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, statement); err == nil || !strings.Contains(strings.ToLower(err.Error()), "immutable") {
+			t.Fatalf("%s error=%v", name, err)
+		}
+	}
+	for _, id := range []string{baselineOldID, currentDefID} {
+		for field, assignment := range map[string]string{
+			"id":                          `id=gen_random_uuid()`,
+			"name":                        `name=name||'-changed'`,
+			"version":                     `version=version||'-changed'`,
+			"description":                 `description=description||'-changed'`,
+			"definition":                  `definition='{"changed":true}'::jsonb`,
+			"default_policy_requirements": `default_policy_requirements='{"changed":true}'::jsonb`,
+			"created_at":                  `created_at=created_at+interval '1 second'`,
+		} {
+			assertImmutable("workflow definition "+id+" "+field, `UPDATE workflow_definitions SET `+assignment+` WHERE id='`+id+`'`)
+		}
+	}
+	assertImmutable("historical template delete", `DELETE FROM workflow_definitions WHERE id='`+baselineOldID+`'`)
+	for _, id := range []string{baselineTaskID, currentTaskID} {
+		for field, assignment := range map[string]string{
+			"id":                     `id=gen_random_uuid()`,
+			"program_id":             `program_id=gen_random_uuid()`,
+			"workflow_definition_id": `workflow_definition_id=gen_random_uuid()`,
+		} {
+			assertImmutable("task "+id+" "+field, `UPDATE tasks SET `+assignment+` WHERE id='`+id+`'`)
+		}
+	}
+	for _, id := range []string{baselineRunID, currentRunID} {
+		for field, assignment := range map[string]string{
+			"id":                        `id=gen_random_uuid()`,
+			"task_id":                   `task_id=gen_random_uuid()`,
+			"workflow_definition_id":    `workflow_definition_id=gen_random_uuid()`,
+			"workflow_version":          `workflow_version=workflow_version||'-changed'`,
+			"previous_run_id":           `previous_run_id=gen_random_uuid()`,
+			"trigger_source":            `trigger_source=trigger_source||'-changed'`,
+			"materialized_definition":   `materialized_definition=COALESCE(materialized_definition,'{}'::jsonb)||'{"changed":true}'::jsonb`,
+			"materialization_digest":    `materialization_digest=repeat('b',64)`,
+			"original_scope_version_id": `original_scope_version_id=gen_random_uuid()`,
+		} {
+			assertImmutable("workflow run "+id+" "+field, `UPDATE workflow_runs SET `+assignment+` WHERE id='`+id+`'`)
+		}
+	}
+	for name, statement := range map[string]string{
+		"definition semantic no-op": `UPDATE workflow_definitions SET id=id,name=name,version=version,description=description,definition=definition,default_policy_requirements=default_policy_requirements,created_at=created_at WHERE id='` + currentDefID + `'`,
+		"task semantic no-op":       `UPDATE tasks SET id=id,program_id=program_id,workflow_definition_id=workflow_definition_id WHERE id='` + currentTaskID + `'`,
+		"run semantic no-op":        `UPDATE workflow_runs SET id=id,task_id=task_id,workflow_definition_id=workflow_definition_id,workflow_version=workflow_version,previous_run_id=previous_run_id,trigger_source=trigger_source,materialized_definition=materialized_definition,materialization_digest=materialization_digest,original_scope_version_id=original_scope_version_id WHERE id='` + currentRunID + `'`,
+		"task lifecycle":            `UPDATE tasks SET status='paused',updated_at=clock_timestamp() WHERE id='` + currentTaskID + `'`,
+		"run lifecycle":             `UPDATE workflow_runs SET status='paused',completed_at=clock_timestamp(),summary='{"lifecycle":true}' WHERE id='` + currentRunID + `'`,
+	} {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatalf("%s error=%v", name, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,trigger_source) VALUES($1,$2,$3,'1.2.0','running','integration')`, "00000000-0000-4000-8000-000000015009", baselineTaskID, baselineOldID); err == nil || !strings.Contains(err.Error(), "complete immutable materialization") {
+		t.Fatalf("post-migration NULL run error=%v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE workflow_runs SET materialization_digest=$2 WHERE id=$1`, currentRunID, strings.Repeat("b", 64)); err == nil || !strings.Contains(strings.ToLower(err.Error()), "immutable") {
+		t.Fatalf("snapshot mutation error=%v", err)
 	}
 }
 

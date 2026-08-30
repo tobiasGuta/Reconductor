@@ -11,6 +11,11 @@ import (
 
 type FileStore struct{ Root string }
 
+type CheckpointDecodeError struct{ Err error }
+
+func (e *CheckpointDecodeError) Error() string { return "decode workflow checkpoint: " + e.Err.Error() }
+func (e *CheckpointDecodeError) Unwrap() error { return e.Err }
+
 func (s FileStore) Save(_ context.Context, state *State) error {
 	if state == nil || state.Run.ID == "" {
 		return fmt.Errorf("run state id is required")
@@ -44,7 +49,7 @@ func (s FileStore) Load(id string) (*State, error) {
 	}
 	var state State
 	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, err
+		return nil, &CheckpointDecodeError{Err: err}
 	}
 	return &state, nil
 }

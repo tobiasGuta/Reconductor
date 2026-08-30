@@ -732,21 +732,15 @@ func TestProbeHTTPSourceTriggerBindsStoredHierarchyAuthorizationAndScheduling(t 
 	t.Run("WorkflowRun Task hierarchy", func(t *testing.T) {
 		lineage := newDirectProbeHTTPSourceLineage(t, "direct-source-workflow-task", false, "probe.http", "fixture-provider", "fixture-provider")
 		other := newScheduledResultFixtureInEnvironment(t, lineage.fixture.env, "direct-source-workflow-task-other", "probe.http")
-		if _, err := lineage.fixture.env.store.Pool.Exec(lineage.fixture.env.ctx, `UPDATE workflow_runs SET task_id=$2 WHERE id=$1`, lineage.fixture.lineage.runID, other.lineage.task.ID); err != nil {
-			t.Fatal(err)
-		}
-		if err := lineage.insert(); err == nil || !strings.Contains(err.Error(), "lineage is inconsistent") {
-			t.Fatalf("inconsistent WorkflowRun hierarchy error=%v", err)
+		if _, err := lineage.fixture.env.store.Pool.Exec(lineage.fixture.env.ctx, `UPDATE workflow_runs SET task_id=$2 WHERE id=$1`, lineage.fixture.lineage.runID, other.lineage.task.ID); err == nil || !strings.Contains(err.Error(), "identity is immutable") {
+			t.Fatalf("WorkflowRun reparenting error=%v", err)
 		}
 	})
 	t.Run("Task Program hierarchy", func(t *testing.T) {
 		lineage := newDirectProbeHTTPSourceLineage(t, "direct-source-task-program", false, "probe.http", "fixture-provider", "fixture-provider")
 		otherProgramID, _ := directOtherProgramResource(t, lineage)
-		if _, err := lineage.fixture.env.store.Pool.Exec(lineage.fixture.env.ctx, `UPDATE tasks SET program_id=$2 WHERE id=$1`, lineage.fixture.lineage.task.ID, otherProgramID); err != nil {
-			t.Fatal(err)
-		}
-		if err := lineage.insert(); err == nil || !strings.Contains(err.Error(), "lineage is inconsistent") {
-			t.Fatalf("inconsistent Task hierarchy error=%v", err)
+		if _, err := lineage.fixture.env.store.Pool.Exec(lineage.fixture.env.ctx, `UPDATE tasks SET program_id=$2 WHERE id=$1`, lineage.fixture.lineage.task.ID, otherProgramID); err == nil || !strings.Contains(err.Error(), "identity is immutable") {
+			t.Fatalf("Task reparenting error=%v", err)
 		}
 	})
 	t.Run("execution authorization semantics", func(t *testing.T) {

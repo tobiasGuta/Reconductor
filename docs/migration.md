@@ -36,6 +36,14 @@ Migration `0014_concrete_http_resource_lineage.sql` adds Program-local `canonica
 
 Deploy 0014 with the Slice-3A binary as one coordinated writer transition: stop new admission, drain old workers and in-flight executions, apply `platform migrate` once, verify the two new tables, source-lineage and immutability triggers, and migration-ledger entry, then start only Slice-3A-aware workers before resuming admission. Pre-v4 `probe.http` outputs remain readable as legacy results with no source rows. A present but malformed v4 source collection fails its result transaction without an accepted or rejected result-fence decision.
 
+### Workflow materialization integrity migration 0015
+
+Migration `0015_workflow_template_materialization_integrity.sql` adds nullable `materialized_definition`, `materialization_digest`, and `original_scope_version_id` columns to `workflow_runs`. Existing rows—including baseline 1.2.0 and continuous 2.2.0—remain unchanged with all three values null. New inserts must supply the complete modern branch; no materialization is guessed or backfilled.
+
+The migration makes every workflow-definition release field immutable: `id`, `name`, `version`, `description`, `definition`, `default_policy_requirements`, and `created_at`. It makes Task `id`, `program_id`, and `workflow_definition_id` immutable, and makes WorkflowRun `id`, `task_id`, `workflow_definition_id`, `workflow_version`, `previous_run_id`, `trigger_source`, `materialized_definition`, `materialization_digest`, and `original_scope_version_id` immutable. Lifecycle fields remain mutable, and semantic no-op writes remain allowed. These guards apply equally to pre-0015 rows and rows inserted after migration. New binaries register the current baseline 1.4.0 and continuous 2.4.0 template UUIDs independently of historical UUIDs, including the base source releases at baseline 1.3.0 and continuous 2.3.0. Stop old writers before applying 0015 because post-migration processes that omit run materialization intentionally fail closed.
+
+A legacy null-materialization run stays visible but returns `ErrWorkflowResumeUnavailable` before state mutation or provider traffic. A valid modern run uses its database snapshot as authority. A genuinely missing initial FileStore checkpoint can be reconstructed only for a non-terminal run with a valid start time and zero StepRuns; malformed/conflicting checkpoints and missing checkpoints after any StepRun return a checkpoint error without traffic.
+
 ## Environment and Compose
 
 Replace `RATE_LIMIT` with `NUCLEI_RATE_LIMIT` and `CONCURRENCY` with explicit host/template/headless concurrency variables. Add `DATABASE_URL` and `REDIS_PASSWORD`. Compare the complete new `.env.example`; duplicated per-binary parsers no longer exist.

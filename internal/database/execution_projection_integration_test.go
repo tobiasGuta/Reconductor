@@ -160,14 +160,14 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("workflow definition version mismatch is visible without normalization", func(t *testing.T) {
+	t.Run("workflow definition version is immutable", func(t *testing.T) {
 		running := domain.RunRunning
 		fixture := createRecoveryFixture(t, env, "projection-version-mismatch", &running, domain.TaskRunning, []recoveryStepSpec{
 			{name: "active", status: domain.StepRunning, started: true, attemptCount: 1},
 		})
 		const contradictoryRunVersion = "contradictory-version"
-		if _, err := env.store.Pool.Exec(env.ctx, `UPDATE workflow_runs SET workflow_version=$2 WHERE id=$1`, fixture.runID, contradictoryRunVersion); err != nil {
-			t.Fatal(err)
+		if _, err := env.store.Pool.Exec(env.ctx, `UPDATE workflow_runs SET workflow_version=$2 WHERE id=$1`, fixture.runID, contradictoryRunVersion); err == nil || !strings.Contains(err.Error(), "identity is immutable") {
+			t.Fatalf("workflow version mutation error=%v", err)
 		}
 
 		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
@@ -177,11 +177,11 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if projection.Scheduler.Status != domain.ScheduledExecutionRunning || projection.Task == nil || projection.Task.Status != domain.TaskRunning || projection.Workflow == nil || projection.Workflow.Status != domain.RunRunning {
 			t.Fatalf("mismatched projection scheduler=%#v task=%#v workflow=%#v", projection.Scheduler, projection.Task, projection.Workflow)
 		}
-		if projection.Workflow.WorkflowDefinitionID != env.definitionID || projection.Workflow.WorkflowVersion != contradictoryRunVersion {
-			t.Fatalf("workflow identity/version was normalized: %#v", projection.Workflow)
+		if projection.Workflow.WorkflowDefinitionID != env.definitionID || projection.Workflow.WorkflowVersion != "1" {
+			t.Fatalf("workflow identity/version changed: %#v", projection.Workflow)
 		}
-		if got := countLineageIssue(projection.Lineage.Issues, ExecutionLineageWorkflowDefinitionVersionMismatch); got != 1 {
-			t.Fatalf("version mismatch issue count = %d, want 1; issues=%v", got, projection.Lineage.Issues)
+		if got := countLineageIssue(projection.Lineage.Issues, ExecutionLineageWorkflowDefinitionVersionMismatch); got != 0 {
+			t.Fatalf("version mismatch issue count = %d, want 0; issues=%v", got, projection.Lineage.Issues)
 		}
 	})
 
@@ -484,7 +484,8 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 		}
 
 		otherRunID, otherStepID := domain.NewID(), domain.NewID()
-		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary) VALUES($1,$2,$3,'1','running',$4,'integration','{}')`, otherRunID, fixture.task.ID, env.definitionID, requested); err != nil {
+		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary,materialized_definition,materialization_digest,original_scope_version_id)
+			SELECT $1,$2,$3,'1','running',$4,'integration','{}',materialized_definition,materialization_digest,original_scope_version_id FROM workflow_runs WHERE id=$5`, otherRunID, fixture.task.ID, env.definitionID, requested, fixture.runID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO step_runs(id,workflow_run_id,step_definition_id,capability,status,idempotency_key) VALUES($1,$2,'other','test.other','awaiting_approval',$3)`, otherStepID, otherRunID, "approval-other-"+string(otherStepID)); err != nil {
@@ -716,7 +717,8 @@ func TestExecutionProjectionCandidateChildrenIntegration(t *testing.T) {
 		})
 
 		otherRunID := domain.NewID()
-		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary) VALUES($1,$2,$3,'1','running',$4,'integration','{}')`, otherRunID, fixture.task.ID, env.definitionID, now); err != nil {
+		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary,materialized_definition,materialization_digest,original_scope_version_id)
+			SELECT $1,$2,$3,'1','running',$4,'integration','{}',materialized_definition,materialization_digest,original_scope_version_id FROM workflow_runs WHERE id=$5`, otherRunID, fixture.task.ID, env.definitionID, now, fixture.runID); err != nil {
 			t.Fatal(err)
 		}
 		otherAssetID := insertProjectionAsset(t, env, env.programID, "https://other-workflow.example.test/")
@@ -934,7 +936,8 @@ func TestExecutionProjectionChangeItemsIntegration(t *testing.T) {
 
 		otherTask := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "projection-change-other-workflow")
 		otherRunID := domain.NewID()
-		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary) VALUES($1,$2,$3,'1','running',$4,'integration','{}')`, otherRunID, otherTask.ID, env.definitionID, now); err != nil {
+		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary,materialized_definition,materialization_digest,original_scope_version_id)
+			SELECT $1,$2,$3,'1','running',$4,'integration','{}',materialized_definition,materialization_digest,original_scope_version_id FROM workflow_runs WHERE id=$5`, otherRunID, otherTask.ID, env.definitionID, now, fixture.runID); err != nil {
 			t.Fatal(err)
 		}
 		wrongWorkflowID := insertProjectionChangeItem(t, env, projectionChangeItemSpec{
@@ -1141,7 +1144,8 @@ func TestExecutionProjectionAssetObservationSummaryIntegration(t *testing.T) {
 		})
 
 		otherRunID := domain.NewID()
-		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary) VALUES($1,$2,$3,'1','running',$4,'integration','{}')`, otherRunID, fixture.task.ID, env.definitionID, now); err != nil {
+		if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary,materialized_definition,materialization_digest,original_scope_version_id)
+			SELECT $1,$2,$3,'1','running',$4,'integration','{}',materialized_definition,materialization_digest,original_scope_version_id FROM workflow_runs WHERE id=$5`, otherRunID, fixture.task.ID, env.definitionID, now, fixture.runID); err != nil {
 			t.Fatal(err)
 		}
 		otherProgramID, _ := createSchedulerIntegrationProgram(t, env.ctx, env.store, "observation-other-workflow-program")

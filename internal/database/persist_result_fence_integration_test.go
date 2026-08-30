@@ -142,7 +142,8 @@ func TestScheduledPersistResultFenceAcceptanceAndRejection(t *testing.T) {
 	t.Run("step belongs to another workflow", func(t *testing.T) {
 		fixture := newScheduledResultFixture(t, "result-step-workflow-mismatch", "scan.nuclei")
 		otherRunID := domain.NewID()
-		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary) VALUES($1,$2,$3,'1','running',clock_timestamp(),'integration','{}')`, otherRunID, fixture.lineage.task.ID, fixture.env.definitionID); err != nil {
+		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,trigger_source,summary,materialized_definition,materialization_digest,original_scope_version_id)
+			SELECT $1,$2,$3,'1','running',clock_timestamp(),'integration','{}',materialized_definition,materialization_digest,original_scope_version_id FROM workflow_runs WHERE id=$4`, otherRunID, fixture.lineage.task.ID, fixture.env.definitionID, fixture.lineage.runID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE step_runs SET workflow_run_id=$2 WHERE id=$1`, fixture.stepID, otherRunID); err != nil {
@@ -386,6 +387,7 @@ func TestProviderResultAcceptedDecisionProvenance(t *testing.T) {
 		{name: "success"},
 		{name: "retryable", mutate: makeRetryableResult},
 		{name: "terminal failure", mutate: makeTerminalFailedResult},
+		{name: "cancelled", mutate: makeCancelledResult},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newScheduledResultFixture(t, "result-decision-accepted-"+strings.ReplaceAll(test.name, " ", "-"), "probe.http")
@@ -423,6 +425,134 @@ func TestProviderResultAcceptedDecisionProvenance(t *testing.T) {
 				Details:                       `{}`,
 			})
 			assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_accepted", "", 1)
+		})
+	}
+}
+
+func TestCancelledProviderResultFence(t *testing.T) {
+	t.Run("accepts exact cancellation and rejects duplicate authority", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "result-cancelled-exact", "probe.http")
+		action := scheduledProviderAction(fixture, 1)
+		queueJobID := domain.NewID()
+		admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, &queueJobID, "fixture-provider")
+		step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		makeCancelledResult(&step, &result)
+		applyScheduledProviderAdmission(tool, &result, admission)
+
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission); err != nil {
+			t.Fatal(err)
+		}
+		assertPersistedStepState(t, fixture, domain.StepCancelled, 1, true)
+		var classification, details string
+		var completedAt *time.Time
+		if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT error_classification,error_details,completed_at FROM step_runs WHERE id=$1`, fixture.stepID).Scan(&classification, &details, &completedAt); err != nil {
+			t.Fatal(err)
+		}
+		if classification != "cancelled" || details != context.Canceled.Error() || completedAt == nil {
+			t.Fatalf("cancelled fields classification=%q details=%q completed=%v", classification, details, completedAt)
+		}
+		decision := loadProviderResultDecision(t, fixture, "provider_result_accepted", admission.ProviderAttemptID, "")
+		assertProviderResultDecisionProvenance(t, decision, providerResultDecisionExpectation{
+			Actor:                         action.RequestedBy,
+			TaskID:                        fixture.lineage.task.ID,
+			ProgramID:                     fixture.env.programID,
+			WorkflowRunID:                 fixture.lineage.runID,
+			StepRunID:                     fixture.stepID,
+			ToolRunID:                     &tool.ID,
+			ScheduledExecutionID:          fixture.lineage.execution.ID,
+			SchedulerAttempt:              fixture.fence.Attempt,
+			ActionRequestID:               action.ID,
+			StepAttempt:                   1,
+			QueueJobID:                    &queueJobID,
+			ExecutionAuthorizationEventID: admission.ExecutionAuthorizationEventID,
+			ProviderAttemptID:             admission.ProviderAttemptID,
+			Capability:                    fixture.capability,
+			Provider:                      admission.Provider,
+			SafeMessage:                   "provider result accepted by persistence fence",
+			Details:                       `{}`,
+		})
+
+		beforeDuplicate := resultFenceSnapshot(t, fixture)
+		duplicateStep, duplicateTool, duplicateArtifacts, duplicateResult := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		makeCancelledResult(&duplicateStep, &duplicateResult)
+		applyScheduledProviderAdmission(duplicateTool, &duplicateResult, admission)
+		if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, duplicateStep, duplicateTool, duplicateArtifacts, duplicateResult, admission); !errors.Is(err, ErrStaleScheduledExecutionResult) {
+			t.Fatalf("duplicate cancelled result error=%v", err)
+		}
+		if afterDuplicate := resultFenceSnapshot(t, fixture); afterDuplicate != beforeDuplicate {
+			t.Fatalf("duplicate cancelled result mutated authority\nbefore=%s\nafter=%s", beforeDuplicate, afterDuplicate)
+		}
+		assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_accepted", "", 1)
+		assertPersistedStepState(t, fixture, domain.StepCancelled, 1, true)
+	})
+
+	t.Run("accepted decision failure rolls back cancellation atomically", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "result-cancelled-rollback", "probe.http")
+		admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+		makeCancelledResult(&step, &result)
+		applyScheduledProviderAdmission(tool, &result, admission)
+		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `CREATE FUNCTION reject_cancelled_provider_result_accepted() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				IF NEW.event_type='provider_result_accepted' THEN
+					RAISE EXCEPTION 'synthetic cancelled accepted decision rejection';
+				END IF;
+				RETURN NEW;
+			END $$;
+			CREATE TRIGGER reject_cancelled_provider_result_accepted BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION reject_cancelled_provider_result_accepted()`); err != nil {
+			t.Fatal(err)
+		}
+
+		before := resultFenceSnapshot(t, fixture)
+		err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission)
+		if err == nil || !strings.Contains(err.Error(), "synthetic cancelled accepted decision rejection") {
+			t.Fatalf("cancelled accepted decision failure=%v", err)
+		}
+		if after := resultFenceSnapshot(t, fixture); after != before {
+			t.Fatalf("cancelled accepted decision failure mutated result\nbefore=%s\nafter=%s", before, after)
+		}
+		assertStepRecoveryStatus(t, fixture.env, fixture.stepID, domain.StepRunning)
+		assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_accepted", "", 0)
+		assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_rejected", "", 0)
+	})
+
+	for _, test := range []struct {
+		name       string
+		mutate     func(*domain.StepRun, *domain.ToolRun, *capability.ResultAdmissionProvenance)
+		reasonCode resultFenceReasonCode
+	}{
+		{name: "completion timestamp required", reasonCode: resultFenceInvalidResultState, mutate: func(step *domain.StepRun, _ *domain.ToolRun, _ *capability.ResultAdmissionProvenance) {
+			step.CompletedAt = nil
+		}},
+		{name: "wrong ProviderAttempt rejected", reasonCode: resultFenceProviderProvenanceMismatch, mutate: func(_ *domain.StepRun, tool *domain.ToolRun, admission *capability.ResultAdmissionProvenance) {
+			wrong := domain.NewID()
+			admission.ProviderAttemptID = wrong
+			tool.ProviderAttemptID = &wrong
+		}},
+		{name: "wrong step attempt rejected", reasonCode: resultFenceProviderProvenanceMismatch, mutate: func(_ *domain.StepRun, _ *domain.ToolRun, admission *capability.ResultAdmissionProvenance) {
+			admission.StepAttempt++
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newScheduledResultFixture(t, "result-cancelled-"+strings.ReplaceAll(test.name, " ", "-"), "probe.http")
+			action := scheduledProviderAction(fixture, 1)
+			admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, nil, "fixture-provider")
+			step, tool, artifacts, result := scheduledResultPayload(fixture, json.RawMessage(`{"lines":[]}`))
+			makeCancelledResult(&step, &result)
+			applyScheduledProviderAdmission(tool, &result, admission)
+			test.mutate(&step, tool, admission)
+			before := resultFenceSnapshot(t, fixture)
+			err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission)
+			if !errors.Is(err, ErrStaleScheduledExecutionResult) {
+				t.Fatalf("cancelled result rejection error=%v", err)
+			}
+			if rejection, ok := resultFenceRejection(err); !ok || rejection.reason != test.reasonCode {
+				t.Fatalf("cancelled result rejection=%#v ok=%v want=%s", rejection, ok, test.reasonCode)
+			}
+			if after := resultFenceSnapshot(t, fixture); after != before {
+				t.Fatalf("rejected cancelled result mutated database\nbefore=%s\nafter=%s", before, after)
+			}
+			assertStepRecoveryStatus(t, fixture.env, fixture.stepID, domain.StepRunning)
 		})
 	}
 }
@@ -1204,6 +1334,7 @@ func TestScheduledWorkflowSaveFence(t *testing.T) {
 	t.Run("current scheduled attempt saves", func(t *testing.T) {
 		fixture := newScheduledResultFixture(t, "save-current", "probe.http")
 		state := scheduledFixtureState(fixture, domain.RunRunning, domain.StepRunning)
+		materializeSyntheticWorkflowState(t, fixture.env.store, fixture.env.ctx, state)
 		if err := fixture.env.store.SaveWorkflowState(fixture.context(), state); err != nil {
 			t.Fatal(err)
 		}
@@ -1235,7 +1366,9 @@ func TestScheduledWorkflowSaveFence(t *testing.T) {
 			fixture := newScheduledResultFixture(t, "save-"+strings.ReplaceAll(test.name, " ", "-"), "probe.http")
 			test.prepare(fixture)
 			before := resultFenceSnapshot(t, fixture)
-			err := fixture.env.store.SaveWorkflowState(test.ctx(fixture), scheduledFixtureState(fixture, domain.RunCompleted, domain.StepSucceeded))
+			state := scheduledFixtureState(fixture, domain.RunCompleted, domain.StepSucceeded)
+			materializeSyntheticWorkflowState(t, fixture.env.store, fixture.env.ctx, state)
+			err := fixture.env.store.SaveWorkflowState(test.ctx(fixture), state)
 			if !errors.Is(err, ErrLostScheduledExecutionLease) {
 				t.Fatalf("save error=%v want %v", err, ErrLostScheduledExecutionLease)
 			}
@@ -1252,8 +1385,13 @@ func TestScheduledWorkflowSaveFence(t *testing.T) {
 		task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "unscheduled")
 		runID, stepID := domain.NewID(), domain.NewID()
 		key := "unscheduled-idempotency"
-		state := &workflow.State{Run: domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: env.definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{"provider": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "provider", Capability: "probe.http", Status: domain.StepRunning, AttemptCount: 1, Input: json.RawMessage(`{}`), StartedAt: &now, IdempotencyKey: key, ApprovalState: "not_required"}}}}
+		input := json.RawMessage(`{}`)
+		state := &workflow.State{Run: domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: env.definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{"provider": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "provider", Capability: "probe.http", Status: domain.StepRunning, Input: input, StartedAt: &now, IdempotencyKey: key, ApprovalState: "not_required"}, InputHash: workflow.InputDigest(input)}}}
+		materializeSyntheticWorkflowState(t, env.store, env.ctx, state)
 		if err := env.store.SaveWorkflowState(env.ctx, state); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: stepID, Capability: "probe.http", Input: input, IdempotencyKey: key, StepAttempt: 1}, input); err != nil {
 			t.Fatal(err)
 		}
 		fixture := scheduledResultFixture{env: env, lineage: recoveryTestFixture{task: task, runID: runID}, stepID: stepID, idempotencyKey: key, capability: "probe.http"}
@@ -1275,9 +1413,13 @@ func TestScheduledWorkflowSaveFence(t *testing.T) {
 		runID, stepID := domain.NewID(), domain.NewID()
 		state := &workflow.State{
 			Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: env.definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration", Summary: json.RawMessage(`{}`)},
-			Steps: map[string]*workflow.StepState{"provider": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "provider", Capability: "probe.http", Status: domain.StepRunning, AttemptCount: 1, Input: json.RawMessage(`{}`), StartedAt: &now, IdempotencyKey: "unscheduled-conflict-key", ApprovalState: "not_required"}}},
+			Steps: map[string]*workflow.StepState{"provider": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "provider", Capability: "probe.http", Status: domain.StepRunning, Input: json.RawMessage(`{}`), StartedAt: &now, IdempotencyKey: "unscheduled-conflict-key", ApprovalState: "not_required"}, InputHash: workflow.InputDigest(json.RawMessage(`{}`))}},
 		}
+		materializeSyntheticWorkflowState(t, env.store, env.ctx, state)
 		if err := env.store.SaveWorkflowState(env.ctx, state); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: stepID, Capability: "probe.http", Input: json.RawMessage(`{}`), IdempotencyKey: "unscheduled-conflict-key", StepAttempt: 1}, json.RawMessage(`{}`)); err != nil {
 			t.Fatal(err)
 		}
 		fixture := scheduledResultFixture{env: env, lineage: recoveryTestFixture{task: task, runID: runID}, stepID: stepID, idempotencyKey: "unscheduled-conflict-key", capability: "probe.http"}
@@ -1289,6 +1431,91 @@ func TestScheduledWorkflowSaveFence(t *testing.T) {
 		assertStepRecoveryStatus(t, env, stepID, domain.StepRunning)
 		assertResultRowCounts(t, fixture, 0, 0, 0, 0, 0)
 	})
+}
+
+func TestWorkflowSaveRejectsTerminalLifecycleRegression(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		runStatus  domain.RunStatus
+		stepStatus domain.StepStatus
+	}{
+		{name: "completed succeeded", runStatus: domain.RunCompleted, stepStatus: domain.StepSucceeded},
+		{name: "failed failed", runStatus: domain.RunFailed, stepStatus: domain.StepFailed},
+		{name: "cancelled cancelled", runStatus: domain.RunCancelled, stepStatus: domain.StepCancelled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			env := newRecoveryTestEnvironment(t, "terminal-save-"+strings.ReplaceAll(test.name, " ", "-"))
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "terminal lifecycle regression")
+			runID, stepID := domain.NewID(), domain.NewID()
+			input := json.RawMessage(`{"targets":["https://example.test/"]}`)
+			initial := &workflow.State{
+				Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: env.definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration", Summary: json.RawMessage(`{}`)},
+				Steps: map[string]*workflow.StepState{"provider": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "provider", Capability: "probe.http", Status: domain.StepRunning, Input: input, StartedAt: &now, IdempotencyKey: "terminal-regression-key", ApprovalState: "not_required"}, InputHash: workflow.InputDigest(input)}},
+			}
+			materializeSyntheticWorkflowState(t, env.store, env.ctx, initial)
+			if err := env.store.SaveWorkflowState(env.ctx, initial); err != nil {
+				t.Fatal(err)
+			}
+			stale, err := env.store.LoadWorkflowState(env.ctx, runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authoritative, err := env.store.LoadWorkflowState(env.ctx, runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			completed := now.Add(time.Minute)
+			authoritative.Run.Status = test.runStatus
+			authoritative.Run.CompletedAt = &completed
+			authoritative.Run.Summary = json.RawMessage(`{"marker":"AUTHORITATIVE_RUN_SUMMARY"}`)
+			authoritative.Steps["provider"].Run.Status = test.stepStatus
+			authoritative.Steps["provider"].Run.Output = json.RawMessage(`{"marker":"AUTHORITATIVE_STEP_OUTPUT"}`)
+			authoritative.Steps["provider"].Run.ErrorClassification = "authoritative"
+			authoritative.Steps["provider"].Run.ErrorDetails = "authoritative lifecycle"
+			authoritative.Steps["provider"].Run.CompletedAt = &completed
+			if err := env.store.SaveWorkflowState(env.ctx, authoritative); err != nil {
+				t.Fatal(err)
+			}
+			if err := env.store.SaveWorkflowState(env.ctx, stale); !errors.Is(err, workflow.ErrWorkflowLifecycleConflict) {
+				t.Fatalf("stale terminal save error=%v", err)
+			}
+			var runStatus domain.RunStatus
+			var stepStatus domain.StepStatus
+			var summary, output json.RawMessage
+			var runCompleted, stepCompleted *time.Time
+			if err := env.store.Pool.QueryRow(env.ctx, `SELECT wr.status,wr.summary,wr.completed_at,sr.status,sr.output,sr.completed_at FROM workflow_runs wr JOIN step_runs sr ON sr.workflow_run_id=wr.id WHERE wr.id=$1 AND sr.id=$2`, runID, stepID).Scan(&runStatus, &summary, &runCompleted, &stepStatus, &output, &stepCompleted); err != nil {
+				t.Fatal(err)
+			}
+			if runStatus != test.runStatus || stepStatus != test.stepStatus || !strings.Contains(string(summary), "AUTHORITATIVE_RUN_SUMMARY") || !strings.Contains(string(output), "AUTHORITATIVE_STEP_OUTPUT") || runCompleted == nil || stepCompleted == nil || !runCompleted.Equal(completed) || !stepCompleted.Equal(completed) {
+				t.Fatalf("authoritative lifecycle regressed run=%s summary=%s run_completed=%v step=%s output=%s step_completed=%v", runStatus, summary, runCompleted, stepStatus, output, stepCompleted)
+			}
+		})
+	}
+}
+
+func TestStaleWorkflowSaveCannotOverwriteAcceptedResultLifecycle(t *testing.T) {
+	fixture := newScheduledResultFixture(t, "scheduled-stale-result-save", "probe.http")
+	action := scheduledProviderAction(fixture, 1)
+	admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, nil, "fixture")
+	step, tool, artifacts, result := fixture.validPayload()
+	applyScheduledProviderAdmission(tool, &result, admission)
+	if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission); err != nil {
+		t.Fatal(err)
+	}
+	before := resultFenceSnapshot(t, fixture)
+	stale := scheduledFixtureState(fixture, domain.RunRunning, domain.StepRunning)
+	materializeSyntheticWorkflowState(t, fixture.env.store, fixture.env.ctx, stale)
+	if err := fixture.env.store.SaveWorkflowState(fixture.context(), stale); !errors.Is(err, workflow.ErrWorkflowLifecycleConflict) {
+		t.Fatalf("scheduled stale save error=%v", err)
+	}
+	after := resultFenceSnapshot(t, fixture)
+	if after != before {
+		t.Fatalf("stale scheduled save changed accepted result lifecycle\nbefore=%s\nafter=%s", before, after)
+	}
+	assertWorkflowRecoveryStatus(t, fixture.env, fixture.lineage.runID, domain.RunRunning)
+	assertStepRecoveryStatus(t, fixture.env, fixture.stepID, domain.StepSucceeded)
+	assertProviderResultDecisionCount(t, fixture, admission.ProviderAttemptID, "provider_result_accepted", "", 1)
 }
 
 func TestPersistResultRecoveryConcurrency(t *testing.T) {
@@ -1339,7 +1566,9 @@ func TestPersistResultRecoveryConcurrency(t *testing.T) {
 		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE scheduled_executions SET lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, fixture.lineage.execution.ID); err != nil {
 			t.Fatal(err)
 		}
-		if err := fixture.env.store.SaveWorkflowState(fixture.context(), scheduledFixtureState(fixture, domain.RunCompleted, domain.StepSucceeded)); err != nil {
+		state := scheduledFixtureState(fixture, domain.RunCompleted, domain.StepSucceeded)
+		materializeSyntheticWorkflowState(t, fixture.env.store, fixture.env.ctx, state)
+		if err := fixture.env.store.SaveWorkflowState(fixture.context(), state); err != nil {
 			t.Fatal(err)
 		}
 		expireRecoveryLease(t, fixture.env, fixture.lineage.execution.ID, 1)
@@ -1544,6 +1773,17 @@ func makeTerminalFailedResult(step *domain.StepRun, result *domain.ActionResult)
 	result.Error = &domain.StructuredError{Classification: step.ErrorClassification, Message: step.ErrorDetails, Retryable: false}
 }
 
+func makeCancelledResult(step *domain.StepRun, result *domain.ActionResult) {
+	now := time.Now().UTC()
+	step.Status = domain.StepCancelled
+	step.CompletedAt = &now
+	step.ErrorClassification = "cancelled"
+	step.ErrorDetails = context.Canceled.Error()
+	result.Status = "cancelled"
+	result.Summary = "provider execution cancelled"
+	result.Error = &domain.StructuredError{Classification: step.ErrorClassification, Message: step.ErrorDetails, Retryable: false}
+}
+
 func assertPersistedStepState(t *testing.T, fixture scheduledResultFixture, status domain.StepStatus, attemptCount int, completed bool) {
 	t.Helper()
 	var gotStatus domain.StepStatus
@@ -1612,7 +1852,8 @@ func scheduledFixtureState(fixture scheduledResultFixture, runStatus domain.RunS
 	if recoveryStepTerminal(stepStatus) {
 		stepCompletedAt = &now
 	}
-	return &workflow.State{Run: domain.WorkflowRun{ID: fixture.lineage.runID, TaskID: fixture.lineage.task.ID, WorkflowDefinitionID: fixture.env.definitionID, WorkflowVersion: "1", Status: runStatus, StartedAt: &now, CompletedAt: runCompletedAt, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{"provider": {Run: domain.StepRun{ID: fixture.stepID, WorkflowRunID: fixture.lineage.runID, StepDefinitionID: "provider", Capability: fixture.capability, Status: stepStatus, AttemptCount: 1, Input: json.RawMessage(`{}`), Output: json.RawMessage(`{"preserved":true}`), StartedAt: &now, CompletedAt: stepCompletedAt, IdempotencyKey: fixture.idempotencyKey, ApprovalState: "not_required"}}}}
+	input := json.RawMessage(`{"input": "preserved"}`)
+	return &workflow.State{Run: domain.WorkflowRun{ID: fixture.lineage.runID, TaskID: fixture.lineage.task.ID, WorkflowDefinitionID: fixture.env.definitionID, WorkflowVersion: "1", Status: runStatus, StartedAt: &now, CompletedAt: runCompletedAt, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{"provider": {Run: domain.StepRun{ID: fixture.stepID, WorkflowRunID: fixture.lineage.runID, StepDefinitionID: "provider", Capability: fixture.capability, Status: stepStatus, AttemptCount: 1, Input: input, Output: json.RawMessage(`{"preserved":true}`), StartedAt: &now, CompletedAt: stepCompletedAt, IdempotencyKey: fixture.idempotencyKey, ApprovalState: "not_required"}, InputHash: workflow.InputDigest(input)}}}
 }
 
 func assertScheduledResultRejectedNoMutation(t *testing.T, fixture scheduledResultFixture, ctx context.Context, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult) {

@@ -2,7 +2,15 @@
 
 Workflow definitions contain stable capability names, typed JSON inputs, dependency IDs, bounded retries, timeouts, supported conditions, and explicit output bindings. Validation rejects cycles, unknown capabilities, invalid JSON, missing dependencies, unsupported conditions, undeclared binding sources, and bindings or output conditions that reference paths absent from the source capability's output schema. Output-path validation walks nested object properties, array item schemas, local `$defs` references, and the `[]` binding notation. There is no command or script field.
 
+Built-in workflow templates are immutable releases. `continuous-web-recon` 2.4.0 and `authorized-web-baseline` 1.4.0 each have a fixed UUID and use materializer revision `web-recon/v1`. A release change requires a workflow version bump and a new template UUID; the materializer revision changes only when materialization semantics change. Source-controlled representative materialization digests guard this release contract without hashing source code.
+
+The database template row contains only the built-in descriptor and static release metadata. At initial WorkflowRun creation, the exact scope-derived definition is canonicalized, digested, and persisted atomically with its original scope version. Resume, retry, process restart, and scheduled continuation use that pinned snapshot; they never call the current builder to reinterpret the run. Current scope and policy still deny or narrow execution, but cannot add targets or rematerialize the stored graph.
+
+Pinned passive-discovery roots retain the stable semantic IDs of the include rules that originally derived them. Immediately before Subfinder or GAU admission, the current scope must still contain at least one of those exact source rules with a provably executable finite protocol, port, and initial-path basis that is not fully vetoed by current exclusions. An unrelated exact-host or wildcard include cannot transfer authority to the pinned root, current-only roots are never injected, and an ambiguous basis fails closed with zero provider traffic.
+
 The engine persists before and after each meaningful state transition. A resumed run retains a succeeded step when its normalized input hash is unchanged. It reruns only when the definition opts into input-change reruns or the operator starts an explicit retry. Pause, cancellation, skipped steps, retryable failures, approvals, and terminal states are distinct.
+
+For steps that add historical observations, execution persists the enriched effective StepRun input before provider admission. That first effective input is authoritative across provider retries and WorkflowRun resume; newer observations cannot change an already-attempted StepRun.
 
 Ready steps execute in deterministic waves. Every step in a wave has satisfied dependencies; independent branches may run concurrently, while their completion transitions are committed in stable topological order. Bindings and conditions must reference a transitive dependency, preventing a custom definition from reading an unordered branch.
 
@@ -16,11 +24,11 @@ Every definition receives a deterministic target-plan digest. Exact host rules y
 
 ## `continuous-web-recon`
 
-Version `2.3.0` runs passive discovery only for planned roots, filters each result, merges authorized discovered URLs with exact seeds, then runs DNSx, an optional authorized port intersection in Naabu, HTTPX, asset comparison, crawling, GAU, endpoint classification, a preliminary recon brief, an optional approved safe Nuclei profile, and a scanner-enriched brief. It supports multiple unrelated domains without `--domain`.
+Version `2.4.0` runs passive discovery only for planned roots that remain provably authorized after current exclusions, filters each result, merges authorized discovered URLs with exact seeds, then runs DNSx, an optional authorized port intersection in Naabu, HTTPX, asset comparison, crawling, GAU, endpoint classification, a preliminary recon brief, an optional approved safe Nuclei profile, and a scanner-enriched brief. It supports multiple unrelated domains without `--domain`.
 
 ## `authorized-web-baseline`
 
-Version `1.3.0` starts only from scope-derived exact seeds, then resolves, optionally scans a common authorized port intersection, probes, compares, crawls changed assets, classifies endpoints, emits a preliminary recon brief, pauses for optional Nuclei approval, and emits a scanner-enriched brief after approved scanner evidence exists. It needs no discovery root.
+Version `1.4.0` starts only from scope-derived exact seeds, then resolves, optionally scans a common authorized port intersection, probes, compares, crawls changed assets, classifies endpoints, emits a preliminary recon brief, pauses for optional Nuclei approval, and emits a scanner-enriched brief after approved scanner evidence exists. It needs no discovery root.
 
 HTTP observations are routed deterministically: 2xx assets may be crawled, 2xx/redirect/authentication responses may enter the approved safe scan profile, and other statuses are retained as observations but not scanned.
 

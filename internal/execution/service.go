@@ -27,6 +27,8 @@ type Service struct {
 }
 type ResultStore interface {
 	PreviousObservationValues(context.Context, domain.ID, domain.ID, string) ([]string, error)
+	LoadEffectiveStepInput(context.Context, domain.ID, domain.ActionRequest) (json.RawMessage, bool, error)
+	PersistEffectiveStepInput(context.Context, domain.ID, domain.ActionRequest, json.RawMessage) (json.RawMessage, error)
 	PersistResult(context.Context, domain.ID, domain.StepRun, *domain.ToolRun, []domain.Artifact, domain.ActionResult, *capability.ResultAdmissionProvenance) error
 }
 
@@ -45,7 +47,18 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 			req.InvocationRecorder = recorder
 		}
 	}
-	if req.Action.Capability == "compare.assets" {
+	effectivePersisted := false
+	if s.Store != nil && req.Action.StepRunID != "" {
+		persisted, found, loadErr := s.Store.LoadEffectiveStepInput(ctx, s.ProgramID, req.Action)
+		if loadErr != nil {
+			return capability.Result{}, loadErr
+		}
+		if found {
+			req.Action.Input = append(json.RawMessage(nil), persisted...)
+			effectivePersisted = true
+		}
+	}
+	if !effectivePersisted && req.Action.Capability == "compare.assets" {
 		if s.Store == nil {
 			return capability.Result{}, fmt.Errorf("result store is required")
 		}
@@ -72,7 +85,7 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 			}
 		}
 	}
-	if req.Action.Capability == "classify.endpoint" {
+	if !effectivePersisted && req.Action.Capability == "classify.endpoint" {
 		if s.Store == nil {
 			return capability.Result{}, fmt.Errorf("result store is required")
 		}
@@ -99,8 +112,22 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 			}
 		}
 	}
+	if s.Store != nil && req.Action.StepRunID != "" {
+		persisted, persistErr := s.Store.PersistEffectiveStepInput(ctx, s.ProgramID, req.Action, req.Action.Input)
+		if persistErr != nil {
+			return capability.Result{}, persistErr
+		}
+		req.Action.Input = append(json.RawMessage(nil), persisted...)
+	}
 	result, executionErr := s.Registry.Execute(ctx, req)
-	if executionErr != nil && result.Action.Error == nil {
+	result.EffectiveInput = append(json.RawMessage(nil), req.Action.Input...)
+	callerCancelled := executionErr != nil && errors.Is(context.Cause(ctx), context.Canceled)
+	if callerCancelled {
+		result.Action.RequestID = req.Action.ID
+		result.Action.Status = "cancelled"
+		result.Action.Summary = "capability execution cancelled"
+		result.Action.Error = &domain.StructuredError{Classification: "cancelled", Message: context.Canceled.Error(), Retryable: false}
+	} else if executionErr != nil && result.Action.Error == nil {
 		result.Action = domain.ActionResult{RequestID: req.Action.ID, Status: "failed", Summary: "capability execution failed", Error: &domain.StructuredError{Classification: "execution", Message: executionErr.Error(), Retryable: false}}
 	}
 	tool := result.ToolRun
@@ -170,11 +197,11 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 	now := time.Now().UTC()
 	step := domain.StepRun{ID: req.Action.StepRunID, WorkflowRunID: req.Action.WorkflowRunID, Capability: req.Action.Capability, Status: domain.StepSucceeded, Output: result.Action.Output, CompletedAt: &now, IdempotencyKey: req.Action.IdempotencyKey}
 	if executionErr != nil {
-		step.Status = domain.StepFailed
+		step.Status = map[bool]domain.StepStatus{true: domain.StepCancelled, false: domain.StepFailed}[callerCancelled]
 		if result.Action.Error != nil {
 			step.ErrorClassification = result.Action.Error.Classification
 			step.ErrorDetails = result.Action.Error.Message
-			if result.Action.Error.Retryable {
+			if result.Action.Error.Retryable && !callerCancelled {
 				step.Status = domain.StepRetryable
 				step.CompletedAt = nil
 			}

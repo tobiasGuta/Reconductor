@@ -32,21 +32,27 @@ func (failingRunner) Run(context.Context, string, []string, []byte) ([]byte, []b
 func (failingRunner) Version(context.Context, string, []string) (string, error) { return "test-1", nil }
 
 type capturedStore struct {
-	called      bool
-	step        domain.StepRun
-	tool        *domain.ToolRun
-	artifacts   []domain.Artifact
-	result      domain.ActionResult
-	admission   *capability.ResultAdmissionProvenance
-	err         error
-	previous    []string
-	loadedFor   string
-	policyID    domain.ID
-	startID     domain.ID
-	start       capability.ProviderInvocationStartRecord
-	terminal    capability.ProviderInvocationTerminalRecord
-	startErr    error
-	terminalErr error
+	called         bool
+	step           domain.StepRun
+	tool           *domain.ToolRun
+	artifacts      []domain.Artifact
+	result         domain.ActionResult
+	admission      *capability.ResultAdmissionProvenance
+	err            error
+	previous       []string
+	loadedFor      string
+	historyLoads   int
+	effective      json.RawMessage
+	effectiveFound bool
+	effectiveErr   error
+	effectiveLoads int
+	effectiveSaves int
+	policyID       domain.ID
+	startID        domain.ID
+	start          capability.ProviderInvocationStartRecord
+	terminal       capability.ProviderInvocationTerminalRecord
+	startErr       error
+	terminalErr    error
 }
 
 func (s *capturedStore) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
@@ -74,7 +80,23 @@ func (s *capturedStore) RecordProviderInvocationTerminal(_ context.Context, reco
 
 func (s *capturedStore) PreviousObservationValues(_ context.Context, _ domain.ID, _ domain.ID, capabilityName string) ([]string, error) {
 	s.loadedFor = capabilityName
+	s.historyLoads++
 	return append([]string(nil), s.previous...), nil
+}
+
+func (s *capturedStore) LoadEffectiveStepInput(context.Context, domain.ID, domain.ActionRequest) (json.RawMessage, bool, error) {
+	s.effectiveLoads++
+	return append(json.RawMessage(nil), s.effective...), s.effectiveFound, s.effectiveErr
+}
+
+func (s *capturedStore) PersistEffectiveStepInput(_ context.Context, _ domain.ID, _ domain.ActionRequest, input json.RawMessage) (json.RawMessage, error) {
+	if s.effectiveErr != nil {
+		return nil, s.effectiveErr
+	}
+	s.effectiveSaves++
+	s.effective = append(json.RawMessage(nil), input...)
+	s.effectiveFound = true
+	return append(json.RawMessage(nil), input...), nil
 }
 
 func TestHistoricalRecordsPreserveStructuredEvidenceAndUpgradeLegacyValues(t *testing.T) {
@@ -225,7 +247,8 @@ func TestClassifyExecutionLoadsPriorProbeEvidence(t *testing.T) {
 		Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}},
 		Scope:  allowedScope{},
 	}
-	if _, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req); err != nil {
+	result, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req)
+	if err != nil {
 		t.Fatal(err)
 	}
 	var captured struct {
@@ -237,8 +260,42 @@ func TestClassifyExecutionLoadsPriorProbeEvidence(t *testing.T) {
 	if store.loadedFor != "probe.http" || len(captured.History) != 1 || captured.History[0]["status_code"] != float64(401) {
 		t.Fatalf("loaded_for=%q input=%s", store.loadedFor, classifier.input)
 	}
+	if store.effectiveSaves != 1 || string(store.effective) != string(classifier.input) || string(result.EffectiveInput) != string(classifier.input) {
+		t.Fatalf("effective input was not frozen before execution: saves=%d persisted=%s provider=%s result=%s", store.effectiveSaves, store.effective, classifier.input, result.EffectiveInput)
+	}
 	if store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != store.startID || store.tool.Provider != "classify.endpoint" || store.admission == nil || store.admission.Provider != "classify.endpoint" {
 		t.Fatalf("platform-synthesized provider ToolRun lost attempt identity: tool=%#v start=%s", store.tool, store.startID)
+	}
+}
+
+func TestClassifyExecutionReusesFrozenHistoricalEnrichmentAcrossRetry(t *testing.T) {
+	registry := capability.NewRegistry()
+	classifier := &inputCaptureCapability{}
+	if err := registry.Register(classifier); err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{previous: []string{`{"provider":"httpx","kind":"url","target":"https://first.test/","status_code":200}`}}
+	programID, taskID, runID, stepID := domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID()
+	input := json.RawMessage(`{"active":[],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan"}`)
+	request := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "classify.endpoint", Input: input, IdempotencyKey: "frozen-history", StepAttempt: 1}, Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}}, Scope: allowedScope{}}
+	service := Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: programID}
+	if _, err := service.Execute(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	first := append(json.RawMessage(nil), classifier.input...)
+	if store.historyLoads != 1 || store.effectiveSaves != 1 {
+		t.Fatalf("first attempt history_loads=%d effective_saves=%d", store.historyLoads, store.effectiveSaves)
+	}
+
+	store.previous = []string{`{"provider":"httpx","kind":"url","target":"https://newer.test/","status_code":500}`}
+	request.Action.ID = domain.NewID()
+	request.Action.StepAttempt = 2
+	request.Action.Input = input
+	if _, err := service.Execute(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if store.historyLoads != 1 || store.effectiveSaves != 2 || string(classifier.input) != string(first) {
+		t.Fatalf("retry rematerialized history: history_loads=%d effective_saves=%d first=%s retry=%s", store.historyLoads, store.effectiveSaves, first, classifier.input)
 	}
 }
 
@@ -538,6 +595,123 @@ func TestFailedProviderAttemptPersistsToolStepArtifactsAndOriginalError(t *testi
 	}
 	if !stderrSeen || !normalizedSeen || len(store.artifacts) < 2 {
 		t.Fatalf("failure artifacts missing: requests=%#v persisted=%#v", artifacts.requests, store.artifacts)
+	}
+}
+
+type contextErrorCapability struct {
+	err            error
+	waitForContext bool
+	started        chan struct{}
+	calls          int
+}
+
+func (*contextErrorCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "context.error", Version: "1", Risk: policy.Low}
+}
+
+func (*contextErrorCapability) Validate(context.Context, capability.Request) error { return nil }
+
+func (c *contextErrorCapability) Execute(ctx context.Context, _ capability.Request) (capability.Result, error) {
+	c.calls++
+	if c.started != nil {
+		close(c.started)
+	}
+	if c.waitForContext {
+		<-ctx.Done()
+		return capability.Result{}, ctx.Err()
+	}
+	return capability.Result{}, c.err
+}
+
+func executionContextErrorRequest() capability.Request {
+	return capability.Request{
+		Action: domain.ActionRequest{
+			ID:             domain.NewID(),
+			TaskID:         domain.NewID(),
+			WorkflowRunID:  domain.NewID(),
+			StepRunID:      domain.NewID(),
+			Capability:     "context.error",
+			Input:          json.RawMessage(`{}`),
+			IdempotencyKey: "context-error",
+			StepAttempt:    1,
+		},
+		Policy: policy.Policy{AllowedCapabilities: []string{"context.error"}},
+		Scope:  allowedScope{},
+	}
+}
+
+func TestOwningContextCancellationPersistsCancelledResult(t *testing.T) {
+	registry := capability.NewRegistry()
+	provider := &contextErrorCapability{waitForContext: true, started: make(chan struct{})}
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{}
+	service := Service{Registry: registry, Store: store, ProgramID: domain.NewID()}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	type executionOutcome struct {
+		result capability.Result
+		err    error
+	}
+	completed := make(chan executionOutcome, 1)
+	go func() {
+		result, err := service.Execute(ctx, executionContextErrorRequest())
+		completed <- executionOutcome{result: result, err: err}
+	}()
+	<-provider.started
+	cancel()
+	outcome := <-completed
+
+	if !errors.Is(outcome.err, context.Canceled) || !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("execution error=%v context error=%v", outcome.err, ctx.Err())
+	}
+	if provider.calls != 1 || !store.called || store.step.Status != domain.StepCancelled || store.step.CompletedAt == nil {
+		t.Fatalf("provider calls=%d persisted step=%#v", provider.calls, store.step)
+	}
+	if outcome.result.Action.Status != "cancelled" || outcome.result.Action.Error == nil || outcome.result.Action.Error.Classification != "cancelled" || store.result.Status != "cancelled" || store.step.ErrorClassification != "cancelled" {
+		t.Fatalf("result=%#v persisted_result=%#v step=%#v", outcome.result.Action, store.result, store.step)
+	}
+	if store.terminal.Outcome != capability.ProviderInvocationCancelled || store.admission == nil || store.admission.StepAttempt != 1 || store.admission.ProviderAttemptID != store.startID || store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != store.startID {
+		t.Fatalf("terminal=%#v admission=%#v tool=%#v start=%s", store.terminal, store.admission, store.tool, store.startID)
+	}
+}
+
+func TestProviderOriginatedContextCanceledWithActiveCallerRemainsFailure(t *testing.T) {
+	registry := capability.NewRegistry()
+	provider := &contextErrorCapability{err: context.Canceled}
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{}
+	ctx := context.Background()
+	result, err := (Service{Registry: registry, Store: store, ProgramID: domain.NewID()}).Execute(ctx, executionContextErrorRequest())
+	if !errors.Is(err, context.Canceled) || ctx.Err() != nil {
+		t.Fatalf("provider error=%v caller error=%v", err, ctx.Err())
+	}
+	if provider.calls != 1 || store.step.Status != domain.StepFailed || store.step.CompletedAt == nil || result.Action.Status != "failed" || result.Action.Error == nil || result.Action.Error.Classification != "execution" {
+		t.Fatalf("provider calls=%d result=%#v step=%#v", provider.calls, result.Action, store.step)
+	}
+	if store.terminal.Outcome != capability.ProviderInvocationCancelled {
+		t.Fatalf("provider terminal outcome=%s", store.terminal.Outcome)
+	}
+}
+
+func TestExecutionDeadlineExceededRemainsFailure(t *testing.T) {
+	registry := capability.NewRegistry()
+	provider := &contextErrorCapability{waitForContext: true}
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	result, err := (Service{Registry: registry, Store: store, ProgramID: domain.NewID()}).Execute(ctx, executionContextErrorRequest())
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("execution error=%v context error=%v", err, ctx.Err())
+	}
+	if provider.calls != 1 || store.step.Status != domain.StepFailed || store.step.CompletedAt == nil || result.Action.Status != "failed" || result.Action.Error == nil || result.Action.Error.Classification != "execution" {
+		t.Fatalf("provider calls=%d result=%#v step=%#v", provider.calls, result.Action, store.step)
 	}
 }
 

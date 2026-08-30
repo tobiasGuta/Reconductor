@@ -58,8 +58,8 @@ func TestBuiltInWorkflowSatisfiesRegisteredCapabilitySchemas(t *testing.T) {
 		wantVersion    string
 		wantEnrichment bool
 	}{
-		{definition: ContinuousWebRecon(plan, false), wantVersion: "2.3.0", wantEnrichment: true},
-		{definition: AuthorizedWebBaseline(plan, false), wantVersion: "1.3.0"},
+		{definition: ContinuousWebRecon(plan, false), wantVersion: "2.4.0", wantEnrichment: true},
+		{definition: AuthorizedWebBaseline(plan, false), wantVersion: "1.4.0"},
 	}
 	for _, test := range definitions {
 		t.Run(test.definition.Name, func(t *testing.T) {

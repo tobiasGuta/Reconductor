@@ -250,6 +250,7 @@ function installDocument() {
   document.register("run-lane");
   document.register("run-inspector");
   document.register("pending-scope-expansion-list");
+  document.register("changes-content");
   document.register("test-sidebar", "sidebar");
   const runNav = document.register("test-run-nav", "nav-item");
   runNav.dataset.view = "runs";
@@ -354,6 +355,87 @@ function workflowRun(id, status = "running", objective = `Objective ${id}`) {
     started_at: "2026-08-08T14:00:05Z",
   };
 }
+
+function consoleChangeItem(overrides = {}) {
+  return {
+    id: "change-1",
+    program_id: "program-1",
+    workflow_run_id: "run-1",
+    scheduled_execution_id: "execution-1",
+    kind: "new_or_changed",
+    entity_type: "asset",
+    entity_key: "https://example.test/",
+    priority: "medium",
+    title: "Persistent asset change",
+    summary: "A typed change is ready for review.",
+    reasons: ["current observation differs"],
+    previous: { status: 404 },
+    current: { status: 200 },
+    source_capabilities: ["compare.assets"],
+    evidence_artifact_ids: [],
+    observed_at: "2026-08-08T15:00:00Z",
+    created_at: "2026-08-08T15:00:00Z",
+    disposition: "unreviewed",
+    ...overrides,
+  };
+}
+
+test("dashboard change summary renders typed change_items without latest_changes", () => {
+  const document = installDocument();
+  app.state.data.change_items = [consoleChangeItem()];
+
+  assert.equal(Object.hasOwn(app.state.data, "latest_changes"), false);
+  app.renderChanges();
+
+  const text = document.querySelector("#changes-content").textContent;
+  assert.match(text, /0new1changed0removed/);
+  assert.doesNotMatch(text, /No persistent changes/);
+});
+
+test("dashboard change summary renders the typed empty state without latest_changes", () => {
+  const document = installDocument();
+  app.state.data.change_items = [];
+
+  assert.equal(Object.hasOwn(app.state.data, "latest_changes"), false);
+  app.renderChanges();
+
+  const text = document.querySelector("#changes-content").textContent;
+  assert.match(text, /0new0changed0removed/);
+  assert.match(text, /No persistent changes are available yet/);
+});
+
+test("dashboard change summary ignores removed provider-derived channels", () => {
+  const document = installDocument();
+  const providerOutput = "PROVIDER_OUTPUT_SENTINEL";
+  const workflowSummary = "WORKFLOW_RAW_SUMMARY_SENTINEL";
+  const auditDetails = "AUDIT_DETAILS_SENTINEL";
+  app.state.data.change_items = [consoleChangeItem({ provider_output: providerOutput })];
+  app.state.data.runs = [{ id: "run-1", summary: workflowSummary }];
+  app.state.data.audit_events = [{ id: "audit-1", details: auditDetails }];
+
+  assert.equal(Object.hasOwn(app.state.data, "latest_changes"), false);
+  app.renderChanges();
+
+  const text = document.querySelector("#changes-content").textContent;
+  assert.match(text, /1changed/);
+  assert.doesNotMatch(text, new RegExp(`${providerOutput}|${workflowSummary}|${auditDetails}`));
+});
+
+test("workflow topology is selected per run and legacy uses recorded steps only", () => {
+	installDocument();
+	const older = workflowRun("run-older");
+	const latest = workflowRun("run-latest");
+	const legacy = workflowRun("run-legacy");
+	app.state.data.workflow_topologies = {
+		"run-older": { availability: "materialized", steps: [{ id: "older-only", capability: "older", depends_on: [], approval_required: true }] },
+		"run-latest": { availability: "materialized", steps: [{ id: "latest-only", capability: "latest", depends_on: [], approval_required: false }] },
+		"run-legacy": { availability: "legacy_unavailable", steps: [] },
+	};
+	app.state.data.steps = [{ id: "legacy-step", workflow_run_id: "run-legacy", step_definition_id: "legacy-recorded", capability: "legacy", status: "succeeded", attempt_count: 1 }];
+	assert.deepEqual(app.latestRunSteps(older).map((step) => step.step_definition_id), ["older-only"]);
+	assert.deepEqual(app.latestRunSteps(latest).map((step) => step.step_definition_id), ["latest-only"]);
+	assert.deepEqual(app.latestRunSteps(legacy).map((step) => step.step_definition_id), ["legacy-recorded"]);
+});
 
 function workspaceProjection(executionID, workflowRunID, name = "Workspace baseline") {
   const value = projection(executionID, name);

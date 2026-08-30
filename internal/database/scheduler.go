@@ -300,6 +300,10 @@ func (s *Store) MarkScheduledExecutionPaused(ctx context.Context, id domain.ID, 
 	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionPausedOperator, owner, attempt, "", "", []domain.ScheduledExecutionStatus{domain.ScheduledExecutionRunning}, "scheduled_execution_paused", "scheduled execution paused by operator")
 }
 
+func (s *Store) MarkScheduledExecutionCheckpointUnavailable(ctx context.Context, id domain.ID, owner string, attempt int) error {
+	return s.markScheduledExecution(ctx, id, domain.ScheduledExecutionPausedOperator, owner, attempt, "checkpoint_unavailable", "workflow checkpoint is unavailable", []domain.ScheduledExecutionStatus{domain.ScheduledExecutionClaimed, domain.ScheduledExecutionRunning}, "scheduled_execution_checkpoint_unavailable", "scheduled execution paused because its workflow checkpoint is unavailable")
+}
+
 func (s *Store) MarkScheduledExecutionPausedForApproval(ctx context.Context, id domain.ID, owner string, attempt int) error {
 	err := s.markScheduledExecution(ctx, id, domain.ScheduledExecutionPausedForApproval, owner, attempt, "", "", []domain.ScheduledExecutionStatus{domain.ScheduledExecutionRunning}, "scheduled_execution_paused_for_approval", "scheduled execution paused for approval")
 	if err == nil {

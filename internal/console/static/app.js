@@ -259,7 +259,7 @@ function renderMetrics() {
 function latestRunSteps(run) {
   if (!run) return [];
   const actual = (state.data.steps || []).filter((step) => step.workflow_run_id === run.id);
-  const definition = state.data.workflow_definition?.steps || [];
+	const definition = state.data.workflow_topologies?.[run.id]?.steps || [];
   if (!definition.length) return actual.sort((a, b) => String(a.started_at || "").localeCompare(String(b.started_at || "")));
   return definition.map((defined) => actual.find((item) => item.step_definition_id === defined.id) || {
     step_definition_id: defined.id,
@@ -281,6 +281,9 @@ function renderWorkflow(run) {
   }
   const left = element("div");
   left.append(element("strong", "", run.objective), element("small", "", `${run.workflow_name} · v${run.workflow_version}`));
+	if (state.data.workflow_topologies?.[run.id]?.availability === "legacy_unavailable") {
+    left.append(element("small", "", "Legacy topology unavailable · showing recorded steps only"));
+  }
   const right = element("div");
   right.append(statusBadge(run.status), element("small", "mono", `run ${shortID(run.id)}`));
   setChildren(summary, left, right);
@@ -326,15 +329,16 @@ function renderScope() {
 }
 
 function changeRows() {
-  const summary = state.data.latest_changes || {};
-  return Array.isArray(summary.changes) ? summary.changes : [];
+  return Array.isArray(state.data?.change_items) ? state.data.change_items : [];
 }
 
 function renderChanges() {
   const rows = changeRows();
-  const counts = { new: 0, changed: 0, removed: 0, new_or_changed: 0 };
-  rows.forEach((item) => { if (item?.kind in counts) counts[item.kind] += 1; });
-  if (counts.new_or_changed && !counts.new && !counts.changed) counts.changed = counts.new_or_changed;
+  const counts = { new: 0, changed: 0, removed: 0 };
+  rows.forEach((item) => {
+    if (item?.kind === "new_or_changed") counts.changed += 1;
+    else if (item?.kind in counts) counts[item.kind] += 1;
+  });
   const wrap = element("div", "change-stats");
   [["new", counts.new], ["changed", counts.changed], ["removed", counts.removed]].forEach(([kind, count]) => {
     const item = element("div", `change-stat ${kind}`);
@@ -342,7 +346,7 @@ function renderChanges() {
     wrap.append(item);
   });
   if (!rows.length) wrap.append();
-  setChildren($("#changes-content"), wrap, !rows.length ? empty("No completed comparison is available yet.") : null);
+  setChildren($("#changes-content"), wrap, !rows.length ? empty("No persistent changes are available yet.") : null);
 }
 
 function renderApprovalPreview() {
@@ -1558,12 +1562,10 @@ function confirmRetry(item) {
 function renderLogs() {
   const tools = state.data.tool_runs || [];
   setChildren($("#tool-list"), ...(tools.length ? tools.map((item) => {
-    const card = element("div", "list-card tool-card");
-    const copy = element("div");
-    copy.append(element("h3", "", `${item.provider}${item.tool_version ? ` · ${item.tool_version}` : ""}`), element("p", "", `${item.step_definition_id} · run ${shortID(item.workflow_run_id)} · ${relativeTime(item.started_at)}`));
-    const args = element("pre", "args", JSON.stringify(item.sanitized_arguments || {}, null, 2));
-    copy.append(args);
-    const meta = element("div", "run-meta");
+	const card = element("div", "list-card tool-card");
+	const copy = element("div");
+	copy.append(element("h3", "", `${item.provider}${item.tool_version ? ` · ${item.tool_version}` : ""}`), element("p", "", `${item.step_definition_id} · run ${shortID(item.workflow_run_id)} · ${relativeTime(item.started_at)}`));
+	const meta = element("div", "run-meta");
     const outcome = item.timed_out ? "timed out" : item.exit_code == null ? "running" : `exit ${item.exit_code}`;
     meta.append(element("span", "", `${item.artifact_count} safe artifacts`), statusBadge(item.timed_out || (item.exit_code != null && item.exit_code !== 0) ? "failed" : outcome === "running" ? "running" : "succeeded"));
     card.append(copy, meta);
@@ -2055,12 +2057,14 @@ if (typeof module !== "undefined" && module.exports) {
     buildRunSelectorEntries,
     containDrawerTab,
     handleDocumentKeydown,
+	latestRunSteps,
     partitionRunRelationships,
     state,
     closeDrawer,
     openExecutionWorkspace,
     openExecutionDetail,
     openRunDrawer,
+    renderChanges,
     renderExecutionProjection,
     renderRuns,
     renderSchedules,

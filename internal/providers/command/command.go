@@ -165,6 +165,22 @@ func (p *Provider) Validate(_ context.Context, req capability.Request) error {
 			return fmt.Errorf("discovery root %q: %w", root, err)
 		}
 	}
+	if len(domains) > 0 {
+		currentScope, ok := req.Scope.(targeting.PassiveDiscoveryScope)
+		if !ok {
+			return fmt.Errorf("passive discovery requires current target-plan scope")
+		}
+		unauthorized := make([]string, 0)
+		for _, root := range domains {
+			if !currentScope.AllowsDiscoveryRoot(root) {
+				unauthorized = append(unauthorized, root)
+			}
+		}
+		if len(unauthorized) > 0 {
+			sort.Strings(unauthorized)
+			return fmt.Errorf("passive discovery roots are outside the current target plan: %s", strings.Join(unauthorized, ", "))
+		}
+	}
 	for _, target := range in.Targets {
 		if !strings.Contains(target, "://") {
 			return fmt.Errorf("active target %q must be an authorized URL with explicit protocol", target)

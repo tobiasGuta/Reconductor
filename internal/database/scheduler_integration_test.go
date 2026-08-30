@@ -30,9 +30,7 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 	if err := store.CreateProgram(ctx, program, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CreateWorkflowDefinition(ctx, definitionID, "scheduler-integration", "1", "synthetic", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
-	}
+	ensureSyntheticWorkflowTemplate(t, store, ctx, definitionID, "scheduler-integration")
 
 	schedule := createIntegrationSchedule(t, ctx, store, programID, "primary")
 	execution, err := store.EnqueueRunNow(ctx, schedule.ID, "integration")
@@ -55,6 +53,7 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 		Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)},
 		Steps: map[string]*workflow.StepState{},
 	}
+	materializeSyntheticWorkflowState(t, store, ctx, state)
 	persister := WorkflowPersister{
 		Store: store,
 		File:  workflow.FileStore{Root: t.TempDir()},
@@ -111,6 +110,7 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 		Run:   domain.WorkflowRun{ID: rejectedRunID, TaskID: rejectedTask.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunPaused, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)},
 		Steps: map[string]*workflow.StepState{"gated": {Run: domain.StepRun{ID: rejectedStepID, WorkflowRunID: rejectedRunID, StepDefinitionID: "gated", Capability: "scan.nuclei", Status: domain.StepAwaitingApproval, Input: json.RawMessage(`{}`), IdempotencyKey: "gated", ApprovalState: "pending"}}},
 	}
+	materializeSyntheticWorkflowState(t, store, ctx, rejectedState)
 	rejectedPersister := WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		return store.MarkScheduledExecutionRunning(lifecycleCtx, rejectedExecution.ID, rejectedTask.ID, state.Run.ID, nil, "owner-b", rejectedExecution.AttemptCount)
 	}}
@@ -174,7 +174,7 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 	cancelledExecution := enqueueAndClaim(t, ctx, store, cancelledSchedule.ID, "owner-c", time.Minute)
 	cancelledTask := createIntegrationTask(t, ctx, store, programID, definitionID, "cancelled")
 	cancelledRun := domain.NewID()
-	if err := saveIntegrationRun(ctx, store, t.TempDir(), cancelledExecution.ID, cancelledTask, definitionID, cancelledRun, "owner-c", cancelledExecution.AttemptCount, now); err != nil {
+	if err := saveIntegrationRun(t, ctx, store, t.TempDir(), cancelledExecution.ID, cancelledTask, definitionID, cancelledRun, "owner-c", cancelledExecution.AttemptCount, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MarkScheduledExecutionCancelled(ctx, cancelledExecution.ID, "owner-c", cancelledExecution.AttemptCount); err != nil {
@@ -190,7 +190,7 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 	operatorSchedule := createIntegrationSchedule(t, ctx, store, programID, "operator-pause")
 	operatorExecution := enqueueAndClaim(t, ctx, store, operatorSchedule.ID, "owner-pause", time.Minute)
 	operatorTask := createIntegrationTask(t, ctx, store, programID, definitionID, "operator-pause")
-	if err := saveIntegrationRun(ctx, store, t.TempDir(), operatorExecution.ID, operatorTask, definitionID, domain.NewID(), "owner-pause", operatorExecution.AttemptCount, now); err != nil {
+	if err := saveIntegrationRun(t, ctx, store, t.TempDir(), operatorExecution.ID, operatorTask, definitionID, domain.NewID(), "owner-pause", operatorExecution.AttemptCount, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MarkScheduledExecutionPaused(ctx, operatorExecution.ID, "owner-pause", operatorExecution.AttemptCount); err != nil {
@@ -244,7 +244,7 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 	interruptedExecution := enqueueAndClaim(t, ctx, store, interruptedSchedule.ID, "old-owner", time.Minute)
 	interruptedTask := createIntegrationTask(t, ctx, store, programID, definitionID, "interrupted")
 	interruptedRun := domain.NewID()
-	if err := saveIntegrationRun(ctx, store, t.TempDir(), interruptedExecution.ID, interruptedTask, definitionID, interruptedRun, "old-owner", interruptedExecution.AttemptCount, now); err != nil {
+	if err := saveIntegrationRun(t, ctx, store, t.TempDir(), interruptedExecution.ID, interruptedTask, definitionID, interruptedRun, "old-owner", interruptedExecution.AttemptCount, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Pool.Exec(ctx, `UPDATE scheduled_executions SET lease_expires_at=now()-interval '1 second' WHERE id=$1`, interruptedExecution.ID); err != nil {
@@ -288,6 +288,49 @@ func TestScheduledExecutionLifecycleRecoveryAndOverlap(t *testing.T) {
 	}
 }
 
+func TestScheduledCheckpointUnavailablePausesClaimedOrRunningOccurrence(t *testing.T) {
+	store, ctx := schedulerIntegrationStore(t)
+	programID, definitionID := createSchedulerIntegrationProgram(t, ctx, store, "checkpoint-unavailable")
+
+	claimedSchedule := createIntegrationSchedule(t, ctx, store, programID, "checkpoint-claimed")
+	claimed := enqueueAndClaim(t, ctx, store, claimedSchedule.ID, "checkpoint-claimed-owner", time.Minute)
+	if err := store.MarkScheduledExecutionCheckpointUnavailable(ctx, claimed.ID, "checkpoint-claimed-owner", claimed.AttemptCount); err != nil {
+		t.Fatal(err)
+	}
+	assertScheduledCheckpointUnavailable(t, store, ctx, claimed.ID)
+
+	runningSchedule := createIntegrationSchedule(t, ctx, store, programID, "checkpoint-running")
+	running := enqueueAndClaim(t, ctx, store, runningSchedule.ID, "checkpoint-running-owner", time.Minute)
+	task := createIntegrationTask(t, ctx, store, programID, definitionID, "checkpoint-running")
+	if err := store.MarkScheduledExecutionTaskCreated(ctx, running.ID, task.ID, "checkpoint-running-owner", running.AttemptCount); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	state := &workflow.State{Run: domain.WorkflowRun{ID: domain.NewID(), TaskID: task.ID, Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{}}
+	materializeSyntheticWorkflowState(t, store, ctx, state)
+	if err := (WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
+		return store.MarkScheduledExecutionRunning(lifecycleCtx, running.ID, task.ID, state.Run.ID, state.Run.OriginalScopeVersionID, "checkpoint-running-owner", running.AttemptCount)
+	}}).Save(WithScheduledExecutionFence(ctx, ScheduledExecutionFence{ExecutionID: running.ID, LeaseOwner: "checkpoint-running-owner", Attempt: running.AttemptCount}), state); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkScheduledExecutionCheckpointUnavailable(ctx, running.ID, "checkpoint-running-owner", running.AttemptCount); err != nil {
+		t.Fatal(err)
+	}
+	assertScheduledCheckpointUnavailable(t, store, ctx, running.ID)
+}
+
+func assertScheduledCheckpointUnavailable(t *testing.T, store *Store, ctx context.Context, id domain.ID) {
+	t.Helper()
+	var status domain.ScheduledExecutionStatus
+	var classification string
+	if err := store.Pool.QueryRow(ctx, `SELECT status,error_classification FROM scheduled_executions WHERE id=$1`, id).Scan(&status, &classification); err != nil {
+		t.Fatal(err)
+	}
+	if status != domain.ScheduledExecutionPausedOperator || classification != "checkpoint_unavailable" {
+		t.Fatalf("checkpoint state status=%s classification=%q", status, classification)
+	}
+}
+
 func TestWorkflowLifecycleRollbackIsAtomic(t *testing.T) {
 	store, ctx := schedulerIntegrationStore(t)
 	now := time.Now().UTC()
@@ -297,9 +340,7 @@ func TestWorkflowLifecycleRollbackIsAtomic(t *testing.T) {
 	if err := store.CreateProgram(ctx, program, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CreateWorkflowDefinition(ctx, definitionID, "atomic", "1", "synthetic", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
-	}
+	ensureSyntheticWorkflowTemplate(t, store, ctx, definitionID, "atomic")
 	schedule := createIntegrationSchedule(t, ctx, store, programID, "atomic")
 	execution := enqueueAndClaim(t, ctx, store, schedule.ID, "atomic-owner", time.Minute)
 	task := createIntegrationTask(t, ctx, store, programID, definitionID, "atomic")
@@ -308,6 +349,7 @@ func TestWorkflowLifecycleRollbackIsAtomic(t *testing.T) {
 	}
 	runID := domain.NewID()
 	state := &workflow.State{Run: domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{}}
+	materializeSyntheticWorkflowState(t, store, ctx, state)
 	persister := WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		if err := store.MarkScheduledExecutionRunning(lifecycleCtx, execution.ID, task.ID, state.Run.ID, nil, "atomic-owner", execution.AttemptCount); err != nil {
 			return err
@@ -885,6 +927,7 @@ func TestApprovalAcceptanceStillRequiresExplicitResume(t *testing.T) {
 		Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunPaused, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)},
 		Steps: map[string]*workflow.StepState{"gated": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "gated", Capability: "scan.nuclei", Status: domain.StepAwaitingApproval, Input: json.RawMessage(`{}`), IdempotencyKey: "approval-resume", ApprovalState: "pending"}}},
 	}
+	materializeSyntheticWorkflowState(t, store, ctx, state)
 	persister := WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		return store.MarkScheduledExecutionRunning(lifecycleCtx, execution.ID, task.ID, state.Run.ID, nil, "approval-owner", execution.AttemptCount)
 	}}
@@ -965,9 +1008,7 @@ func createSchedulerIntegrationProgram(t *testing.T, ctx context.Context, store 
 	if err := store.CreateProgram(ctx, program, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CreateWorkflowDefinition(ctx, definitionID, name, "1", "synthetic", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
-	}
+	ensureSyntheticWorkflowTemplate(t, store, ctx, definitionID, name)
 	return programID, definitionID
 }
 
@@ -1102,11 +1143,13 @@ func enqueueAndClaim(t *testing.T, ctx context.Context, store *Store, scheduleID
 	return claimed
 }
 
-func saveIntegrationRun(ctx context.Context, store *Store, root string, executionID domain.ID, task domain.Task, definitionID, runID domain.ID, owner string, attempt int, now time.Time) error {
+func saveIntegrationRun(t *testing.T, ctx context.Context, store *Store, root string, executionID domain.ID, task domain.Task, definitionID, runID domain.ID, owner string, attempt int, now time.Time) error {
+	t.Helper()
 	if err := store.MarkScheduledExecutionTaskCreated(ctx, executionID, task.ID, owner, attempt); err != nil {
 		return err
 	}
 	state := &workflow.State{Run: domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{}}
+	materializeSyntheticWorkflowState(t, store, ctx, state)
 	fencedCtx := WithScheduledExecutionFence(ctx, ScheduledExecutionFence{ExecutionID: executionID, LeaseOwner: owner, Attempt: attempt})
 	return (WorkflowPersister{Store: store, File: workflow.FileStore{Root: root}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		return store.MarkScheduledExecutionRunning(lifecycleCtx, executionID, task.ID, state.Run.ID, nil, owner, attempt)

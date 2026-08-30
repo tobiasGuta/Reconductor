@@ -213,7 +213,8 @@ func TestAssetObservationEmissionStructuralIntegrity(t *testing.T) {
 	assertObservationEmissionInsertRejected(t, fixture, fixture.env.programID, observationID, wrongTypeEventID, "asset observation emission lineage is inconsistent")
 
 	otherRunID := domain.NewID()
-	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,trigger_source) VALUES($1,$2,$3,'1','running','integration')`, otherRunID, fixture.lineage.task.ID, fixture.env.definitionID); err != nil {
+	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,trigger_source,materialized_definition,materialization_digest,original_scope_version_id)
+		SELECT $1,$2,$3,'1','running','integration',materialized_definition,materialization_digest,original_scope_version_id FROM workflow_runs WHERE id=$4`, otherRunID, fixture.lineage.task.ID, fixture.env.definitionID, fixture.lineage.runID); err != nil {
 		t.Fatal(err)
 	}
 	wrongRunEventID := insertSyntheticAcceptedEvent(t, fixture, tool.ID, admission.ProviderAttemptID, otherRunID, "probe.http")
