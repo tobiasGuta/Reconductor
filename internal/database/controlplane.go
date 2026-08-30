@@ -8,33 +8,46 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
 // ConsoleSnapshot is the read model consumed by the local operator console.
 // It intentionally excludes artifact storage paths, raw provider output, step
 // input, and other fields that could disclose credentials or unredacted data.
 type ConsoleSnapshot struct {
-	GeneratedAt            time.Time                      `json:"generated_at"`
-	SelectedProgramID      domain.ID                      `json:"selected_program_id,omitempty"`
-	Programs               []domain.Program               `json:"programs"`
-	Scope                  *ConsoleScope                  `json:"scope,omitempty"`
-	Stats                  ConsoleStats                   `json:"stats"`
-	Runs                   []ConsoleRun                   `json:"runs"`
-	Steps                  []ConsoleStep                  `json:"steps"`
-	Tools                  []ConsoleToolRun               `json:"tool_runs"`
-	Assets                 []ConsoleAsset                 `json:"assets"`
-	Candidates             []ConsoleCandidate             `json:"candidate_findings"`
-	Verifications          []ConsoleVerification          `json:"verification_results"`
-	VerifiedFindings       []ConsoleVerifiedFinding       `json:"verified_findings"`
-	Approvals              []ConsoleApproval              `json:"approvals"`
-	Schedules              []domain.Schedule              `json:"schedules"`
-	ScheduledExecutions    []domain.ScheduledExecution    `json:"scheduled_executions"`
-	ChangeItems            []ConsoleChangeItem            `json:"change_items"`
-	PendingScopeExpansions []ConsolePendingScopeExpansion `json:"pending_scope_expansions"`
-	AuditEvents            []ConsoleAuditEvent            `json:"audit_events"`
-	LatestChanges          json.RawMessage                `json:"latest_changes"`
-	WorkflowDefinition     json.RawMessage                `json:"workflow_definition,omitempty"`
+	GeneratedAt            time.Time                             `json:"generated_at"`
+	SelectedProgramID      domain.ID                             `json:"selected_program_id,omitempty"`
+	Programs               []domain.Program                      `json:"programs"`
+	Scope                  *ConsoleScope                         `json:"scope,omitempty"`
+	Stats                  ConsoleStats                          `json:"stats"`
+	Runs                   []ConsoleRun                          `json:"runs"`
+	Steps                  []ConsoleStep                         `json:"steps"`
+	Tools                  []ConsoleToolRun                      `json:"tool_runs"`
+	Assets                 []ConsoleAsset                        `json:"assets"`
+	Candidates             []ConsoleCandidate                    `json:"candidate_findings"`
+	Verifications          []ConsoleVerification                 `json:"verification_results"`
+	VerifiedFindings       []ConsoleVerifiedFinding              `json:"verified_findings"`
+	Approvals              []ConsoleApproval                     `json:"approvals"`
+	Schedules              []domain.Schedule                     `json:"schedules"`
+	ScheduledExecutions    []domain.ScheduledExecution           `json:"scheduled_executions"`
+	ChangeItems            []ConsoleChangeItem                   `json:"change_items"`
+	PendingScopeExpansions []ConsolePendingScopeExpansion        `json:"pending_scope_expansions"`
+	AuditEvents            []ConsoleAuditEvent                   `json:"audit_events"`
+	WorkflowTopologies     map[domain.ID]ConsoleWorkflowTopology `json:"workflow_topologies"`
+}
+
+type ConsoleWorkflowTopology struct {
+	Availability string                        `json:"availability"`
+	Steps        []ConsoleWorkflowTopologyStep `json:"steps"`
+}
+
+type ConsoleWorkflowTopologyStep struct {
+	ID               string   `json:"id"`
+	Capability       string   `json:"capability"`
+	DependsOn        []string `json:"depends_on"`
+	ApprovalRequired bool     `json:"approval_required"`
 }
 
 type ConsoleScope struct {
@@ -82,7 +95,6 @@ type ConsoleRun struct {
 	StartedAt       *time.Time       `json:"started_at,omitempty"`
 	CompletedAt     *time.Time       `json:"completed_at,omitempty"`
 	TriggerSource   string           `json:"trigger_source"`
-	Summary         json.RawMessage  `json:"summary"`
 }
 
 type ConsoleStep struct {
@@ -100,17 +112,16 @@ type ConsoleStep struct {
 }
 
 type ConsoleToolRun struct {
-	ID                 domain.ID       `json:"id"`
-	WorkflowRunID      domain.ID       `json:"workflow_run_id"`
-	StepDefinitionID   string          `json:"step_definition_id"`
-	Provider           string          `json:"provider"`
-	ToolVersion        string          `json:"tool_version"`
-	SanitizedArguments json.RawMessage `json:"sanitized_arguments"`
-	StartedAt          time.Time       `json:"started_at"`
-	CompletedAt        *time.Time      `json:"completed_at,omitempty"`
-	ExitCode           *int            `json:"exit_code,omitempty"`
-	TimedOut           bool            `json:"timed_out"`
-	ArtifactCount      int             `json:"artifact_count"`
+	ID               domain.ID  `json:"id"`
+	WorkflowRunID    domain.ID  `json:"workflow_run_id"`
+	StepDefinitionID string     `json:"step_definition_id"`
+	Provider         string     `json:"provider"`
+	ToolVersion      string     `json:"tool_version"`
+	StartedAt        time.Time  `json:"started_at"`
+	CompletedAt      *time.Time `json:"completed_at,omitempty"`
+	ExitCode         *int       `json:"exit_code,omitempty"`
+	TimedOut         bool       `json:"timed_out"`
+	ArtifactCount    int        `json:"artifact_count"`
 }
 
 type ConsoleAsset struct {
@@ -190,16 +201,15 @@ type ConsoleChangeItem struct {
 }
 
 type ConsoleAuditEvent struct {
-	ID            domain.ID       `json:"id"`
-	OccurredAt    time.Time       `json:"occurred_at"`
-	EventType     string          `json:"event_type"`
-	Component     string          `json:"component"`
-	Actor         string          `json:"actor"`
-	WorkflowRunID *domain.ID      `json:"workflow_run_id,omitempty"`
-	Capability    *string         `json:"capability,omitempty"`
-	Provider      *string         `json:"provider,omitempty"`
-	SafeMessage   string          `json:"safe_message"`
-	Details       json.RawMessage `json:"details"`
+	ID            domain.ID  `json:"id"`
+	OccurredAt    time.Time  `json:"occurred_at"`
+	EventType     string     `json:"event_type"`
+	Component     string     `json:"component"`
+	Actor         string     `json:"actor"`
+	WorkflowRunID *domain.ID `json:"workflow_run_id,omitempty"`
+	Capability    *string    `json:"capability,omitempty"`
+	Provider      *string    `json:"provider,omitempty"`
+	SafeMessage   string     `json:"safe_message"`
 }
 
 func (s *Store) ConsoleSnapshot(ctx context.Context, requestedProgramID domain.ID) (ConsoleSnapshot, error) {
@@ -223,7 +233,7 @@ func (s *Store) ConsoleSnapshot(ctx context.Context, requestedProgramID domain.I
 		ChangeItems:            []ConsoleChangeItem{},
 		PendingScopeExpansions: []ConsolePendingScopeExpansion{},
 		AuditEvents:            []ConsoleAuditEvent{},
-		LatestChanges:          json.RawMessage(`{}`),
+		WorkflowTopologies:     map[domain.ID]ConsoleWorkflowTopology{},
 	}
 	if len(programs) == 0 {
 		return snapshot, nil
@@ -268,11 +278,6 @@ func (s *Store) ConsoleSnapshot(ctx context.Context, requestedProgramID domain.I
 		return ConsoleSnapshot{}, err
 	}
 	if err := s.loadConsoleAudit(ctx, selected, &snapshot); err != nil {
-		return ConsoleSnapshot{}, err
-	}
-	if changes, err := s.LatestChanges(ctx, selected); err == nil {
-		snapshot.LatestChanges = changes
-	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return ConsoleSnapshot{}, err
 	}
 	return snapshot, nil
@@ -347,26 +352,35 @@ func (s *Store) loadConsoleStats(ctx context.Context, programID domain.ID, out *
 }
 
 func (s *Store) loadConsoleRuns(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {
-	rows, err := s.Pool.Query(ctx, `SELECT wr.id,wr.task_id,t.objective,wd.name,wr.workflow_version,wr.status,wr.started_at,wr.completed_at,wr.trigger_source,wr.summary FROM workflow_runs wr JOIN tasks t ON t.id=wr.task_id JOIN workflow_definitions wd ON wd.id=wr.workflow_definition_id WHERE t.program_id=$1 ORDER BY COALESCE(wr.started_at,t.created_at) DESC LIMIT 40`, programID)
+	rows, err := s.Pool.Query(ctx, `SELECT wr.id,wr.task_id,t.objective,wd.name,wr.workflow_version,wr.status,wr.started_at,wr.completed_at,wr.trigger_source,wr.materialized_definition,wr.materialization_digest FROM workflow_runs wr JOIN tasks t ON t.id=wr.task_id JOIN workflow_definitions wd ON wd.id=wr.workflow_definition_id WHERE t.program_id=$1 ORDER BY COALESCE(wr.started_at,t.created_at) DESC LIMIT 40`, programID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var item ConsoleRun
-		if err := rows.Scan(&item.ID, &item.TaskID, &item.Objective, &item.WorkflowName, &item.WorkflowVersion, &item.Status, &item.StartedAt, &item.CompletedAt, &item.TriggerSource, &item.Summary); err != nil {
+		var materialized []byte
+		var digest pgtype.Text
+		if err := rows.Scan(&item.ID, &item.TaskID, &item.Objective, &item.WorkflowName, &item.WorkflowVersion, &item.Status, &item.StartedAt, &item.CompletedAt, &item.TriggerSource, &materialized, &digest); err != nil {
 			return err
 		}
 		out.Runs = append(out.Runs, item)
+		topology := ConsoleWorkflowTopology{Availability: "legacy_unavailable", Steps: []ConsoleWorkflowTopologyStep{}}
+		if len(materialized) > 0 && digest.Valid {
+			definition, verifyErr := workflow.VerifyMaterialization(json.RawMessage(materialized), digest.String)
+			if verifyErr != nil {
+				topology.Availability = "invalid"
+			} else {
+				topology.Availability = "materialized"
+				for _, step := range definition.Steps {
+					topology.Steps = append(topology.Steps, ConsoleWorkflowTopologyStep{ID: step.ID, Capability: step.Capability, DependsOn: append([]string(nil), step.DependsOn...), ApprovalRequired: step.ApprovalRequired})
+				}
+			}
+		}
+		out.WorkflowTopologies[item.ID] = topology
 	}
 	if err := rows.Err(); err != nil {
 		return err
-	}
-	if len(out.Runs) > 0 {
-		err = s.Pool.QueryRow(ctx, `SELECT wd.definition FROM workflow_runs wr JOIN workflow_definitions wd ON wd.id=wr.workflow_definition_id WHERE wr.id=$1`, out.Runs[0].ID).Scan(&out.WorkflowDefinition)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
 	}
 	return nil
 }
@@ -388,14 +402,14 @@ func (s *Store) loadConsoleSteps(ctx context.Context, programID domain.ID, out *
 }
 
 func (s *Store) loadConsoleTools(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {
-	rows, err := s.Pool.Query(ctx, `SELECT tr.id,sr.workflow_run_id,sr.step_definition_id,tr.provider,tr.tool_version,tr.sanitized_arguments,tr.started_at,tr.completed_at,tr.exit_code,tr.timed_out,(SELECT count(*) FROM artifacts a WHERE a.tool_run_id=tr.id AND a.sensitive=false AND (a.expires_at IS NULL OR a.expires_at>now())) FROM tool_runs tr JOIN step_runs sr ON sr.id=tr.step_run_id JOIN workflow_runs wr ON wr.id=sr.workflow_run_id JOIN tasks t ON t.id=wr.task_id WHERE t.program_id=$1 ORDER BY tr.started_at DESC LIMIT 120`, programID)
+	rows, err := s.Pool.Query(ctx, `SELECT tr.id,sr.workflow_run_id,sr.step_definition_id,tr.provider,tr.tool_version,tr.started_at,tr.completed_at,tr.exit_code,tr.timed_out,(SELECT count(*) FROM artifacts a WHERE a.tool_run_id=tr.id AND a.sensitive=false AND (a.expires_at IS NULL OR a.expires_at>now())) FROM tool_runs tr JOIN step_runs sr ON sr.id=tr.step_run_id JOIN workflow_runs wr ON wr.id=sr.workflow_run_id JOIN tasks t ON t.id=wr.task_id WHERE t.program_id=$1 ORDER BY tr.started_at DESC LIMIT 120`, programID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var item ConsoleToolRun
-		if err := rows.Scan(&item.ID, &item.WorkflowRunID, &item.StepDefinitionID, &item.Provider, &item.ToolVersion, &item.SanitizedArguments, &item.StartedAt, &item.CompletedAt, &item.ExitCode, &item.TimedOut, &item.ArtifactCount); err != nil {
+		if err := rows.Scan(&item.ID, &item.WorkflowRunID, &item.StepDefinitionID, &item.Provider, &item.ToolVersion, &item.StartedAt, &item.CompletedAt, &item.ExitCode, &item.TimedOut, &item.ArtifactCount); err != nil {
 			return err
 		}
 		out.Tools = append(out.Tools, item)
@@ -488,14 +502,14 @@ func (s *Store) loadConsoleApprovals(ctx context.Context, programID domain.ID, o
 }
 
 func (s *Store) loadConsoleAudit(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {
-	rows, err := s.Pool.Query(ctx, `SELECT ae.id,ae.occurred_at,ae.event_type,ae.component,ae.actor,ae.workflow_run_id,ae.capability,ae.provider,ae.safe_message,ae.details FROM audit_events ae WHERE ae.program_id=$1 OR EXISTS (SELECT 1 FROM tasks t WHERE t.id=ae.task_id AND t.program_id=$1) ORDER BY ae.occurred_at DESC LIMIT 160`, programID)
+	rows, err := s.Pool.Query(ctx, `SELECT ae.id,ae.occurred_at,ae.event_type,ae.component,ae.actor,ae.workflow_run_id,ae.capability,ae.provider,ae.safe_message FROM audit_events ae WHERE ae.program_id=$1 OR EXISTS (SELECT 1 FROM tasks t WHERE t.id=ae.task_id AND t.program_id=$1) ORDER BY ae.occurred_at DESC LIMIT 160`, programID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var item ConsoleAuditEvent
-		if err := rows.Scan(&item.ID, &item.OccurredAt, &item.EventType, &item.Component, &item.Actor, &item.WorkflowRunID, &item.Capability, &item.Provider, &item.SafeMessage, &item.Details); err != nil {
+		if err := rows.Scan(&item.ID, &item.OccurredAt, &item.EventType, &item.Component, &item.Actor, &item.WorkflowRunID, &item.Capability, &item.Provider, &item.SafeMessage); err != nil {
 			return err
 		}
 		out.AuditEvents = append(out.AuditEvents, item)

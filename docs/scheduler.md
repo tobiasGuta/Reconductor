@@ -6,7 +6,7 @@ Reconductor includes a persistent, PostgreSQL-backed scheduler for deterministic
 
 Cron due time is materialized into `scheduled_executions(status=pending)`. Scheduler workers claim pending rows with `FOR UPDATE SKIP LOCKED`, then call the shared `internal/orchestration` workflow service used by the CLI. Run Now inserts the same pending row shape and returns immediately.
 
-Each new execution reloads the program's current `scope_reference`, rebuilds the Burp scope and target plan, records the scope snapshot, validates the workflow definition, creates a distinct `Task`, and creates a distinct `WorkflowRun`. Resume reuses the existing task and workflow run. Queue jobs carry the compiled include/exclude rules, so capability workers do not reopen the scope file.
+Each fresh execution reloads the program's current `scope_reference`, rebuilds the Burp scope and target plan, records the scope snapshot, selects the currently installed immutable workflow template, creates a distinct `Task`, and atomically creates a WorkflowRun with the exact materialized graph and original scope-version attribution. Resume reuses the existing Task, WorkflowRun, materialization, and original scheduled scope attribution even after a software version bump or schedule edit. Queue jobs carry the compiled include/exclude rules, so capability workers do not reopen the scope file.
 
 ## Cron And Timezones
 
@@ -26,7 +26,7 @@ Moderate Nuclei remains approval gated. A scheduled run can pause at `awaiting_a
 
 ## Overlap And Restart Semantics
 
-If the same schedule already has an execution in `claimed`, `running`, or `paused_for_approval`, the new occurrence is recorded as `skipped_overlap`. Claims use short leases. A stale claim without a task can return to pending; a stale execution with task or run lineage becomes `interrupted` for operator review rather than automatically duplicating network traffic.
+If the same schedule already has an execution in `claimed`, `running`, or `paused_for_approval`, the new occurrence is recorded as `skipped_overlap`. Claims use short leases. A stale claim without a task can return to pending; a stale execution with task or run lineage preserves that lineage. A missing reconstructable initial checkpoint is rebuilt from the database using the same Run ID. Ambiguous or unavailable checkpoints pause the scheduled occurrence with `checkpoint_unavailable` for operator action rather than duplicating a run or sending traffic.
 
 ## Change Inbox
 

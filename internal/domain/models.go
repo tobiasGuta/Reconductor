@@ -219,16 +219,19 @@ type Task struct {
 	CancellationReason   string     `json:"cancellation_reason,omitempty"`
 }
 type WorkflowRun struct {
-	ID                   ID              `json:"id"`
-	TaskID               ID              `json:"task_id"`
-	WorkflowDefinitionID ID              `json:"workflow_definition_id"`
-	WorkflowVersion      string          `json:"workflow_version"`
-	Status               RunStatus       `json:"status"`
-	StartedAt            *time.Time      `json:"started_at,omitempty"`
-	CompletedAt          *time.Time      `json:"completed_at,omitempty"`
-	PreviousRunID        *ID             `json:"previous_run_id,omitempty"`
-	TriggerSource        string          `json:"trigger_source"`
-	Summary              json.RawMessage `json:"summary,omitempty"`
+	ID                     ID              `json:"id"`
+	TaskID                 ID              `json:"task_id"`
+	WorkflowDefinitionID   ID              `json:"workflow_definition_id"`
+	WorkflowVersion        string          `json:"workflow_version"`
+	Status                 RunStatus       `json:"status"`
+	StartedAt              *time.Time      `json:"started_at,omitempty"`
+	CompletedAt            *time.Time      `json:"completed_at,omitempty"`
+	PreviousRunID          *ID             `json:"previous_run_id,omitempty"`
+	TriggerSource          string          `json:"trigger_source"`
+	Summary                json.RawMessage `json:"summary,omitempty"`
+	MaterializedDefinition json.RawMessage `json:"materialized_definition,omitempty"`
+	MaterializationDigest  string          `json:"materialization_digest,omitempty"`
+	OriginalScopeVersionID *ID             `json:"original_scope_version_id,omitempty"`
 }
 type StepRun struct {
 	ID                  ID              `json:"id"`

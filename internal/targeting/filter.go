@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
@@ -13,6 +14,152 @@ import (
 type DetailedScope interface {
 	Evaluate(string) platformscope.Evaluation
 	IncludeRules() []platformscope.NormalizedRule
+	ExcludeRules() []platformscope.NormalizedRule
+}
+
+type PassiveDiscoveryScope interface {
+	DetailedScope
+	AllowsDiscoveryRoot(string) bool
+}
+
+type PlannedScope struct {
+	DetailedScope
+	discoveryRoots        map[string]DiscoveryRoot
+	currentDiscoveryRoots map[string]DiscoveryRoot
+}
+
+func WithDiscoveryRoots(sc DetailedScope, pinnedRoots, currentRoots []DiscoveryRoot) PlannedScope {
+	bound := PlannedScope{DetailedScope: sc, discoveryRoots: make(map[string]DiscoveryRoot, len(pinnedRoots)), currentDiscoveryRoots: make(map[string]DiscoveryRoot, len(currentRoots))}
+	for _, pinned := range pinnedRoots {
+		if root, err := normalizeHostname(pinned.Domain); err == nil {
+			pinned.Domain = root
+			pinned.SourceRuleIDs = append([]string(nil), pinned.SourceRuleIDs...)
+			bound.discoveryRoots[root] = pinned
+		}
+	}
+	for _, current := range currentRoots {
+		if root, err := normalizeHostname(current.Domain); err == nil {
+			current.Domain = root
+			current.SourceRuleIDs = append([]string(nil), current.SourceRuleIDs...)
+			bound.currentDiscoveryRoots[root] = current
+		}
+	}
+	return bound
+}
+
+func (s PlannedScope) Allows(target string) bool { return s.Evaluate(target).Allowed }
+
+func (s PlannedScope) AllowsDiscoveryRoot(raw string) bool {
+	root, err := normalizeHostname(raw)
+	if err != nil {
+		return false
+	}
+	pinned, pinnedToOriginalPlan := s.discoveryRoots[root]
+	if !pinnedToOriginalPlan {
+		return false
+	}
+	current, presentInCurrentPlan := s.currentDiscoveryRoots[root]
+	if !presentInCurrentPlan {
+		return false
+	}
+	for _, sourceRuleID := range pinned.SourceRuleIDs {
+		if !containsString(current.SourceRuleIDs, sourceRuleID) {
+			continue
+		}
+		if discoverySourceBasisAllowed(s.DetailedScope, root, sourceRuleID) {
+			return true
+		}
+		if pinned.Source == "manual" && current.Source == "manual" {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(items []string, value string) bool {
+	for _, item := range items {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func discoverySourceBasisAllowed(sc DetailedScope, root, sourceRuleID string) bool {
+	var source platformscope.NormalizedRule
+	found := false
+	for _, include := range sc.IncludeRules() {
+		if include.ID == sourceRuleID {
+			source, found = include, true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+	base, ok := narrowWildcardBase(source.Host)
+	if !ok || base != root {
+		return false
+	}
+	protocols, protocolsOK := finiteProtocols(source.Protocol)
+	ports, portsOK := finitePorts(source.Port)
+	path, pathOK := initialPath(source.File)
+	if !protocolsOK || !portsOK || !pathOK {
+		return false
+	}
+	for _, protocol := range protocols {
+		for _, port := range ports {
+			if discoveryCombinationAllowed(sc.ExcludeRules(), source, root, protocol, port, path) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func discoveryCombinationAllowed(exclusions []platformscope.NormalizedRule, source platformscope.NormalizedRule, root, protocol string, port int, path string) bool {
+	portValue := strconv.Itoa(port)
+	for _, exclusion := range exclusions {
+		if !rulePatternMatches(exclusion.Protocol, protocol) || !rulePatternMatches(exclusion.Port, portValue) || !rulePatternMatches(exclusion.File, path) {
+			continue
+		}
+		covers, provable := exclusionCoversDiscoveryHosts(exclusion.Host, source.Host, root)
+		if !provable || covers {
+			return false
+		}
+	}
+	return true
+}
+
+func rulePatternMatches(pattern, value string) bool {
+	compiled, err := regexp.Compile(pattern)
+	return err == nil && full(compiled, value)
+}
+
+func exclusionCoversDiscoveryHosts(exclusionPattern, sourcePattern, sourceRoot string) (bool, bool) {
+	if exclusionPattern == sourcePattern || exclusionPattern == ".*" || exclusionPattern == "^.*$" {
+		return true, true
+	}
+	if _, exact := exactHost(exclusionPattern); exact {
+		return false, true
+	}
+	if exclusionRoot, wildcard := narrowWildcardBase(exclusionPattern); wildcard {
+		return sourceRoot == exclusionRoot || strings.HasSuffix(sourceRoot, "."+exclusionRoot), true
+	}
+	if exclusionRoot, optional := optionalWildcardBase(exclusionPattern); optional {
+		return sourceRoot == exclusionRoot || strings.HasSuffix(sourceRoot, "."+exclusionRoot), true
+	}
+	return false, false
+}
+
+func optionalWildcardBase(pattern string) (string, bool) {
+	body := strings.TrimPrefix(strings.TrimSuffix(pattern, "$"), "^")
+	for _, prefix := range []string{`(?:.*\.)?`, `(?:[^.]+\.)?`} {
+		if strings.HasPrefix(body, prefix) {
+			return exactHost("^" + strings.TrimPrefix(body, prefix) + "$")
+		}
+	}
+	return "", false
 }
 
 type FilterDecision struct {

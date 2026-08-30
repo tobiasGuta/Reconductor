@@ -107,6 +107,7 @@ type ResultAdmissionProvenance struct {
 }
 type Result struct {
 	Action              domain.ActionResult        `json:"action"`
+	EffectiveInput      json.RawMessage            `json:"effective_input,omitempty"`
 	ToolRun             *domain.ToolRun            `json:"tool_run,omitempty"`
 	RawStdout           []byte                     `json:"-"`
 	RawStderr           []byte                     `json:"-"`

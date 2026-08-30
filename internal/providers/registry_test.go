@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	commandprovider "github.com/tobiasGuta/Reconductor/internal/providers/command"
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
+	"github.com/tobiasGuta/Reconductor/internal/targeting"
 )
 
 type testScope struct{}
@@ -36,6 +38,128 @@ func executeProviderTest(registry *capability.Registry, req capability.Request) 
 	req.DecisionRecorder = recorder
 	req.InvocationRecorder = recorder
 	return registry.Execute(context.Background(), req)
+}
+
+type passiveAdmissionRecorder struct{ starts int }
+
+func (*passiveAdmissionRecorder) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
+	return domain.NewID(), nil
+}
+func (r *passiveAdmissionRecorder) RecordProviderInvocationStarted(context.Context, capability.ProviderInvocationStartRecord) (domain.ID, error) {
+	r.starts++
+	return domain.NewID(), nil
+}
+func (*passiveAdmissionRecorder) RecordProviderInvocationTerminal(context.Context, capability.ProviderInvocationTerminalRecord) error {
+	return nil
+}
+
+type passiveCommandRunner struct {
+	calls  int
+	args   []string
+	stdout string
+}
+
+func (r *passiveCommandRunner) Run(_ context.Context, _ string, args []string, _ []byte) ([]byte, []byte, int, error) {
+	r.calls++
+	r.args = append([]string(nil), args...)
+	return []byte(r.stdout), nil, 0, nil
+}
+func (*passiveCommandRunner) Version(context.Context, string, []string) (string, error) {
+	return "2.0.0", nil
+}
+
+func TestPassiveDiscoveryAdmissionUsesCurrentExclusionAwareScopeForSubfinderAndGAU(t *testing.T) {
+	wildcardA := platformscope.Rule{Protocol: `^https$`, Host: `^.*\.example\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}
+	wildcardB := platformscope.Rule{Protocol: `^https$`, Host: `^[^.]+\.example\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}
+	unrelatedExact := platformscope.Rule{Protocol: `^https$`, Host: `^example\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}
+	tests := []struct {
+		name             string
+		originalIncludes []platformscope.Rule
+		currentIncludes  []platformscope.Rule
+		currentExcludes  []platformscope.Rule
+		originalManual   []targeting.ManualDiscoveryRoot
+		currentManual    []targeting.ManualDiscoveryRoot
+		wantRun          bool
+	}{
+		{name: "original generating rule remains", originalIncludes: []platformscope.Rule{wildcardA}, currentIncludes: []platformscope.Rule{wildcardA}, wantRun: true},
+		{name: "original generating rule removed", originalIncludes: []platformscope.Rule{wildcardA}, currentIncludes: []platformscope.Rule{{Protocol: `^https$`, Host: `^api\.other\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}}},
+		{name: "original generating rule fully excluded", originalIncludes: []platformscope.Rule{wildcardA}, currentIncludes: []platformscope.Rule{wildcardA}, currentExcludes: []platformscope.Rule{wildcardA}},
+		{name: "broader exclusion fully vetoes original basis", originalIncludes: []platformscope.Rule{wildcardA}, currentIncludes: []platformscope.Rule{wildcardA}, currentExcludes: []platformscope.Rule{{Protocol: `^https$`, Host: `^.*\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}}},
+		{name: "unrelated exact include cannot launder vetoed basis", originalIncludes: []platformscope.Rule{wildcardA}, currentIncludes: []platformscope.Rule{wildcardA, unrelatedExact}, currentExcludes: []platformscope.Rule{wildcardA}},
+		{name: "unrelated wildcard cannot launder vetoed basis", originalIncludes: []platformscope.Rule{wildcardA}, currentIncludes: []platformscope.Rule{wildcardA, wildcardB}, currentExcludes: []platformscope.Rule{wildcardA}},
+		{name: "current only same-root rule cannot substitute authority", originalIncludes: []platformscope.Rule{wildcardA}, currentIncludes: []platformscope.Rule{wildcardB}},
+		{name: "partial exclusion leaves original basis provable", originalIncludes: []platformscope.Rule{wildcardA}, currentIncludes: []platformscope.Rule{wildcardA}, currentExcludes: []platformscope.Rule{{Protocol: `^https$`, Host: `^blocked\.example\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}}, wantRun: true},
+		{name: "synthetic-label-only exclusion does not veto original basis", originalIncludes: []platformscope.Rule{wildcardA}, currentIncludes: []platformscope.Rule{wildcardA}, currentExcludes: []platformscope.Rule{{Protocol: `^https$`, Host: `^reconductor-discovery-probe\.example\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}}, wantRun: true},
+		{name: "one of multiple original source rules remains", originalIncludes: []platformscope.Rule{wildcardA, wildcardB}, currentIncludes: []platformscope.Rule{wildcardB}, wantRun: true},
+		{name: "finite path basis remains constrained", originalIncludes: []platformscope.Rule{{Protocol: `^https$`, Host: wildcardA.Host, Port: `^443$`, File: `^/admin$`, Enabled: true}}, currentIncludes: []platformscope.Rule{{Protocol: `^https$`, Host: wildcardA.Host, Port: `^443$`, File: `^/admin$`, Enabled: true}}, wantRun: true},
+		{name: "non-enumerable path basis fails closed", originalIncludes: []platformscope.Rule{{Protocol: `^https$`, Host: wildcardA.Host, Port: `^443$`, File: `^/admin/.*`, Enabled: true}}, currentIncludes: []platformscope.Rule{{Protocol: `^https$`, Host: wildcardA.Host, Port: `^443$`, File: `^/admin/.*`, Enabled: true}}},
+		{name: "manual semantic basis remains", originalIncludes: []platformscope.Rule{unrelatedExact}, currentIncludes: []platformscope.Rule{unrelatedExact}, originalManual: []targeting.ManualDiscoveryRoot{{Domain: "example.test", Reason: "authorized passive root"}}, currentManual: []targeting.ManualDiscoveryRoot{{Domain: "example.test", Reason: "authorized passive root"}}, wantRun: true},
+		{name: "changed manual reason cannot substitute basis", originalIncludes: []platformscope.Rule{unrelatedExact}, currentIncludes: []platformscope.Rule{unrelatedExact}, originalManual: []targeting.ManualDiscoveryRoot{{Domain: "example.test", Reason: "authorized passive root"}}, currentManual: []targeting.ManualDiscoveryRoot{{Domain: "example.test", Reason: "different authority"}}},
+	}
+	providers := []struct {
+		name        string
+		provider    string
+		adapter     string
+		stdout      string
+		build       func(commandprovider.Input, policy.Policy) ([]string, error)
+		wantArgs    []string
+		wrapAsMulti bool
+	}{
+		{name: "subfinder", provider: "subfinder", adapter: "subfinder", stdout: "www.example.test\n", build: subfinderArgs, wantArgs: []string{"-d", "example.test", "-silent"}, wrapAsMulti: true},
+		{name: "gau", provider: "gau", adapter: "gau", stdout: "https://www.example.test/\n", build: func(input commandprovider.Input, _ policy.Policy) ([]string, error) { return gauArgs(input) }, wantArgs: []string{"--json", "example.test"}},
+	}
+	for _, providerTest := range providers {
+		providerTest := providerTest
+		for _, test := range tests {
+			t.Run(providerTest.name+"/"+test.name, func(t *testing.T) {
+				originalScope, err := platformscope.Compile(test.originalIncludes, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				originalPlan, err := targeting.Plan(originalScope, test.originalManual)
+				if err != nil {
+					t.Fatal(err)
+				}
+				currentScope, err := platformscope.Compile(test.currentIncludes, test.currentExcludes)
+				if err != nil {
+					t.Fatal(err)
+				}
+				currentPlan, err := targeting.Plan(currentScope, test.currentManual)
+				if err != nil {
+					t.Fatal(err)
+				}
+				runner := &passiveCommandRunner{stdout: providerTest.stdout}
+				implementation := commandprovider.New(commandprovider.Definition{Name: map[bool]string{true: "discover.subdomains", false: "discover.archive_urls"}[providerTest.wrapAsMulti], Provider: providerTest.provider, Executable: providerTest.provider, Version: "2", Risk: policy.Passive, ScopeType: "discovery-root", RetrySafe: true, Idempotent: true, PassiveInput: true, OutputAdapter: providerTest.adapter, BuildArgs: providerTest.build}, runner, nil)
+				var registered capability.Capability = implementation
+				if providerTest.wrapAsMulti {
+					registered, err = capability.NewMulti("subfinder", map[string]capability.Capability{"subfinder": implementation})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				registry := capability.NewRegistry()
+				if err := registry.Register(registered); err != nil {
+					t.Fatal(err)
+				}
+				capabilityName := registered.Manifest().Name
+				raw, err := json.Marshal(commandprovider.Input{Domains: []string{"example.test"}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				recorder := &passiveAdmissionRecorder{}
+				_, executeErr := registry.Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), RequestedBy: "test", Capability: capabilityName, Input: raw, StepAttempt: 1}, Provider: providerTest.provider, Policy: policy.Policy{ID: "passive-admission", AllowedCapabilities: []string{capabilityName}}, Scope: targeting.WithDiscoveryRoots(currentScope, originalPlan.DiscoveryRoots, currentPlan.DiscoveryRoots), DecisionRecorder: recorder, InvocationRecorder: recorder})
+				if !test.wantRun {
+					if executeErr == nil || recorder.starts != 0 || runner.calls != 0 || len(runner.args) != 0 {
+						t.Fatalf("error=%v provider_starts=%d runner_calls=%d args=%v", executeErr, recorder.starts, runner.calls, runner.args)
+					}
+					return
+				}
+				if executeErr != nil || recorder.starts != 1 || runner.calls != 1 || !slices.Equal(runner.args, providerTest.wantArgs) {
+					t.Fatalf("error=%v provider_starts=%d runner_calls=%d args=%v want=%v", executeErr, recorder.starts, runner.calls, runner.args, providerTest.wantArgs)
+				}
+			})
+		}
+	}
 }
 
 func TestEndpointClassifierVersionAndStableSchemas(t *testing.T) {
@@ -341,6 +465,45 @@ func TestInternalCapabilitiesEmitTypedNonNullOutputs(t *testing.T) {
 		if err := json.Unmarshal(result.Action.Output, test.out); err != nil {
 			t.Fatalf("%s output contract: %v", test.name, err)
 		}
+	}
+}
+
+func TestTargetingPrepareNarrowsPinnedURLsToCurrentScope(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := Registry(cfg)
+	input := json.RawMessage(`{"exact_urls":["https://keep.test/","https://removed.test/"],"discovered_urls":[],"ports":[443],"target_plan_digest":"pinned-plan"}`)
+
+	narrowed, err := platformscope.Compile([]platformscope.Rule{{Protocol: `^https$`, Host: `^keep\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executeProviderTest(registry, capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "targeting.prepare", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"targeting.prepare"}}, Scope: narrowed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output TargetingPrepareOutput
+	if err := json.Unmarshal(result.Action.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.URLs) != 1 || output.URLs[0] != "https://keep.test/" || output.AcceptedCount != 1 || output.FilteredCount != 1 {
+		t.Fatalf("narrowed output=%#v", output)
+	}
+
+	veto, err := platformscope.Compile([]platformscope.Rule{{Protocol: `^https$`, Host: `^other\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = executeProviderTest(registry, capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "targeting.prepare", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"targeting.prepare"}}, Scope: veto})
+	if err == nil || !strings.Contains(err.Error(), "no executable authorized targets") {
+		t.Fatalf("current-scope veto error=%v", err)
 	}
 }
 

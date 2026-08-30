@@ -16,6 +16,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/orchestration"
+	"github.com/tobiasGuta/Reconductor/internal/workflow"
 	"github.com/tobiasGuta/Reconductor/internal/workflows"
 )
 
@@ -235,6 +236,124 @@ func (w *recoveryStoreWrapper) MarkScheduledExecutionRunning(ctx context.Context
 
 // Compile-time check: recoveryStoreWrapper must satisfy the scheduler.Store interface.
 var _ Store = (*recoveryStoreWrapper)(nil)
+
+func TestScheduledContinuationStaysPinnedAndNextOccurrenceUsesCurrentTemplate(t *testing.T) {
+	env := newRecoveryIntegrationEnv(t, "template-pinning")
+	ctx := env.ctx
+	owner := "template-pinning-owner"
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	oldTemplate, err := workflows.CurrentTemplate(workflows.BaselineName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.EnsureWorkflowTemplate(ctx, oldTemplate); err != nil {
+		t.Fatal(err)
+	}
+	oldTask := domain.Task{ID: domain.NewID(), ProgramID: env.programID, Objective: "pinned objective", WorkflowDefinitionID: oldTemplate.ID, Status: domain.TaskRunning, RequestedBy: domain.ScheduleTriggerRunNow, CreatedAt: now, UpdatedAt: now}
+	if err := env.store.CreateTask(ctx, oldTask); err != nil {
+		t.Fatal(err)
+	}
+	var originalScopeVersionID domain.ID
+	if err := env.store.Pool.QueryRow(ctx, `SELECT id FROM scope_versions WHERE program_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1`, env.programID).Scan(&originalScopeVersionID); err != nil {
+		t.Fatal(err)
+	}
+	oldDefinition := workflow.Definition{ID: oldTemplate.ID, Name: oldTemplate.Name, Version: oldTemplate.Version, Materializer: oldTemplate.Materializer, Description: oldTemplate.Description, DefaultPolicyRequirements: oldTemplate.DefaultPolicyRequirements, CreatedAt: oldTemplate.CreatedAt, Steps: []workflow.Step{{ID: "pinned-step", Capability: "pinned.old", Input: json.RawMessage(`{}`), Retry: workflow.RetryPolicy{MaxAttempts: 1}}}}
+	materialized, digest, err := workflow.Materialize(oldDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRun := &workflow.State{Run: domain.WorkflowRun{ID: domain.NewID(), TaskID: oldTask.ID, WorkflowDefinitionID: oldTemplate.ID, WorkflowVersion: oldTemplate.Version, Status: domain.RunRunning, StartedAt: &now, TriggerSource: domain.ScheduleTriggerRunNow, Summary: json.RawMessage(`{}`), MaterializedDefinition: materialized, MaterializationDigest: digest, OriginalScopeVersionID: &originalScopeVersionID}, Steps: map[string]*workflow.StepState{}}
+
+	execution, err := env.store.EnqueueRunNow(ctx, env.scheduleID, "integration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, _, ok, err := env.store.ClaimPendingScheduledExecution(ctx, owner, 30*time.Second)
+	if err != nil || !ok || claimed.ID != execution.ID {
+		t.Fatalf("claim: ok=%v execution=%s err=%v", ok, claimed.ID, err)
+	}
+	if err := env.store.MarkScheduledExecutionTaskCreated(ctx, claimed.ID, oldTask.ID, owner, claimed.AttemptCount); err != nil {
+		t.Fatal(err)
+	}
+	runCtx := database.WithScheduledExecutionFence(ctx, database.ScheduledExecutionFence{ExecutionID: claimed.ID, LeaseOwner: owner, Attempt: claimed.AttemptCount})
+	persister := database.WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: env.root}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
+		return env.store.MarkScheduledExecutionRunning(lifecycleCtx, claimed.ID, oldTask.ID, state.Run.ID, &originalScopeVersionID, owner, claimed.AttemptCount)
+	}}
+	if err := persister.Save(runCtx, oldRun); err != nil {
+		t.Fatal(err)
+	}
+	claimed.Status = domain.ScheduledExecutionRunning
+	claimed.TaskID = &oldTask.ID
+	claimed.WorkflowRunID = &oldRun.Run.ID
+	claimed.ScopeVersionID = &originalScopeVersionID
+
+	schedule, err := env.store.GetSchedule(ctx, env.scheduleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedule.WorkflowName = workflows.ContinuousName
+	schedule.Objective = "edited objective"
+	schedule.Headless = !schedule.Headless
+	if err := env.store.UpdateSchedule(ctx, schedule, "integration"); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err = env.store.GetSchedule(ctx, env.scheduleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var oldCalls atomic.Int32
+	fakeOutput := json.RawMessage(`{"urls":[],"port_targets":[],"authorized_urls":[],"active_urls":[],"findings":[],"authorized_records":[],"lines":[],"scan_targets":[],"crawl_targets":[],"interesting_endpoints":[],"changes":[]}`)
+	registry := capability.NewRegistry()
+	if err := registry.Register(&fakeProvider{name: "pinned.old", onExecute: func(context.Context) (capability.Result, error) {
+		oldCalls.Add(1)
+		return capability.Result{Action: domain.ActionResult{Output: json.RawMessage(`{}`)}}, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, capName := range allCaps() {
+		name := capName
+		if err := registry.Register(&fakeProvider{name: name, onExecute: func(context.Context) (capability.Result, error) {
+			return capability.Result{Action: domain.ActionResult{Output: fakeOutput}}, nil
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc := newRecoverySvc(env, newRecoveryOrch(env, registry), owner)
+	if err := svc.execute(ctx, claimed, schedule); err != nil {
+		t.Fatal(err)
+	}
+	storedOld, err := env.store.GetWorkflowRun(ctx, oldRun.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldCalls.Load() != 1 || storedOld.WorkflowDefinitionID != oldTemplate.ID || storedOld.MaterializationDigest != digest || storedOld.Status != domain.RunCompleted {
+		t.Fatalf("pinned continuation calls=%d run=%#v", oldCalls.Load(), storedOld)
+	}
+	storedTask, err := env.store.GetTask(ctx, oldTask.ID)
+	if err != nil || storedTask.Objective != oldTask.Objective || storedTask.WorkflowDefinitionID != oldTemplate.ID {
+		t.Fatalf("schedule edit mutated existing Task: task=%#v err=%v", storedTask, err)
+	}
+
+	fresh, err := env.store.EnqueueRunNow(ctx, env.scheduleID, "integration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Dispatch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var freshRunID, freshTemplateID domain.ID
+	if err := env.store.Pool.QueryRow(ctx, `SELECT workflow_run_id FROM scheduled_executions WHERE id=$1 AND status='completed'`, fresh.ID).Scan(&freshRunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pool.QueryRow(ctx, `SELECT workflow_definition_id FROM workflow_runs WHERE id=$1`, freshRunID).Scan(&freshTemplateID); err != nil {
+		t.Fatal(err)
+	}
+	if freshTemplateID != workflows.ContinuousTemplateID || freshTemplateID == oldTemplate.ID {
+		t.Fatalf("fresh occurrence template=%s want current=%s", freshTemplateID, workflows.ContinuousTemplateID)
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Test 1 – Scenario A: safe_no_lineage_claim → re-claim → complete

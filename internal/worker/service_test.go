@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
+	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
 type workerCaptureCapability struct {
@@ -39,20 +41,22 @@ func (c *workerCaptureCapability) Execute(_ context.Context, req capability.Requ
 }
 
 type workerStore struct {
-	previous    []string
-	loadedFor   string
-	step        domain.StepRun
-	tool        *domain.ToolRun
-	artifacts   []domain.Artifact
-	result      domain.ActionResult
-	admission   *capability.ResultAdmissionProvenance
-	admissions  []*capability.ResultAdmissionProvenance
-	policyID    domain.ID
-	startID     domain.ID
-	startIDs    []domain.ID
-	start       capability.ProviderInvocationStartRecord
-	terminal    capability.ProviderInvocationTerminalRecord
-	terminalErr error
+	previous          []string
+	loadedFor         string
+	step              domain.StepRun
+	tool              *domain.ToolRun
+	artifacts         []domain.Artifact
+	result            domain.ActionResult
+	admission         *capability.ResultAdmissionProvenance
+	admissions        []*capability.ResultAdmissionProvenance
+	policyID          domain.ID
+	startID           domain.ID
+	startIDs          []domain.ID
+	start             capability.ProviderInvocationStartRecord
+	terminal          capability.ProviderInvocationTerminalRecord
+	terminalErr       error
+	effectiveInputs   map[domain.ID]json.RawMessage
+	effectiveAttempts map[domain.ID]int
 }
 
 func (s *workerStore) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
@@ -76,6 +80,45 @@ func (*workerStore) AlreadySucceeded(context.Context, string) (bool, error) { re
 func (s *workerStore) PreviousObservationValues(_ context.Context, _ domain.ID, _ domain.ID, capabilityName string) ([]string, error) {
 	s.loadedFor = capabilityName
 	return append([]string(nil), s.previous...), nil
+}
+func (s *workerStore) LoadEffectiveStepInput(_ context.Context, _ domain.ID, action domain.ActionRequest) (json.RawMessage, bool, error) {
+	persisted, found := s.effectiveInputs[action.StepRunID]
+	if !found {
+		return nil, false, nil
+	}
+	authoritativeAttempt := s.effectiveAttempts[action.StepRunID]
+	if action.StepAttempt < authoritativeAttempt {
+		return nil, false, &workflow.StepAttemptOwnershipError{StepRunID: action.StepRunID, RequestedAttempt: action.StepAttempt, AuthoritativeAttempt: authoritativeAttempt}
+	}
+	return append(json.RawMessage(nil), persisted...), true, nil
+}
+func (s *workerStore) PersistEffectiveStepInput(_ context.Context, _ domain.ID, action domain.ActionRequest, proposed json.RawMessage) (json.RawMessage, error) {
+	if action.StepAttempt < 1 || len(proposed) == 0 || !json.Valid(proposed) {
+		return nil, fmt.Errorf("%w: effective input or attempt is invalid", workflow.ErrEffectiveStepInputConflict)
+	}
+	if s.effectiveInputs == nil {
+		s.effectiveInputs = map[domain.ID]json.RawMessage{}
+		s.effectiveAttempts = map[domain.ID]int{}
+	}
+	persisted, found := s.effectiveInputs[action.StepRunID]
+	if found {
+		authoritativeAttempt := s.effectiveAttempts[action.StepRunID]
+		if action.StepAttempt <= authoritativeAttempt {
+			return nil, &workflow.StepAttemptOwnershipError{StepRunID: action.StepRunID, RequestedAttempt: action.StepAttempt, AuthoritativeAttempt: authoritativeAttempt}
+		}
+		if action.StepAttempt != authoritativeAttempt+1 || !bytes.Equal(persisted, proposed) {
+			return nil, fmt.Errorf("%w: StepRun %s already has authoritative attempt %d input", workflow.ErrEffectiveStepInputConflict, action.StepRunID, authoritativeAttempt)
+		}
+		s.effectiveAttempts[action.StepRunID] = action.StepAttempt
+		return append(json.RawMessage(nil), persisted...), nil
+	}
+	if action.StepAttempt != 1 {
+		return nil, fmt.Errorf("%w: first durable attempt for StepRun %s must be 1, got %d", workflow.ErrEffectiveStepInputConflict, action.StepRunID, action.StepAttempt)
+	}
+	frozen := append(json.RawMessage(nil), proposed...)
+	s.effectiveInputs[action.StepRunID] = frozen
+	s.effectiveAttempts[action.StepRunID] = action.StepAttempt
+	return append(json.RawMessage(nil), frozen...), nil
 }
 func (s *workerStore) PersistResult(_ context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) error {
 	s.step = step
@@ -144,7 +187,7 @@ func TestWorkerExecutionUsesSharedPipelineForHistoryAndArtifacts(t *testing.T) {
 	input := json.RawMessage(`{"active":[],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan"}`)
 	service := &Service{Registry: registry, Results: store, Artifacts: artifacts}
 	jobID, actionID := domain.NewID(), domain.NewID()
-	delivery := queue.Delivery{MessageID: "redis-message-1", Job: queue.Job{ID: jobID, ProgramID: programID, Action: domain.ActionRequest{ID: actionID, TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "classify.endpoint", Input: input, IdempotencyKey: "job"}, Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}, ArtifactRetention: time.Hour}}}
+	delivery := queue.Delivery{MessageID: "redis-message-1", Job: queue.Job{ID: jobID, ProgramID: programID, Action: domain.ActionRequest{ID: actionID, TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "classify.endpoint", Input: input, IdempotencyKey: "job", StepAttempt: 1}, Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}, ArtifactRetention: time.Hour}}}
 
 	result, err := service.executeJob(context.Background(), delivery, "platform", workerScope{}, nil)
 	if err != nil {
@@ -260,6 +303,8 @@ func TestWorkerRedeliveryRetainsJobAndActionButCreatesNewProviderAttempt(t *test
 	}
 	provider.claimedAttemptID = first.ProviderAttemptID
 	delivery.MessageID = "redis-delivery-b"
+	delivery.Job.Action.StepAttempt = 2
+	delivery.Job.Action.Input = json.RawMessage(`{"ok":false}`)
 	second, err := service.executeJob(context.Background(), delivery, "resolved-provider", workerScope{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -275,6 +320,9 @@ func TestWorkerRedeliveryRetainsJobAndActionButCreatesNewProviderAttempt(t *test
 	}
 	if store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != *second.ProviderAttemptID || *store.tool.ProviderAttemptID == *first.ProviderAttemptID {
 		t.Fatalf("P1 was not displaced by exact redelivery P2: tool=%#v first=%v second=%v", store.tool, first.ProviderAttemptID, second.ProviderAttemptID)
+	}
+	if store.effectiveAttempts[delivery.Job.Action.StepRunID] != 2 || !bytes.Equal(store.effectiveInputs[delivery.Job.Action.StepRunID], json.RawMessage(`{"ok":true}`)) {
+		t.Fatalf("redelivery did not retain frozen input across attempts: attempts=%#v inputs=%#v", store.effectiveAttempts, store.effectiveInputs)
 	}
 }
 
@@ -331,7 +379,7 @@ func TestWorkerTerminalAuditWarningDoesNotLogInternalError(t *testing.T) {
 }
 
 func parityAction(taskID, runID, stepID domain.ID) domain.ActionRequest {
-	return domain.ActionRequest{ID: domain.NewID(), TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "parity.cap", Input: json.RawMessage(`{"ok":true}`), IdempotencyKey: string(stepID)}
+	return domain.ActionRequest{ID: domain.NewID(), TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "parity.cap", Input: json.RawMessage(`{"ok":true}`), IdempotencyKey: string(stepID), StepAttempt: 1}
 }
 
 func assertArtifactRoles(t *testing.T, name string, store *workerStore, artifacts *workerArtifacts) {

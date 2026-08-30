@@ -24,6 +24,7 @@ type Store interface {
 	MarkScheduledExecutionTaskCreated(context.Context, domain.ID, domain.ID, string, int) error
 	MarkScheduledExecutionRunning(context.Context, domain.ID, domain.ID, domain.ID, *domain.ID, string, int) error
 	MarkScheduledExecutionPaused(context.Context, domain.ID, string, int) error
+	MarkScheduledExecutionCheckpointUnavailable(context.Context, domain.ID, string, int) error
 	MarkScheduledExecutionPausedForApproval(context.Context, domain.ID, string, int) error
 	MarkScheduledExecutionCompleted(context.Context, domain.ID, string, int) error
 	MarkScheduledExecutionFailed(context.Context, domain.ID, string, int, string, string) error
@@ -166,6 +167,9 @@ func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, s
 	}
 	if errors.Is(err, orchestration.ErrScopeExpansion) {
 		return s.Store.MarkScheduledExecutionBlocked(context.WithoutCancel(ctx), exec.ID, result.ScopeChange.ScopeVersionID, s.Owner, exec.AttemptCount)
+	}
+	if errors.Is(err, workflow.ErrWorkflowCheckpointUnavailable) {
+		return s.Store.MarkScheduledExecutionCheckpointUnavailable(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount)
 	}
 	if result.State != nil && result.State.Run.Status == domain.RunCancelled {
 		return s.Store.MarkScheduledExecutionCancelled(context.WithoutCancel(ctx), exec.ID, s.Owner, exec.AttemptCount)

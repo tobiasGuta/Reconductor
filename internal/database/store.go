@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/changes"
@@ -20,6 +21,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/migrations"
 	"github.com/tobiasGuta/Reconductor/internal/normalize"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
+	"github.com/tobiasGuta/Reconductor/internal/targeting"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
@@ -274,6 +276,27 @@ func auditPlanDerivations(ctx context.Context, tx pgx.Tx, snapshot domain.ScopeS
 	return nil
 }
 
+func (s *Store) ScopeTargetPlan(ctx context.Context, scopeVersionID, programID domain.ID) (targeting.TargetPlan, error) {
+	var raw json.RawMessage
+	var digest string
+	if err := s.Pool.QueryRow(ctx, `SELECT target_plan,target_plan_digest FROM scope_versions WHERE id=$1 AND program_id=$2`, scopeVersionID, programID).Scan(&raw, &digest); err != nil {
+		return targeting.TargetPlan{}, err
+	}
+	var plan targeting.TargetPlan
+	if err := json.Unmarshal(raw, &plan); err != nil {
+		return targeting.TargetPlan{}, fmt.Errorf("%w: original target plan is invalid: %v", workflow.ErrWorkflowCheckpointConflict, err)
+	}
+	if plan.Digest == "" || plan.Digest != digest {
+		return targeting.TargetPlan{}, fmt.Errorf("%w: original target plan identity does not match its scope version", workflow.ErrWorkflowCheckpointConflict)
+	}
+	for _, root := range plan.DiscoveryRoots {
+		if strings.TrimSpace(root.Domain) == "" || len(root.SourceRuleIDs) == 0 {
+			return targeting.TargetPlan{}, fmt.Errorf("%w: original discovery root lacks deterministic source-rule provenance", workflow.ErrWorkflowCheckpointConflict)
+		}
+	}
+	return plan, nil
+}
+
 func difference(left, right []string) []string {
 	set := map[string]bool{}
 	for _, value := range right {
@@ -294,9 +317,73 @@ func scopeChange(previousPlan string, previousInclude, previousExclude []string,
 	change.ExpandsScope = previousPlan != "" && (len(change.AddedIncludeDigests) > 0 || len(change.RemovedExcludeDigests) > 0)
 	return change
 }
-func (s *Store) CreateWorkflowDefinition(ctx context.Context, id domain.ID, name, version, description string, definition json.RawMessage) error {
-	_, err := s.Pool.Exec(ctx, `INSERT INTO workflow_definitions(id,name,version,description,definition) VALUES($1,$2,$3,$4,$5) ON CONFLICT(name,version) DO UPDATE SET description=EXCLUDED.description,definition=EXCLUDED.definition`, id, name, version, description, definition)
-	return err
+func (s *Store) EnsureWorkflowTemplate(ctx context.Context, template workflow.Template) error {
+	descriptor, err := template.Descriptor()
+	if err != nil {
+		return err
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	createdAt := template.CreatedAt.UTC().Truncate(time.Microsecond)
+	if _, err = tx.Exec(ctx, `INSERT INTO workflow_definitions(id,name,version,description,definition,default_policy_requirements,created_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, template.ID, template.Name, template.Version, template.Description, descriptor, template.DefaultPolicyRequirements, createdAt); err != nil {
+		return err
+	}
+	type persistedTemplate struct {
+		id                         domain.ID
+		name, version, description string
+		definition, requirements   json.RawMessage
+		createdAt                  time.Time
+	}
+	rows, err := tx.Query(ctx, `SELECT id,name,version,description,definition,default_policy_requirements,created_at
+		FROM workflow_definitions WHERE id=$1 OR (name=$2 AND version=$3) ORDER BY id FOR UPDATE`, template.ID, template.Name, template.Version)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	persisted := make([]persistedTemplate, 0, 2)
+	for rows.Next() {
+		var item persistedTemplate
+		if err := rows.Scan(&item.id, &item.name, &item.version, &item.description, &item.definition, &item.requirements, &item.createdAt); err != nil {
+			return err
+		}
+		persisted = append(persisted, item)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(persisted) != 1 || persisted[0].id != template.ID || persisted[0].name != template.Name || persisted[0].version != template.Version {
+		return fmt.Errorf("%w: id=%s name=%s version=%s", workflow.ErrWorkflowTemplateIdentityConflict, template.ID, template.Name, template.Version)
+	}
+	item := persisted[0]
+	var definitionEqual, requirementsEqual bool
+	if err := tx.QueryRow(ctx, `SELECT $1::jsonb=$2::jsonb,$3::jsonb=$4::jsonb`, item.definition, descriptor, item.requirements, template.DefaultPolicyRequirements).Scan(&definitionEqual, &requirementsEqual); err != nil {
+		return err
+	}
+	if item.description != template.Description || !definitionEqual || !requirementsEqual || !item.createdAt.Equal(createdAt) {
+		return fmt.Errorf("%w: id=%s name=%s version=%s", workflow.ErrWorkflowTemplateDefinitionConflict, template.ID, template.Name, template.Version)
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) WorkflowTemplate(ctx context.Context, id domain.ID) (workflow.Template, error) {
+	var template workflow.Template
+	var raw json.RawMessage
+	err := s.Pool.QueryRow(ctx, `SELECT id,name,version,description,definition,default_policy_requirements,created_at FROM workflow_definitions WHERE id=$1`, id).Scan(
+		&template.ID, &template.Name, &template.Version, &template.Description, &raw, &template.DefaultPolicyRequirements, &template.CreatedAt,
+	)
+	if err != nil {
+		return workflow.Template{}, err
+	}
+	descriptor, err := workflow.DecodeTemplateDescriptor(raw)
+	if err != nil {
+		return workflow.Template{}, fmt.Errorf("%w: template %s has no supported static descriptor", workflow.ErrTaskWorkflowTemplateUnavailable, id)
+	}
+	template.Materializer = descriptor.Materializer
+	return template, nil
 }
 func (s *Store) WorkflowDefinitionID(ctx context.Context, name, version string) (domain.ID, error) {
 	var id domain.ID
@@ -410,13 +497,71 @@ func (s *Store) SetTaskStatusFromWorkflow(ctx context.Context, id domain.ID, sta
 }
 
 func (s *Store) CreateWorkflowRun(ctx context.Context, r domain.WorkflowRun) error {
-	_, err := s.Pool.Exec(ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,previous_run_id,trigger_source,summary) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, r.ID, r.TaskID, r.WorkflowDefinitionID, r.WorkflowVersion, r.Status, r.StartedAt, r.CompletedAt, r.PreviousRunID, r.TriggerSource, r.Summary)
-	return err
+	return s.SaveWorkflowState(ctx, &workflow.State{Run: r, Steps: map[string]*workflow.StepState{}})
 }
 func (s *Store) GetWorkflowRun(ctx context.Context, id domain.ID) (domain.WorkflowRun, error) {
 	var r domain.WorkflowRun
-	err := s.Pool.QueryRow(ctx, `SELECT id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,previous_run_id,trigger_source,summary FROM workflow_runs WHERE id=$1`, id).Scan(&r.ID, &r.TaskID, &r.WorkflowDefinitionID, &r.WorkflowVersion, &r.Status, &r.StartedAt, &r.CompletedAt, &r.PreviousRunID, &r.TriggerSource, &r.Summary)
+	err := scanWorkflowRun(s.Pool.QueryRow(ctx, `SELECT id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,previous_run_id,trigger_source,summary,materialized_definition,materialization_digest,original_scope_version_id FROM workflow_runs WHERE id=$1`, id), &r)
 	return r, err
+}
+
+type workflowRunScanner interface {
+	Scan(...any) error
+}
+
+func scanWorkflowRun(row workflowRunScanner, run *domain.WorkflowRun) error {
+	var materializedDefinition []byte
+	var materializationDigest pgtype.Text
+	var originalScopeVersionID pgtype.UUID
+	if err := row.Scan(
+		&run.ID, &run.TaskID, &run.WorkflowDefinitionID, &run.WorkflowVersion, &run.Status, &run.StartedAt, &run.CompletedAt, &run.PreviousRunID, &run.TriggerSource, &run.Summary,
+		&materializedDefinition, &materializationDigest, &originalScopeVersionID,
+	); err != nil {
+		return err
+	}
+	run.MaterializedDefinition = append(json.RawMessage(nil), materializedDefinition...)
+	run.MaterializationDigest = ""
+	if materializationDigest.Valid {
+		run.MaterializationDigest = materializationDigest.String
+	}
+	run.OriginalScopeVersionID = nil
+	if originalScopeVersionID.Valid {
+		value := domain.ID(originalScopeVersionID.String())
+		run.OriginalScopeVersionID = &value
+	}
+	return nil
+}
+
+func (s *Store) LoadWorkflowState(ctx context.Context, id domain.ID) (*workflow.State, error) {
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	state := &workflow.State{Steps: map[string]*workflow.StepState{}}
+	r := &state.Run
+	if err := scanWorkflowRun(tx.QueryRow(ctx, `SELECT id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,previous_run_id,trigger_source,summary,materialized_definition,materialization_digest,original_scope_version_id FROM workflow_runs WHERE id=$1`, id), r); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `SELECT id,workflow_run_id,step_definition_id,capability,status,attempt_count,input,output,error_classification,error_details,started_at,completed_at,idempotency_key,approval_state FROM step_runs WHERE workflow_run_id=$1 ORDER BY step_definition_id,id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var run domain.StepRun
+		if err := rows.Scan(&run.ID, &run.WorkflowRunID, &run.StepDefinitionID, &run.Capability, &run.Status, &run.AttemptCount, &run.Input, &run.Output, &run.ErrorClassification, &run.ErrorDetails, &run.StartedAt, &run.CompletedAt, &run.IdempotencyKey, &run.ApprovalState); err != nil {
+			return nil, err
+		}
+		state.Steps[run.StepDefinitionID] = &workflow.StepState{Run: run, InputHash: workflow.InputDigest(run.Input)}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return state, nil
 }
 
 type ApprovalListItem struct {
@@ -756,14 +901,14 @@ func persistResultTransaction(ctx context.Context, tx pgx.Tx, programID domain.I
 		return err
 	}
 	switch step.Status {
-	case domain.StepSucceeded, domain.StepFailed, domain.StepRetryable:
+	case domain.StepSucceeded, domain.StepFailed, domain.StepRetryable, domain.StepCancelled:
 	default:
 		return resultConflict(lineage.scheduled, resultFenceInvalidResultState, "result status is not persistable")
 	}
 	if step.Status == domain.StepRetryable && step.CompletedAt != nil {
 		return resultConflict(lineage.scheduled, resultFenceInvalidResultState, "retryable result is completed")
 	}
-	if (step.Status == domain.StepSucceeded || step.Status == domain.StepFailed) && step.CompletedAt == nil {
+	if (step.Status == domain.StepSucceeded || step.Status == domain.StepFailed || step.Status == domain.StepCancelled) && step.CompletedAt == nil {
 		return resultConflict(lineage.scheduled, resultFenceInvalidResultState, "terminal result is not completed")
 	}
 	if tool != nil {
@@ -1506,6 +1651,83 @@ func (s *Store) PreviousObservationValues(ctx context.Context, programID, curren
 	return out, rows.Err()
 }
 
+func (s *Store) LoadEffectiveStepInput(ctx context.Context, programID domain.ID, action domain.ActionRequest) (json.RawMessage, bool, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback(ctx)
+	step := effectiveInputStep(action)
+	if _, err := lockResultLineage(ctx, tx, programID, step); err != nil {
+		return nil, false, err
+	}
+	var input json.RawMessage
+	var attemptCount int
+	if err := tx.QueryRow(ctx, `SELECT input,attempt_count FROM step_runs WHERE id=$1`, action.StepRunID).Scan(&input, &attemptCount); err != nil {
+		return nil, false, err
+	}
+	if action.StepAttempt < attemptCount {
+		return nil, false, &workflow.StepAttemptOwnershipError{StepRunID: action.StepRunID, RequestedAttempt: action.StepAttempt, AuthoritativeAttempt: attemptCount}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	return append(json.RawMessage(nil), input...), attemptCount > 0, nil
+}
+
+func (s *Store) PersistEffectiveStepInput(ctx context.Context, programID domain.ID, action domain.ActionRequest, proposed json.RawMessage) (json.RawMessage, error) {
+	if action.StepAttempt < 1 || len(proposed) == 0 || !json.Valid(proposed) {
+		return nil, fmt.Errorf("%w: effective input or attempt is invalid", workflow.ErrEffectiveStepInputConflict)
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	step := effectiveInputStep(action)
+	if _, err := lockResultLineage(ctx, tx, programID, step); err != nil {
+		return nil, err
+	}
+	var persisted json.RawMessage
+	var attemptCount int
+	if err := tx.QueryRow(ctx, `SELECT input,attempt_count FROM step_runs WHERE id=$1`, action.StepRunID).Scan(&persisted, &attemptCount); err != nil {
+		return nil, err
+	}
+	if attemptCount > 0 {
+		if action.StepAttempt <= attemptCount {
+			return nil, &workflow.StepAttemptOwnershipError{StepRunID: action.StepRunID, RequestedAttempt: action.StepAttempt, AuthoritativeAttempt: attemptCount}
+		}
+		var equal bool
+		if err := tx.QueryRow(ctx, `SELECT $1::jsonb=$2::jsonb`, persisted, proposed).Scan(&equal); err != nil {
+			return nil, err
+		}
+		if action.StepAttempt != attemptCount+1 || !equal {
+			return nil, fmt.Errorf("%w: StepRun %s already has authoritative attempt %d input", workflow.ErrEffectiveStepInputConflict, action.StepRunID, attemptCount)
+		}
+		if err := tx.QueryRow(ctx, `UPDATE step_runs SET attempt_count=$2 WHERE id=$1 AND attempt_count=$3 RETURNING input`, action.StepRunID, action.StepAttempt, attemptCount).Scan(&persisted); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return append(json.RawMessage(nil), persisted...), nil
+	}
+	if action.StepAttempt != 1 {
+		return nil, fmt.Errorf("%w: first durable attempt for StepRun %s must be 1, got %d", workflow.ErrEffectiveStepInputConflict, action.StepRunID, action.StepAttempt)
+	}
+	if err := tx.QueryRow(ctx, `UPDATE step_runs SET input=$2,attempt_count=$3 WHERE id=$1 AND attempt_count=0 RETURNING input`, action.StepRunID, proposed, action.StepAttempt).Scan(&persisted); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return append(json.RawMessage(nil), persisted...), nil
+}
+
+func effectiveInputStep(action domain.ActionRequest) domain.StepRun {
+	return domain.StepRun{ID: action.StepRunID, WorkflowRunID: action.WorkflowRunID, Capability: action.Capability, IdempotencyKey: action.IdempotencyKey}
+}
+
 func previousObservationValue(metadata json.RawMessage, observedValue string) string {
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(metadata, &fields) == nil && len(fields) == 1 {
@@ -1541,8 +1763,31 @@ func (s *Store) saveWorkflowState(ctx context.Context, state *workflow.State, li
 	if err := lockAndValidateWorkflowSave(ctx, tx, state, lifecycle != nil); err != nil {
 		return err
 	}
+	if err := lockAndValidateAuthoritativeStepAttempts(ctx, tx, state); err != nil {
+		return err
+	}
 	r := state.Run
-	_, err = tx.Exec(ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,previous_run_id,trigger_source,summary) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO UPDATE SET status=EXCLUDED.status,started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,summary=EXCLUDED.summary`, r.ID, r.TaskID, r.WorkflowDefinitionID, r.WorkflowVersion, r.Status, r.StartedAt, r.CompletedAt, r.PreviousRunID, r.TriggerSource, r.Summary)
+	initial, err := guardInitialWorkflowRun(ctx, tx, r)
+	if err != nil {
+		return err
+	}
+	if initial {
+		result, updateErr := tx.Exec(ctx, `UPDATE tasks SET status='running',updated_at=now() WHERE id=$1 AND status IN ('pending','running')`, r.TaskID)
+		if updateErr != nil {
+			return updateErr
+		}
+		if result.RowsAffected() != 1 {
+			return fmt.Errorf("task %s is not in a recoverable pre-run state", r.TaskID)
+		}
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO workflow_runs(id,task_id,workflow_definition_id,workflow_version,status,started_at,completed_at,previous_run_id,trigger_source,summary,materialized_definition,materialization_digest,original_scope_version_id)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		ON CONFLICT(id) DO UPDATE SET
+			status=EXCLUDED.status,
+			started_at=COALESCE(workflow_runs.started_at,EXCLUDED.started_at),
+			completed_at=CASE WHEN workflow_runs.status IN ('completed','failed','cancelled') THEN workflow_runs.completed_at ELSE EXCLUDED.completed_at END,
+			summary=CASE WHEN workflow_runs.status IN ('completed','failed','cancelled') THEN workflow_runs.summary ELSE EXCLUDED.summary END`,
+		r.ID, r.TaskID, r.WorkflowDefinitionID, r.WorkflowVersion, r.Status, r.StartedAt, r.CompletedAt, r.PreviousRunID, r.TriggerSource, r.Summary, r.MaterializedDefinition, r.MaterializationDigest, r.OriginalScopeVersionID)
 	if err != nil {
 		return err
 	}
@@ -1553,7 +1798,16 @@ func (s *Store) saveWorkflowState(ctx context.Context, state *workflow.State, li
 	}
 	for _, ss := range state.Steps {
 		x := ss.Run
-		_, err = tx.Exec(ctx, `INSERT INTO step_runs(id,workflow_run_id,step_definition_id,capability,status,attempt_count,input,output,error_classification,error_details,started_at,completed_at,idempotency_key,approval_state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO UPDATE SET status=EXCLUDED.status,attempt_count=EXCLUDED.attempt_count,input=EXCLUDED.input,output=EXCLUDED.output,error_classification=EXCLUDED.error_classification,error_details=EXCLUDED.error_details,started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,approval_state=EXCLUDED.approval_state`, x.ID, x.WorkflowRunID, x.StepDefinitionID, x.Capability, x.Status, x.AttemptCount, x.Input, x.Output, x.ErrorClassification, x.ErrorDetails, x.StartedAt, x.CompletedAt, x.IdempotencyKey, x.ApprovalState)
+		_, err = tx.Exec(ctx, `INSERT INTO step_runs(id,workflow_run_id,step_definition_id,capability,status,attempt_count,input,output,error_classification,error_details,started_at,completed_at,idempotency_key,approval_state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO UPDATE SET
+			status=EXCLUDED.status,
+			attempt_count=EXCLUDED.attempt_count,
+			input=EXCLUDED.input,
+			output=CASE WHEN step_runs.status IN ('succeeded','failed','skipped','cancelled') OR (step_runs.status='retryable' AND EXCLUDED.status='retryable') THEN step_runs.output ELSE EXCLUDED.output END,
+			error_classification=CASE WHEN step_runs.status IN ('succeeded','failed','skipped','cancelled') OR (step_runs.status='retryable' AND EXCLUDED.status='retryable') THEN step_runs.error_classification ELSE EXCLUDED.error_classification END,
+			error_details=CASE WHEN step_runs.status IN ('succeeded','failed','skipped','cancelled') OR (step_runs.status='retryable' AND EXCLUDED.status='retryable') THEN step_runs.error_details ELSE EXCLUDED.error_details END,
+			started_at=COALESCE(step_runs.started_at,EXCLUDED.started_at),
+			completed_at=CASE WHEN step_runs.status IN ('succeeded','failed','skipped','cancelled') OR (step_runs.status='retryable' AND EXCLUDED.status='retryable') THEN step_runs.completed_at ELSE EXCLUDED.completed_at END,
+			approval_state=EXCLUDED.approval_state`, x.ID, x.WorkflowRunID, x.StepDefinitionID, x.Capability, x.Status, x.AttemptCount, x.Input, x.Output, x.ErrorClassification, x.ErrorDetails, x.StartedAt, x.CompletedAt, x.IdempotencyKey, x.ApprovalState)
 		if err != nil {
 			return err
 		}
@@ -1584,6 +1838,81 @@ func (s *Store) saveWorkflowState(ctx context.Context, state *workflow.State, li
 	return tx.Commit(ctx)
 }
 
+func guardInitialWorkflowRun(ctx context.Context, tx pgx.Tx, run domain.WorkflowRun) (bool, error) {
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE id=$1)`, run.ID).Scan(&exists); err != nil {
+		return false, err
+	}
+	if exists {
+		return false, nil
+	}
+	if run.OriginalScopeVersionID == nil {
+		return false, fmt.Errorf("%w: new run has no original scope version", workflow.ErrWorkflowCheckpointConflict)
+	}
+	definition, err := workflow.VerifyMaterialization(run.MaterializedDefinition, run.MaterializationDigest)
+	if err != nil {
+		return false, err
+	}
+	if definition.ID != run.WorkflowDefinitionID || definition.Version != run.WorkflowVersion {
+		return false, fmt.Errorf("%w: materialized definition identity differs from WorkflowRun", workflow.ErrWorkflowCheckpointConflict)
+	}
+	var taskProgramID, taskTemplateID domain.ID
+	if err := tx.QueryRow(ctx, `SELECT program_id,workflow_definition_id FROM tasks WHERE id=$1 FOR UPDATE`, run.TaskID).Scan(&taskProgramID, &taskTemplateID); err != nil {
+		return false, err
+	}
+	if taskTemplateID != run.WorkflowDefinitionID {
+		return false, fmt.Errorf("%w: task %s pins template %s, not %s", workflow.ErrTaskWorkflowTemplateUnavailable, run.TaskID, taskTemplateID, run.WorkflowDefinitionID)
+	}
+	var templateName, templateVersion, templateDescription string
+	var templateDescriptor, templateRequirements json.RawMessage
+	var templateCreatedAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT name,version,description,definition,default_policy_requirements,created_at FROM workflow_definitions WHERE id=$1`, taskTemplateID).Scan(&templateName, &templateVersion, &templateDescription, &templateDescriptor, &templateRequirements, &templateCreatedAt); err != nil {
+		return false, err
+	}
+	descriptor, err := workflow.DecodeTemplateDescriptor(templateDescriptor)
+	if err != nil {
+		return false, fmt.Errorf("%w: template %s has no supported static descriptor", workflow.ErrTaskWorkflowTemplateUnavailable, taskTemplateID)
+	}
+	var requirementsEqual bool
+	if err := tx.QueryRow(ctx, `SELECT $1::jsonb=$2::jsonb`, templateRequirements, definition.DefaultPolicyRequirements).Scan(&requirementsEqual); err != nil {
+		return false, err
+	}
+	if definition.Name != templateName || definition.Version != templateVersion || definition.Materializer != descriptor.Materializer || definition.Description != templateDescription || !definition.CreatedAt.Equal(templateCreatedAt) || !requirementsEqual {
+		return false, fmt.Errorf("%w: materialized definition release metadata differs from template", workflow.ErrWorkflowCheckpointConflict)
+	}
+	var scopeProgramID domain.ID
+	if err := tx.QueryRow(ctx, `SELECT program_id FROM scope_versions WHERE id=$1`, *run.OriginalScopeVersionID).Scan(&scopeProgramID); err != nil {
+		return false, err
+	}
+	if scopeProgramID != taskProgramID {
+		return false, fmt.Errorf("%w: original scope version belongs to program %s, not %s", workflow.ErrWorkflowCheckpointConflict, scopeProgramID, taskProgramID)
+	}
+	rows, err := tx.Query(ctx, `SELECT id FROM workflow_runs WHERE task_id=$1 AND status IN ('pending','running','paused') ORDER BY id FOR UPDATE`, run.TaskID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	active := make([]domain.ID, 0, 2)
+	for rows.Next() {
+		var id domain.ID
+		if err := rows.Scan(&id); err != nil {
+			return false, err
+		}
+		active = append(active, id)
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	switch len(active) {
+	case 0:
+		return true, nil
+	case 1:
+		return false, &workflow.RunLineageError{Cause: workflow.ErrWorkflowRunAlreadyActive, TaskID: run.TaskID, RunID: active[0]}
+	default:
+		return false, &workflow.RunLineageError{Cause: workflow.ErrWorkflowRunLineageConflict, TaskID: run.TaskID, Detail: fmt.Sprintf("%d non-terminal runs already exist", len(active))}
+	}
+}
+
 type WorkflowPersister struct {
 	Store     *Store
 	File      workflow.FileStore
@@ -1594,5 +1923,8 @@ func (p WorkflowPersister) Save(ctx context.Context, state *workflow.State) erro
 	if err := p.Store.saveWorkflowState(ctx, state, p.Lifecycle); err != nil {
 		return err
 	}
-	return p.File.Save(ctx, state)
+	if err := p.File.Save(ctx, state); err != nil {
+		return &workflow.RunLineageError{Cause: workflow.ErrWorkflowCheckpointUnavailable, TaskID: state.Run.TaskID, RunID: state.Run.ID, Detail: err.Error()}
+	}
+	return nil
 }

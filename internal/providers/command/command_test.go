@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -70,7 +71,11 @@ func TestPassiveDiscoveryOutputIsFilteredPerRecordBeforeActiveUse(t *testing.T) 
 	runner := &fakeRunner{stdout: "authorized.dev.example.com\nunauthorized.example.com\nexcluded.dev.example.com\nbad host\n"}
 	p := New(Definition{Name: "discover.subdomains", Provider: "subfinder", Executable: "subfinder", Version: "2", Risk: policy.Passive, PassiveInput: true, OutputAdapter: "subfinder", BuildArgs: func(i Input, _ policy.Policy) ([]string, error) { return []string{"-d", i.Domains[0]}, nil }}, runner, nil)
 	raw, _ := json.Marshal(Input{Domains: []string{"dev.example.com"}})
-	req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), StepRunID: domain.NewID(), Capability: "discover.subdomains", Input: raw}, Policy: policy.Policy{AllowedCapabilities: []string{"discover.subdomains"}}, Scope: sc}
+	plan, err := targeting.Plan(sc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), StepRunID: domain.NewID(), Capability: "discover.subdomains", Input: raw}, Policy: policy.Policy{AllowedCapabilities: []string{"discover.subdomains"}}, Scope: targeting.WithDiscoveryRoots(sc, plan.DiscoveryRoots, plan.DiscoveryRoots)}
 	if err := p.Validate(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
@@ -103,6 +108,59 @@ func TestPassiveDiscoveryOutputIsFilteredPerRecordBeforeActiveUse(t *testing.T) 
 	}
 	if len(output.Filtered) != 2 || len(output.Warnings) != 1 {
 		t.Fatalf("filtered=%v warnings=%v", output.Filtered, output.Warnings)
+	}
+}
+
+func TestPassiveDiscoveryRootsAreVetoedAgainstCurrentTargetPlan(t *testing.T) {
+	tests := []struct {
+		name       string
+		hostRule   string
+		inputRoots []string
+		wantArgs   []string
+		wantError  bool
+	}{
+		{name: "root still authorized", hostRule: `^.*\.example\.test$`, inputRoots: []string{"example.test"}, wantArgs: []string{"-roots", "example.test"}},
+		{name: "root removed", hostRule: `^api\.example\.test$`, inputRoots: []string{"example.test"}, wantError: true},
+		{name: "wildcard authorization changed", hostRule: `^.*\.other\.test$`, inputRoots: []string{"example.test"}, wantError: true},
+		{name: "mixed roots fail closed", hostRule: `^.*\.example\.test$`, inputRoots: []string{"example.test", "removed.test"}, wantError: true},
+		{name: "full veto", hostRule: `^api\.other\.test$`, inputRoots: []string{"example.test", "removed.test"}, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sc, err := platformscope.Compile([]platformscope.Rule{{Protocol: `^https$`, Host: test.hostRule, Port: `^443$`, File: `^/.*`, Enabled: true}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := targeting.Plan(sc, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner := &fakeRunner{}
+			provider := New(Definition{Name: "discover.subdomains", Provider: "subfinder", Executable: "subfinder", Version: "2", Risk: policy.Passive, PassiveInput: true, BuildArgs: func(input Input, _ policy.Policy) ([]string, error) {
+				return []string{"-roots", strings.Join(input.Domains, ",")}, nil
+			}}, runner, nil)
+			raw, err := json.Marshal(Input{Domains: test.inputRoots})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), StepRunID: domain.NewID(), Capability: "discover.subdomains", Input: raw}, Policy: policy.Policy{AllowedCapabilities: []string{"discover.subdomains"}}, Scope: targeting.WithDiscoveryRoots(sc, plan.DiscoveryRoots, plan.DiscoveryRoots)}
+			validationErr := provider.Validate(context.Background(), req)
+			if test.wantError {
+				if validationErr == nil || runner.called {
+					t.Fatalf("validation error=%v provider_called=%v", validationErr, runner.called)
+				}
+				return
+			}
+			if validationErr != nil {
+				t.Fatal(validationErr)
+			}
+			if _, err := provider.Execute(context.Background(), req); err != nil {
+				t.Fatal(err)
+			}
+			if !runner.called || !slices.Equal(runner.args, test.wantArgs) {
+				t.Fatalf("provider_called=%v args=%v want=%v", runner.called, runner.args, test.wantArgs)
+			}
+		})
 	}
 }
 

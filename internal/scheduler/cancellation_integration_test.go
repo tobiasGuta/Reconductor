@@ -498,7 +498,9 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		}
 		registry := capability.NewRegistry()
 		ready := make(chan struct{})
+		var providerCalls atomic.Int32
 		fakeExecute := func(ctx context.Context) (capability.Result, error) {
+			providerCalls.Add(1)
 			close(ready)
 			<-ctx.Done()
 			return capability.Result{}, ctx.Err()
@@ -515,14 +517,30 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		go func() { errs <- svc.Dispatch(cancelCtx) }()
 		<-ready
 		cancel()
-		<-errs
-
-		var status domain.ScheduledExecutionStatus
-		if err := store.Pool.QueryRow(ctx, `SELECT status FROM scheduled_executions WHERE id=$1`, execution.ID).Scan(&status); err != nil {
-			t.Fatalf("query final scheduled execution status: %v", err)
+		if err := <-errs; err != nil {
+			t.Fatalf("Dispatch failed after parent cancellation: %v", err)
 		}
-		if status != domain.ScheduledExecutionCancelled {
-			t.Fatalf("expected cancelled, got %v", status)
+
+		var scheduledStatus domain.ScheduledExecutionStatus
+		var taskStatus domain.TaskStatus
+		var workflowStatus domain.RunStatus
+		var cancelledSteps, exactAcceptedResults, cancelledProviderTerminals int
+		if err := store.Pool.QueryRow(ctx, `
+			SELECT se.status,t.status,wr.status,
+				(SELECT count(*) FROM step_runs sr WHERE sr.workflow_run_id=wr.id AND sr.status='cancelled' AND sr.attempt_count=1 AND sr.error_classification='cancelled' AND sr.completed_at IS NOT NULL),
+				(SELECT count(*) FROM audit_events accepted
+				 JOIN audit_events started ON started.id=accepted.provider_attempt_id AND started.event_type='provider_invocation_started'
+				 JOIN tool_runs tool ON tool.id=accepted.tool_run_id AND tool.provider_attempt_id=started.id
+				 WHERE accepted.event_type='provider_result_accepted' AND accepted.workflow_run_id=wr.id AND accepted.step_attempt=1),
+				(SELECT count(*) FROM audit_events ae WHERE ae.workflow_run_id=wr.id AND ae.event_type='provider_invocation_cancelled')
+			FROM scheduled_executions se
+			JOIN tasks t ON t.id=se.task_id
+			JOIN workflow_runs wr ON wr.id=se.workflow_run_id
+			WHERE se.id=$1`, execution.ID).Scan(&scheduledStatus, &taskStatus, &workflowStatus, &cancelledSteps, &exactAcceptedResults, &cancelledProviderTerminals); err != nil {
+			t.Fatalf("query final cancellation lineage: %v", err)
+		}
+		if providerCalls.Load() != 1 || scheduledStatus != domain.ScheduledExecutionCancelled || taskStatus != domain.TaskCancelled || workflowStatus != domain.RunCancelled || cancelledSteps != 1 || exactAcceptedResults != 1 || cancelledProviderTerminals != 1 {
+			t.Fatalf("parent cancellation provider_calls=%d scheduled=%s task=%s workflow=%s cancelled_steps=%d exact_results=%d provider_terminals=%d", providerCalls.Load(), scheduledStatus, taskStatus, workflowStatus, cancelledSteps, exactAcceptedResults, cancelledProviderTerminals)
 		}
 	})
 
@@ -934,16 +952,23 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		var scheduledStatus domain.ScheduledExecutionStatus
 		var taskStatus domain.TaskStatus
 		var workflowStatus domain.RunStatus
+		var cancelledSteps, exactAcceptedResults, cancelledProviderTerminals int
 		if err := store.Pool.QueryRow(ctx, `
-			SELECT se.status,t.status,wr.status
+			SELECT se.status,t.status,wr.status,
+				(SELECT count(*) FROM step_runs sr WHERE sr.workflow_run_id=wr.id AND sr.status='cancelled' AND sr.attempt_count=1 AND sr.error_classification='cancelled' AND sr.completed_at IS NOT NULL),
+				(SELECT count(*) FROM audit_events accepted
+				 JOIN audit_events started ON started.id=accepted.provider_attempt_id AND started.event_type='provider_invocation_started'
+				 JOIN tool_runs tool ON tool.id=accepted.tool_run_id AND tool.provider_attempt_id=started.id
+				 WHERE accepted.event_type='provider_result_accepted' AND accepted.workflow_run_id=wr.id AND accepted.step_attempt=1),
+				(SELECT count(*) FROM audit_events ae WHERE ae.workflow_run_id=wr.id AND ae.event_type='provider_invocation_cancelled')
 			FROM scheduled_executions se
 			JOIN tasks t ON t.id=se.task_id
 			JOIN workflow_runs wr ON wr.id=se.workflow_run_id
-			WHERE se.id=$1`, execution.ID).Scan(&scheduledStatus, &taskStatus, &workflowStatus); err != nil {
+			WHERE se.id=$1`, execution.ID).Scan(&scheduledStatus, &taskStatus, &workflowStatus, &cancelledSteps, &exactAcceptedResults, &cancelledProviderTerminals); err != nil {
 			t.Fatalf("query cancellation lineage: %v", err)
 		}
-		if scheduledStatus != domain.ScheduledExecutionCancelled || taskStatus != domain.TaskCancelled || workflowStatus != domain.RunCancelled {
-			t.Fatalf("incoherent cancellation lineage: scheduled=%s task=%s workflow=%s", scheduledStatus, taskStatus, workflowStatus)
+		if scheduledStatus != domain.ScheduledExecutionCancelled || taskStatus != domain.TaskCancelled || workflowStatus != domain.RunCancelled || cancelledSteps != 1 || exactAcceptedResults != 1 || cancelledProviderTerminals != 1 {
+			t.Fatalf("incoherent cancellation lineage: scheduled=%s task=%s workflow=%s cancelled_steps=%d exact_results=%d provider_terminals=%d", scheduledStatus, taskStatus, workflowStatus, cancelledSteps, exactAcceptedResults, cancelledProviderTerminals)
 		}
 
 		var terminalAuditCounts = map[string]int{}

@@ -268,21 +268,22 @@ func taskCommand(ctx context.Context, cfg config.Config, args []string) error {
 		programID := fs.String("program-id", "", "program UUID")
 		objective := fs.String("objective", "", "human objective")
 		requested := fs.String("requested-by", "cli", "request source")
+		workflowName := fs.String("workflow", workflows.ContinuousName, "workflow template name")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if *programID == "" || *objective == "" {
 			return fmt.Errorf("--program-id and --objective are required")
 		}
-		placeholderScope, _ := platformscope.HostScope("placeholder.invalid")
-		placeholderPlan, _ := targeting.Plan(placeholderScope, nil)
-		def := workflows.ContinuousWebRecon(placeholderPlan, false)
-		defJSON, _ := json.Marshal(def)
-		if err := s.CreateWorkflowDefinition(ctx, def.ID, def.Name, def.Version, def.Description, defJSON); err != nil {
+		template, err := workflows.CurrentTemplate(*workflowName)
+		if err != nil {
+			return err
+		}
+		if err := s.EnsureWorkflowTemplate(ctx, template); err != nil {
 			return err
 		}
 		now := time.Now().UTC()
-		t := domain.Task{ID: domain.NewID(), ProgramID: domain.ID(*programID), Objective: *objective, WorkflowDefinitionID: def.ID, Status: domain.TaskPending, RequestedBy: *requested, CreatedAt: now, UpdatedAt: now}
+		t := domain.Task{ID: domain.NewID(), ProgramID: domain.ID(*programID), Objective: *objective, WorkflowDefinitionID: template.ID, Status: domain.TaskPending, RequestedBy: *requested, CreatedAt: now, UpdatedAt: now}
 		if err := s.CreateTask(ctx, t); err != nil {
 			return err
 		}
@@ -564,8 +565,7 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 	}
 	defer s.Close()
 	if *programID == "" && *resumeID != "" {
-		fileStore := workflow.FileStore{Root: cfg.Scheduler.WorkflowStateRoot}
-		state, err := fileStore.Load(*resumeID)
+		state, err := s.LoadWorkflowState(ctx, domain.ID(*resumeID))
 		if err != nil {
 			return err
 		}

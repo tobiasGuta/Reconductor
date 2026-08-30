@@ -24,6 +24,7 @@ type Definition struct {
 	ID                        domain.ID       `json:"id"`
 	Name                      string          `json:"name"`
 	Version                   string          `json:"version"`
+	Materializer              string          `json:"materializer"`
 	Description               string          `json:"description"`
 	Steps                     []Step          `json:"steps"`
 	DefaultPolicyRequirements json.RawMessage `json:"default_policy_requirements"`
@@ -112,13 +113,14 @@ func (c *Controls) Done() <-chan struct{} {
 }
 
 type Engine struct {
-	Registry  *capability.Registry
-	Executor  Executor
-	Persister Persister
-	Approval  ApprovalFunc
-	Policy    policy.Policy
-	Scope     capability.Scope
-	Budget    budget.Limiter
+	Registry               *capability.Registry
+	Executor               Executor
+	Persister              Persister
+	Approval               ApprovalFunc
+	Policy                 policy.Policy
+	Scope                  capability.Scope
+	Budget                 budget.Limiter
+	OriginalScopeVersionID domain.ID
 	// MaxParallel is the maximum number of ready steps in one deterministic
 	// execution wave. Zero preserves the legacy single-step behavior.
 	MaxParallel int
@@ -380,7 +382,16 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 	now := time.Now().UTC()
 	resuming := state != nil
 	if state == nil {
-		state = &State{Run: domain.WorkflowRun{ID: domain.NewID(), TaskID: task.ID, WorkflowDefinitionID: d.ID, WorkflowVersion: d.Version, Status: domain.RunRunning, StartedAt: &now, TriggerSource: task.RequestedBy, Summary: json.RawMessage(`{}`)}, Steps: map[string]*StepState{}}
+		materialized, digest, err := Materialize(d)
+		if err != nil {
+			return nil, err
+		}
+		var scopeVersionID *domain.ID
+		if e.OriginalScopeVersionID != "" {
+			value := e.OriginalScopeVersionID
+			scopeVersionID = &value
+		}
+		state = &State{Run: domain.WorkflowRun{ID: domain.NewID(), TaskID: task.ID, WorkflowDefinitionID: d.ID, WorkflowVersion: d.Version, Status: domain.RunRunning, StartedAt: &now, TriggerSource: task.RequestedBy, Summary: json.RawMessage(`{}`), MaterializedDefinition: materialized, MaterializationDigest: digest, OriginalScopeVersionID: scopeVersionID}, Steps: map[string]*StepState{}}
 		state.Events = append(state.Events, Event{now, "workflow_started", "", "workflow execution started"})
 	} else {
 		state.Run.Status = domain.RunRunning
@@ -492,8 +503,10 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 				}
 			}
 			ss := transitionStep(state, step, input, hash, domain.StepRunning)
-			started := time.Now().UTC()
-			ss.Run.StartedAt = &started
+			if ss.Run.StartedAt == nil {
+				started := time.Now().UTC()
+				ss.Run.StartedAt = &started
+			}
 			ss.Run.ApprovalState = map[bool]string{true: "approved", false: "not_required"}[approved]
 			state.Steps[step.ID] = ss
 			e.event(state, "step_started", step.ID, "capability execution started")
@@ -505,7 +518,7 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 			if provider == "" {
 				provider = step.Capability
 			}
-			plans = append(plans, stepPlan{Definition: step, State: *ss, Input: input, Approved: approved, Provider: provider})
+			plans = append(plans, stepPlan{Definition: step, State: *ss, Input: append(json.RawMessage(nil), ss.Run.Input...), Approved: approved, Provider: provider})
 		}
 		if stateChanged {
 			if err := e.save(runCtx, state); err != nil {
@@ -520,6 +533,11 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 		}
 
 		outcomes := e.executeWave(runCtx, task, state.Run.ID, plans)
+		for _, outcome := range outcomes {
+			if errors.Is(outcome.Err, ErrStepAttemptOwnershipLost) {
+				return state, outcome.Err
+			}
+		}
 		sort.Slice(outcomes, func(i, j int) bool { return rank[outcomes[i].Definition.ID] < rank[outcomes[j].Definition.ID] })
 		var primaryFailure *stepOutcome
 		for index := range outcomes {
@@ -628,7 +646,13 @@ func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	firstAttempt := outcome.State.Run.AttemptCount + 1
+	if firstAttempt > maxAttempts {
+		outcome.Err = fmt.Errorf("retry attempts exhausted after %d durable attempts", outcome.State.Run.AttemptCount)
+		completeStep(&outcome.State)
+		return outcome
+	}
+	for attempt := firstAttempt; attempt <= maxAttempts; attempt++ {
 		outcome.State.Run.AttemptCount = attempt
 		action := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: outcome.State.Run.ID, RequestedBy: "workflow", Capability: plan.Definition.Capability, Reason: "deterministic workflow step " + plan.Definition.ID, Input: plan.Input, IdempotencyKey: outcome.State.Run.IdempotencyKey, StepAttempt: attempt}
 		attemptCtx := ctx
@@ -638,6 +662,19 @@ func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain
 		}
 		outcome.Result, outcome.Err = e.Executor.Execute(attemptCtx, capability.Request{Action: action, Provider: plan.Provider, Approved: plan.Approved, Policy: policy.ParallelShare(e.Policy, plan.ParallelShare), Scope: e.Scope})
 		cancelAttempt()
+		outcome.State.Run.Output = append(json.RawMessage(nil), outcome.Result.Action.Output...)
+		if outcome.Result.Action.Error != nil {
+			outcome.State.Run.ErrorClassification = outcome.Result.Action.Error.Classification
+			outcome.State.Run.ErrorDetails = outcome.Result.Action.Error.Message
+		} else {
+			outcome.State.Run.ErrorClassification = ""
+			outcome.State.Run.ErrorDetails = ""
+		}
+		if len(outcome.Result.EffectiveInput) > 0 {
+			plan.Input = append(json.RawMessage(nil), outcome.Result.EffectiveInput...)
+			outcome.State.Run.Input = append(json.RawMessage(nil), outcome.Result.EffectiveInput...)
+			outcome.State.InputHash = inputHash(outcome.Result.EffectiveInput)
+		}
 		if outcome.Result.TerminalAuditError != nil {
 			outcome.TerminalAuditDegradations++
 		}
@@ -723,13 +760,30 @@ func newStep(state *State, s Step, input json.RawMessage, hash string, status do
 
 func transitionStep(state *State, s Step, input json.RawMessage, hash string, status domain.StepStatus) *StepState {
 	next := newStep(state, s, input, hash, status)
-	if previous := state.Steps[s.ID]; previous != nil && previous.Run.IdempotencyKey == next.Run.IdempotencyKey {
-		next.Run.ID = previous.Run.ID
+	if previous := state.Steps[s.ID]; previous != nil {
+		if previous.Run.AttemptCount > 0 {
+			next.Run.ID = previous.Run.ID
+			next.Run.IdempotencyKey = previous.Run.IdempotencyKey
+			next.Run.AttemptCount = previous.Run.AttemptCount
+			next.Run.Input = append(json.RawMessage(nil), previous.Run.Input...)
+			next.Run.Output = append(json.RawMessage(nil), previous.Run.Output...)
+			next.Run.ErrorClassification = previous.Run.ErrorClassification
+			next.Run.ErrorDetails = previous.Run.ErrorDetails
+			next.Run.StartedAt = previous.Run.StartedAt
+			next.Run.CompletedAt = previous.Run.CompletedAt
+			if previous.Run.Status == domain.StepRetryable && status == domain.StepRunning {
+				next.Run.Status = domain.StepRetryable
+			}
+			next.InputHash = previous.InputHash
+		} else if previous.Run.IdempotencyKey == next.Run.IdempotencyKey {
+			next.Run.ID = previous.Run.ID
+		}
 	}
 	return next
 }
 
-func inputHash(in []byte) string { sum := sha256.Sum256(in); return hex.EncodeToString(sum[:]) }
+func inputHash(in []byte) string   { sum := sha256.Sum256(in); return hex.EncodeToString(sum[:]) }
+func InputDigest(in []byte) string { return inputHash(in) }
 func dependenciesSucceeded(s Step, state *State) bool {
 	for _, d := range s.DependsOn {
 		run := state.Steps[d]

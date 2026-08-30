@@ -14,9 +14,60 @@ import (
 )
 
 const (
-	ContinuousName = "continuous-web-recon"
-	BaselineName   = "authorized-web-baseline"
+	ContinuousName         = "continuous-web-recon"
+	BaselineName           = "authorized-web-baseline"
+	ContinuousVersion      = "2.4.0"
+	BaselineVersion        = "1.4.0"
+	WebReconMaterializerV1 = workflow.SupportedMaterializerRevision
+	ContinuousTemplateID   = domain.ID("3e62ed2c-ab49-421d-a4ce-5fdfead60f4a")
+	BaselineTemplateID     = domain.ID("96b2e895-8c7a-4812-b2dc-fac5eb364547")
 )
+
+var defaultPolicyRequirements = json.RawMessage(`{"forbid":["dos","bruteforce","credential-stuffing","state-changing"],"moderate_requires_approval":true}`)
+
+func Templates() []workflow.Template {
+	return []workflow.Template{
+		{
+			ID:                        ContinuousTemplateID,
+			Name:                      ContinuousName,
+			Version:                   ContinuousVersion,
+			Description:               "Scope-driven continuous web reconnaissance with preliminary briefs and optional scanner enrichment",
+			Materializer:              WebReconMaterializerV1,
+			DefaultPolicyRequirements: append(json.RawMessage(nil), defaultPolicyRequirements...),
+			CreatedAt:                 time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			ID:                        BaselineTemplateID,
+			Name:                      BaselineName,
+			Version:                   BaselineVersion,
+			Description:               "Scope-derived exact-seed authorized web baseline with preliminary briefs and optional scanner enrichment",
+			Materializer:              WebReconMaterializerV1,
+			DefaultPolicyRequirements: append(json.RawMessage(nil), defaultPolicyRequirements...),
+			CreatedAt:                 time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC),
+		},
+	}
+}
+
+func CurrentTemplate(name string) (workflow.Template, error) {
+	if name == "" {
+		name = ContinuousName
+	}
+	for _, template := range Templates() {
+		if template.Name == name {
+			return template, nil
+		}
+	}
+	return workflow.Template{}, fmt.Errorf("unknown workflow %q", name)
+}
+
+func SupportsRelease(id domain.ID, name, version, materializer string) bool {
+	for _, template := range Templates() {
+		if template.ID == id && template.Name == name && template.Version == version && template.Materializer == materializer {
+			return true
+		}
+	}
+	return false
+}
 
 func Build(name string, plan targeting.TargetPlan, headless bool) (workflow.Definition, error) {
 	switch name {
@@ -36,15 +87,16 @@ func Build(name string, plan targeting.TargetPlan, headless bool) (workflow.Defi
 }
 
 func ContinuousWebRecon(plan targeting.TargetPlan, headless bool) workflow.Definition {
-	return webReconDefinition(domain.ID("d0e5e6a3-bd8a-4b4b-a76b-f6452c30179a"), ContinuousName, "2.3.0", "Scope-driven continuous web reconnaissance with preliminary briefs and optional scanner enrichment", plan, headless, true)
+	template, _ := CurrentTemplate(ContinuousName)
+	return webReconDefinition(template, plan, headless, true)
 }
 
 func AuthorizedWebBaseline(plan targeting.TargetPlan, headless bool) workflow.Definition {
-	return webReconDefinition(domain.ID("c9479711-b203-4fe1-8528-718888e5a5d2"), BaselineName, "1.3.0", "Scope-derived exact-seed authorized web baseline with preliminary briefs and optional scanner enrichment", plan, headless, false)
+	template, _ := CurrentTemplate(BaselineName)
+	return webReconDefinition(template, plan, headless, false)
 }
 
-func webReconDefinition(id domain.ID, name, version, description string, plan targeting.TargetPlan, headless, allowDiscovery bool) workflow.Definition {
-	policyRequirements := json.RawMessage(`{"forbid":["dos","bruteforce","credential-stuffing","state-changing"],"moderate_requires_approval":true}`)
+func webReconDefinition(template workflow.Template, plan targeting.TargetPlan, headless, allowDiscovery bool) workflow.Definition {
 	steps := []workflow.Step{}
 	prepare := workflow.Step{ID: "prepare-authorized-targets", Capability: "targeting.prepare", Input: raw(map[string]any{"exact_urls": plan.InitialURLs(), "discovered_urls": []string{}, "ports": commonPorts(plan), "target_plan_digest": plan.Digest}), Retry: retry(), Timeout: time.Minute}
 	if allowDiscovery && len(plan.DiscoveryRoots) > 0 {
@@ -82,7 +134,7 @@ func webReconDefinition(id domain.ID, name, version, description string, plan ta
 		workflow.Step{ID: "run-safe-nuclei-profile", Capability: "scan.nuclei", Provider: "nuclei", DependsOn: []string{"classify-interesting-endpoints"}, Condition: "nonempty:compare-assets.output.scan_targets", Input: raw(map[string]any{"targets": []string{}, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"targets": "compare-assets.output.scan_targets"}, Retry: workflow.RetryPolicy{MaxAttempts: 2, BaseDelay: 5 * time.Second}, Timeout: 45 * time.Minute, ApprovalRequired: true},
 		workflow.Step{ID: "enrich-recon-brief", Capability: "report.changes", DependsOn: []string{"generate-recon-brief", "run-safe-nuclei-profile"}, Input: raw(map[string]any{"changes": []any{}, "endpoints": []any{}, "candidate_matches": []any{}, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"changes": "compare-assets.output.changes", "endpoints": "classify-interesting-endpoints.output.interesting_endpoints", "candidate_matches": "run-safe-nuclei-profile.output.lines"}, Retry: retry(), Timeout: time.Minute},
 	)
-	return workflow.Definition{ID: id, Name: name, Version: version, Description: description, DefaultPolicyRequirements: policyRequirements, CreatedAt: time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC), Steps: steps}
+	return workflow.Definition{ID: template.ID, Name: template.Name, Version: template.Version, Materializer: template.Materializer, Description: template.Description, DefaultPolicyRequirements: append(json.RawMessage(nil), template.DefaultPolicyRequirements...), CreatedAt: template.CreatedAt, Steps: steps}
 }
 
 func commonPorts(plan targeting.TargetPlan) []int {

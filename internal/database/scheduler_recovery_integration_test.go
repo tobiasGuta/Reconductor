@@ -89,12 +89,16 @@ func TestStructuredRecoveryProvenance(t *testing.T) {
 		runID, stepID := domain.NewID(), domain.NewID()
 		state := &workflow.State{
 			Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: env.definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)},
-			Steps: map[string]*workflow.StepState{"active": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "active", Capability: "test.active", Status: domain.StepRunning, AttemptCount: 1, Input: json.RawMessage(`{}`), StartedAt: &now, IdempotencyKey: "structured-recovery-scope-active", ApprovalState: "not_required"}}},
+			Steps: map[string]*workflow.StepState{"active": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "active", Capability: "test.active", Status: domain.StepRunning, Input: json.RawMessage(`{}`), StartedAt: &now, IdempotencyKey: "structured-recovery-scope-active", ApprovalState: "not_required"}, InputHash: workflow.InputDigest(json.RawMessage(`{}`))}},
 		}
+		materializeSyntheticWorkflowState(t, env.store, env.ctx, state)
 		fencedCtx := WithScheduledExecutionFence(env.ctx, ScheduledExecutionFence{ExecutionID: execution.ID, LeaseOwner: "structured-recovery-scope-owner", Attempt: execution.AttemptCount})
 		if err := env.store.saveWorkflowState(fencedCtx, state, func(lifecycleCtx context.Context, state *workflow.State) error {
 			return env.store.MarkScheduledExecutionRunning(lifecycleCtx, execution.ID, task.ID, state.Run.ID, &scopeVersionID, "structured-recovery-scope-owner", execution.AttemptCount)
 		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := env.store.PersistEffectiveStepInput(fencedCtx, env.programID, domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: stepID, Capability: "test.active", Input: json.RawMessage(`{}`), IdempotencyKey: "structured-recovery-scope-active", StepAttempt: 1}, json.RawMessage(`{}`)); err != nil {
 			t.Fatal(err)
 		}
 		expireRecoveryLease(t, env, execution.ID, 1)
@@ -482,30 +486,15 @@ func TestStaleScheduledExecutionReconciliationScenarioH(t *testing.T) {
 		assertManualReviewConflict(t, env, fixture.execution.ID, "task_program_mismatch:"+string(otherTask.ID)+":"+string(otherProgramID))
 	})
 
-	t.Run("workflow from another program is preserved for manual review", func(t *testing.T) {
+	t.Run("workflow cannot be reparented to another program", func(t *testing.T) {
 		env := newRecoveryTestEnvironment(t, "scenario-h-workflow-program-conflict")
 		runStatus := domain.RunRunning
 		fixture := createRecoveryFixture(t, env, "scenario-h-workflow-program-conflict", &runStatus, domain.TaskRunning, []recoveryStepSpec{{name: "running", status: domain.StepRunning, started: true}})
 		otherProgramID, otherDefinitionID := createSchedulerIntegrationProgram(t, env.ctx, env.store, "scenario-h-workflow-other-program")
 		otherTask := createIntegrationTask(t, env.ctx, env.store, otherProgramID, otherDefinitionID, "workflow-other-program")
-		if _, err := env.store.Pool.Exec(env.ctx, `UPDATE workflow_runs SET task_id=$2 WHERE id=$1`, fixture.runID, otherTask.ID); err != nil {
-			t.Fatal(err)
+		if _, err := env.store.Pool.Exec(env.ctx, `UPDATE workflow_runs SET task_id=$2 WHERE id=$1`, fixture.runID, otherTask.ID); err == nil || !strings.Contains(err.Error(), "identity is immutable") {
+			t.Fatalf("WorkflowRun reparenting error=%v", err)
 		}
-		expireRecoveryLease(t, env, fixture.execution.ID, 1)
-
-		reconcileRecovery(t, env)
-		assertScheduledRecoveryStatusAndClass(t, env, fixture.execution.ID, domain.ScheduledExecutionInterrupted, "lineage_inconsistent")
-		assertTaskRecoveryStatus(t, env, fixture.task.ID, domain.TaskRunning)
-		assertTaskRecoveryStatus(t, env, otherTask.ID, domain.TaskRunning)
-		assertWorkflowRecoveryStatus(t, env, fixture.runID, domain.RunRunning)
-		assertStepRecoveryStatus(t, env, fixture.steps["running"], domain.StepRunning)
-		assertEntityAuditCount(t, env, "scheduled_task_reconciled", "task_id", fixture.task.ID, 0)
-		assertEntityAuditCount(t, env, "scheduled_task_reconciled", "task_id", otherTask.ID, 0)
-		assertEntityAuditCount(t, env, "scheduled_workflow_reconciled", "workflow_run_id", fixture.runID, 0)
-		assertEntityAuditCount(t, env, "scheduled_step_reconciled", "step_run_id", fixture.steps["running"], 0)
-		assertRecoveryAuditIDs(t, env, fixture.execution.ID, "scheduled_execution_lineage_inconsistent", "changed_workflow_ids", nil)
-		assertRecoveryAuditIDs(t, env, fixture.execution.ID, "scheduled_execution_lineage_inconsistent", "preserved_workflow_ids", []domain.ID{fixture.runID})
-		assertManualReviewConflict(t, env, fixture.execution.ID, "task_program_mismatch:"+string(otherTask.ID)+":"+string(otherProgramID))
 	})
 
 	t.Run("terminal task without workflow is inconsistent", func(t *testing.T) {
@@ -886,13 +875,14 @@ func createRecoveryFixture(t *testing.T, env recoveryTestEnvironment, name strin
 	}
 	fixture := recoveryTestFixture{execution: execution, task: task, steps: map[string]domain.ID{}}
 	if runStatus != nil {
+		desiredRunStatus := *runStatus
 		fixture.runID = domain.NewID()
 		completedAt := (*time.Time)(nil)
-		if recoveryRunTerminal(*runStatus) {
+		if recoveryRunTerminal(desiredRunStatus) {
 			completedAt = &now
 		}
 		state := &workflow.State{
-			Run:   domain.WorkflowRun{ID: fixture.runID, TaskID: task.ID, WorkflowDefinitionID: env.definitionID, WorkflowVersion: "1", Status: *runStatus, StartedAt: &now, CompletedAt: completedAt, TriggerSource: "run_now", Summary: json.RawMessage(`{"marker":"preserved"}`)},
+			Run:   domain.WorkflowRun{ID: fixture.runID, TaskID: task.ID, WorkflowDefinitionID: env.definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{"marker":"preserved"}`)},
 			Steps: map[string]*workflow.StepState{},
 		}
 		for _, spec := range specs {
@@ -909,12 +899,33 @@ func createRecoveryFixture(t *testing.T, env recoveryTestEnvironment, name strin
 			if approvalState == "" {
 				approvalState = "not_required"
 			}
-			state.Steps[spec.name] = &workflow.StepState{Run: domain.StepRun{ID: stepID, WorkflowRunID: fixture.runID, StepDefinitionID: spec.name, Capability: "test." + spec.name, Status: spec.status, AttemptCount: spec.attemptCount, Input: json.RawMessage(`{"input":"preserved"}`), Output: spec.output, StartedAt: startedAt, CompletedAt: stepCompletedAt, IdempotencyKey: name + "-" + spec.name, ApprovalState: approvalState}}
+			input := json.RawMessage(`{"input":"preserved"}`)
+			state.Steps[spec.name] = &workflow.StepState{Run: domain.StepRun{ID: stepID, WorkflowRunID: fixture.runID, StepDefinitionID: spec.name, Capability: "test." + spec.name, Status: spec.status, Input: input, Output: spec.output, StartedAt: startedAt, CompletedAt: stepCompletedAt, IdempotencyKey: name + "-" + spec.name, ApprovalState: approvalState}, InputHash: workflow.InputDigest(input)}
 		}
+		materializeSyntheticWorkflowState(t, env.store, env.ctx, state)
 		fencedCtx := WithScheduledExecutionFence(env.ctx, ScheduledExecutionFence{ExecutionID: execution.ID, LeaseOwner: name + "-owner", Attempt: execution.AttemptCount})
 		if err := env.store.saveWorkflowState(fencedCtx, state, func(lifecycleCtx context.Context, state *workflow.State) error {
 			return env.store.MarkScheduledExecutionRunning(lifecycleCtx, execution.ID, task.ID, state.Run.ID, nil, name+"-owner", execution.AttemptCount)
 		}); err != nil {
+			t.Fatal(err)
+		}
+		for _, spec := range specs {
+			stepState := state.Steps[spec.name]
+			for attempt := 1; attempt <= spec.attemptCount; attempt++ {
+				action := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: fixture.runID, StepRunID: stepState.Run.ID, Capability: stepState.Run.Capability, Input: stepState.Run.Input, IdempotencyKey: stepState.Run.IdempotencyKey, StepAttempt: attempt}
+				input, err := env.store.PersistEffectiveStepInput(fencedCtx, env.programID, action, stepState.Run.Input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stepState.Run.Input = input
+				stepState.Run.AttemptCount = attempt
+				stepState.InputHash = workflow.InputDigest(input)
+			}
+			if _, err := env.store.Pool.Exec(env.ctx, `UPDATE step_runs SET status=$2,completed_at=$3 WHERE id=$1`, stepState.Run.ID, spec.status, stepState.Run.CompletedAt); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := env.store.Pool.Exec(env.ctx, `UPDATE workflow_runs SET status=$2,completed_at=$3 WHERE id=$1`, fixture.runID, desiredRunStatus, completedAt); err != nil {
 			t.Fatal(err)
 		}
 		if len(specs) == 1 && (specs[0].approvalState == "pending" || specs[0].approvalState == "approved") {

@@ -2,11 +2,14 @@ package database
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,7 +91,12 @@ type integrationAllowScope struct{}
 
 func (integrationAllowScope) Allows(string) bool { return true }
 
-type postgresWorkflowRetryCapability struct{ calls int }
+type postgresWorkflowRetryCapability struct {
+	calls             int
+	store             *Store
+	persistedInputs   []json.RawMessage
+	persistedAttempts []int
+}
 
 func (*postgresWorkflowRetryCapability) Manifest() capability.Manifest {
 	return capability.Manifest{Name: "test.workflow-retry", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true, SupportedProviders: []string{"retry-provider"}}
@@ -98,8 +106,17 @@ func (*postgresWorkflowRetryCapability) Validate(context.Context, capability.Req
 	return nil
 }
 
-func (c *postgresWorkflowRetryCapability) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+func (c *postgresWorkflowRetryCapability) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
 	c.calls++
+	if c.store != nil {
+		var input json.RawMessage
+		var attempt int
+		if err := c.store.Pool.QueryRow(ctx, `SELECT input,attempt_count FROM step_runs WHERE id=$1`, req.Action.StepRunID).Scan(&input, &attempt); err != nil {
+			return capability.Result{}, err
+		}
+		c.persistedInputs = append(c.persistedInputs, append(json.RawMessage(nil), input...))
+		c.persistedAttempts = append(c.persistedAttempts, attempt)
+	}
 	now := time.Now().UTC()
 	exitCode := 0
 	tool := &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: req.Provider, ToolVersion: "1", SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"integration"}`), StartedAt: now, CompletedAt: &now, ExitCode: &exitCode}
@@ -123,6 +140,176 @@ func (postgresWorkflowRetryArtifacts) Put(_ context.Context, req artifact.PutReq
 	return domain.Artifact{ID: domain.NewID(), TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), SHA256: strings.Repeat("a", 64), StorageLocation: "synthetic://" + req.Name, CreatedAt: time.Now().UTC(), RedactionState: "redacted"}, nil
 }
 
+type postgresClassifyResumeCapability struct {
+	calls             int
+	store             *Store
+	persistedInputs   []json.RawMessage
+	persistedAttempts []int
+}
+
+func (*postgresClassifyResumeCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "classify.endpoint", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true, SupportedProviders: []string{"classifier"}}
+}
+func (*postgresClassifyResumeCapability) Validate(context.Context, capability.Request) error {
+	return nil
+}
+func (c *postgresClassifyResumeCapability) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
+	c.calls++
+	var input json.RawMessage
+	var attempt int
+	if err := c.store.Pool.QueryRow(ctx, `SELECT input,attempt_count FROM step_runs WHERE id=$1`, req.Action.StepRunID).Scan(&input, &attempt); err != nil {
+		return capability.Result{}, err
+	}
+	c.persistedInputs = append(c.persistedInputs, append(json.RawMessage(nil), input...))
+	c.persistedAttempts = append(c.persistedAttempts, attempt)
+	now := time.Now().UTC()
+	exitCode := 0
+	result := capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "classifier succeeded", Output: json.RawMessage(`{"endpoints":[],"classifications":[],"interesting_endpoints":[],"relationships":[]}`)}, ToolRun: &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: req.Provider, ToolVersion: "1", SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"integration"}`), StartedAt: now, CompletedAt: &now, ExitCode: &exitCode}}
+	if c.calls == 1 {
+		result.Action.Status = "failed"
+		result.Action.Summary = "retryable classifier failure"
+		result.Action.Error = &domain.StructuredError{Classification: "provider_error", Message: "temporary classifier failure", Retryable: true}
+		return result, errors.New("temporary classifier failure")
+	}
+	return result, nil
+}
+
+type countingHistoricalStore struct {
+	*Store
+	historyLoads int
+}
+
+type concurrentEffectiveInputStore struct {
+	*Store
+	loads      atomic.Int32
+	bothLoaded chan struct{}
+}
+
+func (s *concurrentEffectiveInputStore) LoadEffectiveStepInput(ctx context.Context, programID domain.ID, action domain.ActionRequest) (json.RawMessage, bool, error) {
+	input, found, err := s.Store.LoadEffectiveStepInput(ctx, programID, action)
+	if err != nil {
+		return nil, false, err
+	}
+	if s.loads.Add(1) == 2 {
+		close(s.bothLoaded)
+	}
+	<-s.bothLoaded
+	return input, found, nil
+}
+
+type blockingAttemptCapability struct {
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (*blockingAttemptCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "test.concurrent-attempt", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true}
+}
+func (*blockingAttemptCapability) Validate(context.Context, capability.Request) error { return nil }
+func (c *blockingAttemptCapability) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+	c.calls.Add(1)
+	c.entered <- struct{}{}
+	<-c.release
+	return capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "claimed attempt executed"}}, nil
+}
+
+func (s *countingHistoricalStore) PreviousObservationValues(ctx context.Context, programID, runID domain.ID, capabilityName string) ([]string, error) {
+	s.historyLoads++
+	return s.Store.PreviousObservationValues(ctx, programID, runID, capabilityName)
+}
+
+func TestWorkflowResumePreservesHistoricalEffectiveInputAndAttemptProvenance(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "workflow-resume-effective-input")
+	firstHistory := `{"provider":"httpx","kind":"url","target":"https://first-history.test/","status_code":200}`
+	newerHistory := `{"provider":"httpx","kind":"url","target":"https://newer-history.test/","status_code":503}`
+	insertCompletedHistoricalObservation(t, env, firstHistory, time.Now().UTC().Add(-time.Hour))
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	task := domain.Task{ID: domain.NewID(), ProgramID: env.programID, Objective: "resume frozen historical input", WorkflowDefinitionID: env.definitionID, Status: domain.TaskRunning, RequestedBy: "integration-test", CreatedAt: now, UpdatedAt: now}
+	if err := env.store.CreateTask(env.ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	baseInput := json.RawMessage(`{"active":[],"passive":[],"http_observations":[],"crawl_observations":[],"passive_observations":[],"historical_observations":[],"api_schema_endpoints":[],"target_plan_digest":"plan"}`)
+	definition, scopeVersionID := syntheticWorkflowDefinition(t, env.store, env.ctx, task.ID)
+	definition.Steps = []workflow.Step{{ID: "classify", Capability: "classify.endpoint", Provider: "classifier", Input: baseInput, Retry: workflow.RetryPolicy{MaxAttempts: 2, BaseDelay: time.Millisecond}}}
+	materialized, digest, err := workflow.Materialize(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, stepID := domain.NewID(), domain.NewID()
+	baseHash := workflow.InputDigest(baseInput)
+	keySum := sha256.Sum256([]byte(string(runID) + "\x00classify\x00" + baseHash))
+	state := &workflow.State{Run: domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: definition.ID, WorkflowVersion: definition.Version, Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration-test", Summary: json.RawMessage(`{}`), MaterializedDefinition: materialized, MaterializationDigest: digest, OriginalScopeVersionID: &scopeVersionID}, Steps: map[string]*workflow.StepState{"classify": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "classify", Capability: "classify.endpoint", Status: domain.StepRunning, Input: baseInput, IdempotencyKey: hex.EncodeToString(keySum[:]), ApprovalState: "not_required"}, InputHash: baseHash}}}
+	if err := env.store.SaveWorkflowState(env.ctx, state); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &postgresClassifyResumeCapability{store: env.store}
+	registry := capability.NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	countingStore := &countingHistoricalStore{Store: env.store}
+	executor := execution.Service{Registry: registry, Store: countingStore, Artifacts: postgresWorkflowRetryArtifacts{}, ProgramID: env.programID}
+	firstAction := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: stepID, RequestedBy: "workflow", Capability: "classify.endpoint", Reason: "first durable attempt", Input: baseInput, IdempotencyKey: state.Steps["classify"].Run.IdempotencyKey, StepAttempt: 1}
+	firstResult, firstErr := executor.Execute(env.ctx, capability.Request{Action: firstAction, Provider: "classifier", Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}}, Scope: integrationAllowScope{}})
+	if firstErr == nil || firstResult.Action.Error == nil || !firstResult.Action.Error.Retryable {
+		t.Fatalf("first result=%#v error=%v", firstResult, firstErr)
+	}
+	frozenInput := append(json.RawMessage(nil), firstResult.EffectiveInput...)
+	if countingStore.historyLoads != 1 || len(frozenInput) == 0 || strings.Contains(string(frozenInput), "newer-history") || !strings.Contains(string(frozenInput), "first-history") {
+		t.Fatalf("history_loads=%d frozen_input=%s", countingStore.historyLoads, frozenInput)
+	}
+
+	insertCompletedHistoricalObservation(t, env, newerHistory, time.Now().UTC())
+	resumedState, err := env.store.LoadWorkflowState(env.ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := workflow.Engine{Registry: registry, Executor: executor, Persister: WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: t.TempDir()}}, Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}}, Scope: integrationAllowScope{}, OriginalScopeVersionID: scopeVersionID}
+	resumedState, err = engine.Run(env.ctx, definition, resumedState, task, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumedState.Run.Status != domain.RunCompleted || provider.calls != 2 || countingStore.historyLoads != 1 || len(provider.persistedAttempts) != 2 || provider.persistedAttempts[0] != 1 || provider.persistedAttempts[1] != 2 {
+		t.Fatalf("status=%s calls=%d history_loads=%d attempts=%v", resumedState.Run.Status, provider.calls, countingStore.historyLoads, provider.persistedAttempts)
+	}
+	for index, input := range provider.persistedInputs {
+		var equal bool
+		if err := env.store.Pool.QueryRow(env.ctx, `SELECT $1::jsonb=$2::jsonb`, input, frozenInput).Scan(&equal); err != nil || !equal {
+			t.Fatalf("provider input[%d]=%s frozen=%s equal=%v error=%v", index, input, frozenInput, equal, err)
+		}
+	}
+	var attemptCount, acceptedAttemptTwo int
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT attempt_count FROM step_runs WHERE id=$1`, stepID).Scan(&attemptCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT count(*) FROM audit_events accepted JOIN audit_events started ON started.id=accepted.provider_attempt_id WHERE accepted.event_type='provider_result_accepted' AND accepted.step_run_id=$1 AND started.event_type='provider_invocation_started' AND started.step_attempt=2 AND accepted.action_request_id=started.action_request_id`, stepID).Scan(&acceptedAttemptTwo); err != nil {
+		t.Fatal(err)
+	}
+	if attemptCount != 2 || acceptedAttemptTwo != 1 {
+		t.Fatalf("durable attempt_count=%d accepted_attempt_two=%d", attemptCount, acceptedAttemptTwo)
+	}
+}
+
+func insertCompletedHistoricalObservation(t *testing.T, env recoveryTestEnvironment, raw string, completedAt time.Time) {
+	t.Helper()
+	task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "historical-observation")
+	state := &workflow.State{Run: domain.WorkflowRun{ID: domain.NewID(), TaskID: task.ID, Status: domain.RunCompleted, StartedAt: &completedAt, CompletedAt: &completedAt, TriggerSource: "integration", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{}}
+	materializeSyntheticWorkflowState(t, env.store, env.ctx, state)
+	if err := env.store.SaveWorkflowState(env.ctx, state); err != nil {
+		t.Fatal(err)
+	}
+	assetID := domain.NewID()
+	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO assets(id,program_id,type,canonical_value) VALUES($1,$2,'url',$3)`, assetID, env.programID, raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO asset_observations(id,asset_id,workflow_run_id,source_capability,observed_value,metadata,first_seen_at,observed_at,confidence) VALUES($1,$2,$3,'probe.http',$4,$5,$6,$6,1)`, domain.NewID(), assetID, state.Run.ID, raw, json.RawMessage(raw), completedAt); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWorkflowRetryPersistsEveryProviderAttempt(t *testing.T) {
 	env := newRecoveryTestEnvironment(t, "workflow-provider-retry")
 	now := time.Now().UTC()
@@ -130,18 +317,20 @@ func TestWorkflowRetryPersistsEveryProviderAttempt(t *testing.T) {
 	if err := env.store.CreateTask(env.ctx, task); err != nil {
 		t.Fatal(err)
 	}
-	provider := &postgresWorkflowRetryCapability{}
+	provider := &postgresWorkflowRetryCapability{store: env.store}
 	registry := capability.NewRegistry()
 	if err := registry.Register(provider); err != nil {
 		t.Fatal(err)
 	}
-	definition := workflow.Definition{ID: env.definitionID, Name: "workflow-provider-retry", Version: "1", Steps: []workflow.Step{{ID: "retry", Capability: "test.workflow-retry", Input: json.RawMessage(`{}`), Retry: workflow.RetryPolicy{MaxAttempts: 2, BaseDelay: time.Millisecond}}}}
+	definition, scopeVersionID := syntheticWorkflowDefinition(t, env.store, env.ctx, task.ID)
+	definition.Steps = []workflow.Step{{ID: "retry", Capability: "test.workflow-retry", Input: json.RawMessage(`{}`), Retry: workflow.RetryPolicy{MaxAttempts: 2, BaseDelay: time.Millisecond}}}
 	engine := workflow.Engine{
-		Registry:  registry,
-		Executor:  execution.Service{Registry: registry, Store: env.store, Artifacts: postgresWorkflowRetryArtifacts{}, ProgramID: env.programID},
-		Persister: WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: t.TempDir()}},
-		Policy:    policy.Policy{AllowedCapabilities: []string{"test.workflow-retry"}},
-		Scope:     integrationAllowScope{},
+		Registry:               registry,
+		Executor:               execution.Service{Registry: registry, Store: env.store, Artifacts: postgresWorkflowRetryArtifacts{}, ProgramID: env.programID},
+		Persister:              WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: t.TempDir()}},
+		Policy:                 policy.Policy{AllowedCapabilities: []string{"test.workflow-retry"}},
+		Scope:                  integrationAllowScope{},
+		OriginalScopeVersionID: scopeVersionID,
 	}
 	state, err := engine.Run(env.ctx, definition, nil, task, nil)
 	if err != nil {
@@ -149,6 +338,9 @@ func TestWorkflowRetryPersistsEveryProviderAttempt(t *testing.T) {
 	}
 	if provider.calls != 2 || state.Run.Status != domain.RunCompleted || state.Steps["retry"].Run.Status != domain.StepSucceeded {
 		t.Fatalf("calls=%d state=%#v", provider.calls, state)
+	}
+	if len(provider.persistedInputs) != 2 || string(provider.persistedInputs[0]) != `{}` || string(provider.persistedInputs[1]) != `{}` || len(provider.persistedAttempts) != 2 || provider.persistedAttempts[0] != 1 || provider.persistedAttempts[1] != 2 {
+		t.Fatalf("provider observed inputs=%q attempts=%v", provider.persistedInputs, provider.persistedAttempts)
 	}
 	stepID := state.Steps["retry"].Run.ID
 	var status domain.StepStatus
@@ -169,6 +361,330 @@ func TestWorkflowRetryPersistsEveryProviderAttempt(t *testing.T) {
 	}
 	if status != domain.StepSucceeded || attemptCount != 2 || completedAt == nil || stepCount != 1 || toolCount != 2 || providerAttemptCount != 2 || artifactCount != 4 || artifactToolCount != 2 || toolExecutionCount != 2 || acceptedDecisionCount != 2 {
 		t.Fatalf("status=%s attempt=%d completed=%v steps=%d tools=%d provider_attempts=%d artifacts=%d artifact_tools=%d tool_executions=%d accepted_decisions=%d", status, attemptCount, completedAt, stepCount, toolCount, providerAttemptCount, artifactCount, artifactToolCount, toolExecutionCount, acceptedDecisionCount)
+	}
+}
+
+func TestEffectiveStepInputPersistenceConflictsBeforeProviderAdmission(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "effective-input-conflict")
+	now := time.Now().UTC()
+	task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "effective-input-conflict")
+	runID, stepID := domain.NewID(), domain.NewID()
+	state := &workflow.State{
+		Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration", Summary: json.RawMessage(`{}`)},
+		Steps: map[string]*workflow.StepState{"classify": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "classify", Capability: "classify.endpoint", Status: domain.StepRunning, Input: json.RawMessage(`{"historical_observations":[]}`), IdempotencyKey: "effective-input-conflict", ApprovalState: "not_required"}}},
+	}
+	materializeSyntheticWorkflowState(t, env.store, env.ctx, state)
+	if err := env.store.SaveWorkflowState(env.ctx, state); err != nil {
+		t.Fatal(err)
+	}
+	action := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: stepID, Capability: "classify.endpoint", IdempotencyKey: "effective-input-conflict", StepAttempt: 1}
+	first := json.RawMessage(`{"historical_observations":[{"target":"https://first.test/"}]}`)
+	persisted, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, action, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persistedEqual bool
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT $1::jsonb=$2::jsonb`, persisted, first).Scan(&persistedEqual); err != nil || !persistedEqual {
+		t.Fatalf("first effective input=%s equal=%v err=%v", persisted, persistedEqual, err)
+	}
+	if _, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, action, json.RawMessage(`{"historical_observations":[{"target":"https://other.test/"}]}`)); !errors.Is(err, workflow.ErrEffectiveStepInputConflict) {
+		t.Fatalf("different same-attempt input error=%v", err)
+	}
+	action.StepAttempt = 2
+	loaded, found, err := env.store.LoadEffectiveStepInput(env.ctx, env.programID, action)
+	if err != nil || !found {
+		t.Fatalf("loaded effective input=%s found=%v err=%v", loaded, found, err)
+	}
+	var loadedEqual bool
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT $1::jsonb=$2::jsonb`, loaded, first).Scan(&loadedEqual); err != nil || !loadedEqual {
+		t.Fatalf("loaded effective input=%s equal=%v err=%v", loaded, loadedEqual, err)
+	}
+	var attempt int
+	var stored json.RawMessage
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT input,attempt_count FROM step_runs WHERE id=$1`, stepID).Scan(&stored, &attempt); err != nil || attempt != 1 {
+		t.Fatalf("stored input=%s attempt=%d err=%v", stored, attempt, err)
+	}
+	var storedEqual bool
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT $1::jsonb=$2::jsonb`, stored, first).Scan(&storedEqual); err != nil || !storedEqual {
+		t.Fatalf("stored effective input=%s equal=%v err=%v", stored, storedEqual, err)
+	}
+}
+
+func TestConcurrentEffectiveStepAttemptIsOneShotBeforeProviderExecution(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "concurrent-effective-input-claim")
+	now := time.Now().UTC()
+	task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "concurrent-effective-input-claim")
+	runID, stepID := domain.NewID(), domain.NewID()
+	frozen := json.RawMessage(`{"targets":["https://one.example.test/"]}`)
+	state := &workflow.State{
+		Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration", Summary: json.RawMessage(`{}`)},
+		Steps: map[string]*workflow.StepState{"attempt": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "attempt", Capability: "test.concurrent-attempt", Status: domain.StepRunning, Input: frozen, IdempotencyKey: "concurrent-attempt", ApprovalState: "not_required"}, InputHash: workflow.InputDigest(frozen)}},
+	}
+	materializeSyntheticWorkflowState(t, env.store, env.ctx, state)
+	if err := env.store.SaveWorkflowState(env.ctx, state); err != nil {
+		t.Fatal(err)
+	}
+	first := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: stepID, RequestedBy: "integration", Capability: "test.concurrent-attempt", Input: frozen, IdempotencyKey: "concurrent-attempt", StepAttempt: 1}
+	if _, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, first, frozen); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &blockingAttemptCapability{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	registry := capability.NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	barrierStore := &concurrentEffectiveInputStore{Store: env.store, bothLoaded: make(chan struct{})}
+	service := execution.Service{Registry: registry, Store: barrierStore, ProgramID: env.programID}
+	type outcome struct{ err error }
+	results := make(chan outcome, 2)
+	for range 2 {
+		action := first
+		action.ID = domain.NewID()
+		action.StepAttempt = 2
+		go func() {
+			_, err := service.Execute(env.ctx, capability.Request{Action: action, Policy: policy.Policy{ID: "concurrent-attempt", AllowedCapabilities: []string{"test.concurrent-attempt"}}, Scope: integrationAllowScope{}})
+			results <- outcome{err: err}
+		}()
+	}
+	select {
+	case <-provider.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider did not receive the winning attempt")
+	}
+	var loser outcome
+	select {
+	case loser = <-results:
+	case <-time.After(5 * time.Second):
+		t.Fatal("duplicate attempt did not fail while the winning provider was blocked")
+	}
+	if !errors.Is(loser.err, workflow.ErrStepAttemptOwnershipLost) || !errors.Is(loser.err, workflow.ErrEffectiveStepInputConflict) {
+		t.Fatalf("duplicate attempt error=%v", loser.err)
+	}
+	close(provider.release)
+	select {
+	case winner := <-results:
+		if winner.err != nil {
+			t.Fatalf("winning attempt error=%v", winner.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("winning attempt did not finish")
+	}
+	var attemptCount, attemptTwoStarts int
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT attempt_count FROM step_runs WHERE id=$1`, stepID).Scan(&attemptCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT count(*) FROM audit_events WHERE step_run_id=$1 AND event_type='provider_invocation_started' AND step_attempt=2`, stepID).Scan(&attemptTwoStarts); err != nil {
+		t.Fatal(err)
+	}
+	if provider.calls.Load() != 1 || attemptTwoStarts != 1 || attemptCount != 2 {
+		t.Fatalf("provider calls=%d provider starts=%d durable attempt=%d", provider.calls.Load(), attemptTwoStarts, attemptCount)
+	}
+}
+
+func TestTwoCompleteEnginesCannotLetLosingAttemptClaimOverwriteWinnerLifecycle(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "two-engine-attempt-ownership")
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "two-engine-attempt-ownership")
+	definition, scopeVersionID := syntheticWorkflowDefinition(t, env.store, env.ctx, task.ID)
+	definition.Steps = []workflow.Step{{ID: "attempt", Capability: "test.concurrent-attempt", Input: json.RawMessage(`{"targets":["https://one.example.test/"]}`), Retry: workflow.RetryPolicy{MaxAttempts: 2, BaseDelay: time.Millisecond}}}
+	materialized, digest, err := workflow.Materialize(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, stepID := domain.NewID(), domain.NewID()
+	input := append(json.RawMessage(nil), definition.Steps[0].Input...)
+	inputHash := workflow.InputDigest(input)
+	keySum := sha256.Sum256([]byte(string(runID) + "\x00attempt\x00" + inputHash))
+	idempotencyKey := hex.EncodeToString(keySum[:])
+	initial := &workflow.State{
+		Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: definition.ID, WorkflowVersion: definition.Version, Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration", Summary: json.RawMessage(`{}`), MaterializedDefinition: materialized, MaterializationDigest: digest, OriginalScopeVersionID: &scopeVersionID},
+		Steps: map[string]*workflow.StepState{"attempt": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "attempt", Capability: "test.concurrent-attempt", Status: domain.StepRunning, Input: input, StartedAt: &now, IdempotencyKey: idempotencyKey, ApprovalState: "not_required"}, InputHash: inputHash}},
+	}
+	if err := env.store.SaveWorkflowState(env.ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	firstAction := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: stepID, RequestedBy: "workflow", Capability: "test.concurrent-attempt", Input: input, IdempotencyKey: idempotencyKey, StepAttempt: 1}
+	if _, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, firstAction, input); err != nil {
+		t.Fatal(err)
+	}
+	retryable := domain.StepRun{ID: stepID, WorkflowRunID: runID, Capability: "test.concurrent-attempt", Status: domain.StepRetryable, ErrorClassification: "provider_error", ErrorDetails: "first attempt is retryable", IdempotencyKey: idempotencyKey}
+	retryableResult := domain.ActionResult{RequestID: firstAction.ID, Status: "failed", Summary: "retryable setup result", Error: &domain.StructuredError{Classification: "provider_error", Message: "first attempt is retryable", Retryable: true}}
+	if err := env.store.PersistResult(env.ctx, env.programID, retryable, nil, nil, retryableResult, nil); err != nil {
+		t.Fatal(err)
+	}
+	stateA, err := env.store.LoadWorkflowState(env.ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateB, err := env.store.LoadWorkflowState(env.ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &blockingAttemptCapability{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	registry := capability.NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	barrierStore := &concurrentEffectiveInputStore{Store: env.store, bothLoaded: make(chan struct{})}
+	type engineOutcome struct {
+		state *workflow.State
+		err   error
+	}
+	results := make(chan engineOutcome, 2)
+	states := []*workflow.State{stateA, stateB}
+	for index, candidate := range states {
+		candidate := candidate
+		root := t.TempDir()
+		engine := workflow.Engine{
+			Registry:  registry,
+			Executor:  execution.Service{Registry: registry, Store: barrierStore, ProgramID: env.programID},
+			Persister: WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: root}},
+			Policy:    policy.Policy{ID: "two-engine-attempt", AllowedCapabilities: []string{"test.concurrent-attempt"}},
+			Scope:     integrationAllowScope{}, OriginalScopeVersionID: scopeVersionID,
+		}
+		engineCtx, cancel := context.WithTimeout(env.ctx, 10*time.Second)
+		defer cancel()
+		go func(label int) {
+			completed, runErr := engine.Run(engineCtx, definition, candidate, task, nil)
+			results <- engineOutcome{state: completed, err: runErr}
+		}(index)
+	}
+	select {
+	case <-provider.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("winning engine did not enter provider execution")
+	}
+	var loser engineOutcome
+	select {
+	case loser = <-results:
+	case <-time.After(5 * time.Second):
+		t.Fatal("losing engine did not terminate while winner was blocked")
+	}
+	if !errors.Is(loser.err, workflow.ErrStepAttemptOwnershipLost) || loser.state == nil || loser.state.Run.Status == domain.RunFailed || loser.state.Steps["attempt"].Run.Status == domain.StepFailed {
+		t.Fatalf("loser state=%#v error=%v", loser.state, loser.err)
+	}
+	var blockedRunStatus domain.RunStatus
+	var blockedStepStatus domain.StepStatus
+	var blockedAttempt, blockedFailedRuns, blockedFailedSteps int
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT wr.status,sr.status,sr.attempt_count,(SELECT count(*) FROM workflow_runs WHERE id=$1 AND status='failed'),(SELECT count(*) FROM step_runs WHERE id=$2 AND status='failed') FROM workflow_runs wr JOIN step_runs sr ON sr.workflow_run_id=wr.id WHERE wr.id=$1 AND sr.id=$2`, runID, stepID).Scan(&blockedRunStatus, &blockedStepStatus, &blockedAttempt, &blockedFailedRuns, &blockedFailedSteps); err != nil {
+		t.Fatal(err)
+	}
+	if blockedRunStatus != domain.RunRunning || blockedStepStatus != domain.StepRetryable || blockedAttempt != 2 || blockedFailedRuns != 0 || blockedFailedSteps != 0 || provider.calls.Load() != 1 {
+		t.Fatalf("blocked lifecycle run=%s step=%s attempt=%d failed_runs=%d failed_steps=%d provider_calls=%d", blockedRunStatus, blockedStepStatus, blockedAttempt, blockedFailedRuns, blockedFailedSteps, provider.calls.Load())
+	}
+	close(provider.release)
+	var winner engineOutcome
+	select {
+	case winner = <-results:
+	case <-time.After(5 * time.Second):
+		t.Fatal("winning engine did not finish")
+	}
+	if winner.err != nil || winner.state == nil || winner.state.Run.Status != domain.RunCompleted || winner.state.Steps["attempt"].Run.Status != domain.StepSucceeded {
+		t.Fatalf("winner state=%#v error=%v", winner.state, winner.err)
+	}
+	var finalRunStatus domain.RunStatus
+	var finalStepStatus domain.StepStatus
+	var attemptTwoStarts, acceptedAttemptTwo int
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT wr.status,sr.status,(SELECT count(*) FROM audit_events WHERE step_run_id=$2 AND event_type='provider_invocation_started' AND step_attempt=2),(SELECT count(*) FROM audit_events accepted JOIN audit_events started ON started.id=accepted.provider_attempt_id WHERE accepted.event_type='provider_result_accepted' AND accepted.step_run_id=$2 AND started.event_type='provider_invocation_started' AND started.step_attempt=2 AND accepted.action_request_id=started.action_request_id) FROM workflow_runs wr JOIN step_runs sr ON sr.workflow_run_id=wr.id WHERE wr.id=$1 AND sr.id=$2`, runID, stepID).Scan(&finalRunStatus, &finalStepStatus, &attemptTwoStarts, &acceptedAttemptTwo); err != nil {
+		t.Fatal(err)
+	}
+	if finalRunStatus != domain.RunCompleted || finalStepStatus != domain.StepSucceeded || attemptTwoStarts != 1 || acceptedAttemptTwo != 1 || provider.calls.Load() != 1 {
+		t.Fatalf("final lifecycle run=%s step=%s starts=%d accepted=%d provider_calls=%d", finalRunStatus, finalStepStatus, attemptTwoStarts, acceptedAttemptTwo, provider.calls.Load())
+	}
+}
+
+func TestStaleWorkflowSaveCannotRegressEffectiveInputOrAttempt(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "stale-effective-input-save")
+	now := time.Now().UTC()
+	task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "stale-effective-input-save")
+	runID, stepID := domain.NewID(), domain.NewID()
+	earlier := json.RawMessage(`{"targets":[]}`)
+	frozen := json.RawMessage(`{"targets":["https://frozen.example.test/"]}`)
+	stale := &workflow.State{
+		Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration", Summary: json.RawMessage(`{}`)},
+		Steps: map[string]*workflow.StepState{"attempt": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "attempt", Capability: "test.concurrent-attempt", Status: domain.StepRunning, Input: earlier, IdempotencyKey: "stale-attempt", ApprovalState: "not_required"}, InputHash: workflow.InputDigest(earlier)}},
+	}
+	materializeSyntheticWorkflowState(t, env.store, env.ctx, stale)
+	if err := env.store.SaveWorkflowState(env.ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	action := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: stepID, Capability: "test.concurrent-attempt", IdempotencyKey: "stale-attempt", StepAttempt: 1}
+	if _, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, action, frozen); err != nil {
+		t.Fatal(err)
+	}
+	action.ID = domain.NewID()
+	action.StepAttempt = 2
+	if _, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, action, frozen); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.SaveWorkflowState(env.ctx, stale); !errors.Is(err, workflow.ErrEffectiveStepInputConflict) {
+		t.Fatalf("stale count/input save error=%v", err)
+	}
+	authoritative, err := env.store.LoadWorkflowState(env.ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := authoritative.Steps["attempt"]
+	if step.Run.AttemptCount != 2 || step.InputHash != workflow.InputDigest(step.Run.Input) || !strings.Contains(string(step.Run.Input), "frozen.example.test") {
+		t.Fatalf("authoritative step=%#v", step)
+	}
+	step.InputHash = strings.Repeat("0", 64)
+	if err := env.store.SaveWorkflowState(env.ctx, authoritative); !errors.Is(err, workflow.ErrEffectiveStepInputConflict) {
+		t.Fatalf("alternate input hash save error=%v", err)
+	}
+	step.InputHash = workflow.InputDigest(step.Run.Input)
+	step.Run.Input = json.RawMessage(`{"targets":["https://alternate.example.test/"]}`)
+	step.InputHash = workflow.InputDigest(step.Run.Input)
+	if err := env.store.SaveWorkflowState(env.ctx, authoritative); !errors.Is(err, workflow.ErrEffectiveStepInputConflict) {
+		t.Fatalf("alternate frozen input save error=%v", err)
+	}
+	reloaded, err := env.store.LoadWorkflowState(env.ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Steps["attempt"].Run.AttemptCount != 2 || !strings.Contains(string(reloaded.Steps["attempt"].Run.Input), "frozen.example.test") {
+		t.Fatalf("regressed durable step=%#v", reloaded.Steps["attempt"])
+	}
+}
+
+func TestCrashAfterAttemptAllocationConsumesAttempt(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "crash-after-attempt-allocation")
+	now := time.Now().UTC()
+	task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "crash-after-attempt-allocation")
+	runID, stepID := domain.NewID(), domain.NewID()
+	frozen := json.RawMessage(`{"targets":["https://resume.example.test/"]}`)
+	state := &workflow.State{
+		Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration", Summary: json.RawMessage(`{}`)},
+		Steps: map[string]*workflow.StepState{"attempt": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "attempt", Capability: "test.concurrent-attempt", Status: domain.StepRunning, Input: frozen, IdempotencyKey: "crash-attempt", ApprovalState: "not_required"}, InputHash: workflow.InputDigest(frozen)}},
+	}
+	materializeSyntheticWorkflowState(t, env.store, env.ctx, state)
+	if err := env.store.SaveWorkflowState(env.ctx, state); err != nil {
+		t.Fatal(err)
+	}
+	action := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: stepID, Capability: "test.concurrent-attempt", Input: frozen, IdempotencyKey: "crash-attempt", StepAttempt: 1}
+	if _, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, action, frozen); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := env.store.LoadWorkflowState(env.ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Steps["attempt"].Run.AttemptCount != 1 {
+		t.Fatalf("resumed attempt=%d", resumed.Steps["attempt"].Run.AttemptCount)
+	}
+	if _, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, action, frozen); !errors.Is(err, workflow.ErrEffectiveStepInputConflict) {
+		t.Fatalf("reused consumed attempt error=%v", err)
+	}
+	action.ID = domain.NewID()
+	action.StepAttempt = resumed.Steps["attempt"].Run.AttemptCount + 1
+	if _, err := env.store.PersistEffectiveStepInput(env.ctx, env.programID, action, frozen); err != nil {
+		t.Fatalf("next bounded attempt %d: %v", action.StepAttempt, err)
+	}
+	var attemptCount int
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT attempt_count FROM step_runs WHERE id=$1`, stepID).Scan(&attemptCount); err != nil || attemptCount != 2 {
+		t.Fatalf("durable attempt=%d err=%v", attemptCount, err)
 	}
 }
 
@@ -222,9 +738,7 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	if err := store.CreateProgram(ctx, program, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CreateWorkflowDefinition(ctx, definitionID, "persistence-"+string(definitionID), "1", "synthetic", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
-	}
+	ensureSyntheticWorkflowTemplate(t, store, ctx, definitionID, "persistence-"+string(definitionID))
 	task := domain.Task{ID: taskID, ProgramID: programID, Objective: "verify failure persistence", WorkflowDefinitionID: definitionID, Status: domain.TaskRunning, RequestedBy: "integration-test", CreatedAt: now, UpdatedAt: now}
 	if err := store.CreateTask(ctx, task); err != nil {
 		t.Fatal(err)
@@ -235,6 +749,7 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 		Run:   domain.WorkflowRun{ID: runID, TaskID: taskID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration-test", Summary: json.RawMessage(`{}`)},
 		Steps: map[string]*workflow.StepState{"dns": {Run: domain.StepRun{ID: stepID, WorkflowRunID: runID, StepDefinitionID: "dns", Capability: "resolve.dns", Status: domain.StepRunning, Input: json.RawMessage(`{"targets":["https://local.example.test/"]}`), IdempotencyKey: string(domain.NewID()), ApprovalState: "not_required"}}},
 	}
+	materializeSyntheticWorkflowState(t, store, ctx, state)
 	if err := store.SaveWorkflowState(ctx, state); err != nil {
 		t.Fatal(err)
 	}
@@ -255,6 +770,7 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 		Run:   domain.WorkflowRun{ID: altRunID, TaskID: altTaskID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "integration-test", Summary: json.RawMessage(`{}`)},
 		Steps: map[string]*workflow.StepState{"alternate": {Run: domain.StepRun{ID: altStepID, WorkflowRunID: altRunID, StepDefinitionID: "alternate", Capability: "alternate.capability", Status: domain.StepRunning, Input: json.RawMessage(`{}`), IdempotencyKey: string(domain.NewID()), ApprovalState: "not_required"}}},
 	}
+	materializeSyntheticWorkflowState(t, store, ctx, altState)
 	if err := store.SaveWorkflowState(ctx, altState); err != nil {
 		t.Fatal(err)
 	}
@@ -514,14 +1030,40 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	state.Steps["dns"].Run.ErrorClassification = ""
 	state.Steps["dns"].Run.ErrorDetails = ""
 	state.Steps["dns"].Run.CompletedAt = nil
-	if err := store.SaveWorkflowState(ctx, state); err != nil {
-		t.Fatalf("resume existing failed step: %v", err)
+	if err := store.SaveWorkflowState(ctx, state); !errors.Is(err, workflow.ErrEffectiveStepInputConflict) {
+		t.Fatalf("stale attempt-0 save error=%v", err)
 	}
-	var stepCount int
-	if err := store.Pool.QueryRow(ctx, `SELECT count(*) FROM step_runs WHERE workflow_run_id=$1 AND step_definition_id='dns' AND idempotency_key=$2`, runID, state.Steps["dns"].Run.IdempotencyKey).Scan(&stepCount); err != nil {
+	authoritative, err := store.LoadWorkflowState(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authoritativeStep := authoritative.Steps["dns"]
+	if authoritativeStep == nil || authoritativeStep.Run.Status != domain.StepFailed || authoritativeStep.Run.AttemptCount != 1 {
+		t.Fatalf("authoritative failed step=%#v", authoritativeStep)
+	}
+	var authoritativeInput struct {
+		Targets []string `json:"targets"`
+	}
+	if err := json.Unmarshal(authoritativeStep.Run.Input, &authoritativeInput); err != nil || len(authoritativeInput.Targets) != 1 || authoritativeInput.Targets[0] != "https://local.example.test/" || authoritativeStep.InputHash != workflow.InputDigest(authoritativeStep.Run.Input) {
+		t.Fatalf("authoritative input=%s hash=%q", authoritativeStep.Run.Input, authoritativeStep.InputHash)
+	}
+	if authoritativeStep.Run.ErrorClassification != step.ErrorClassification || authoritativeStep.Run.ErrorDetails != step.ErrorDetails || authoritativeStep.Run.CompletedAt == nil || !authoritativeStep.Run.CompletedAt.Equal(completed.Truncate(time.Microsecond)) {
+		t.Fatalf("authoritative terminal fields classification=%q details=%q completed=%v", authoritativeStep.Run.ErrorClassification, authoritativeStep.Run.ErrorDetails, authoritativeStep.Run.CompletedAt)
+	}
+	var stepCount, acceptedAfter, rejectedAfter, terminalAfter int
+	var providerAttemptAfter domain.ID
+	if err := store.Pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM step_runs WHERE workflow_run_id=$1 AND step_definition_id='dns' AND idempotency_key=$2),
+		(SELECT count(*) FROM audit_events WHERE event_type='provider_result_accepted' AND provider_attempt_id=$3),
+		(SELECT count(*) FROM audit_events WHERE event_type='provider_result_rejected' AND provider_attempt_id=$3),
+		(SELECT count(*) FROM audit_events WHERE event_type='provider_invocation_failed' AND provider_attempt_id=$3),
+		(SELECT provider_attempt_id FROM tool_runs WHERE id=$4)`, runID, state.Steps["dns"].Run.IdempotencyKey, providerAttemptID, toolID).Scan(&stepCount, &acceptedAfter, &rejectedAfter, &terminalAfter, &providerAttemptAfter); err != nil {
 		t.Fatal(err)
 	}
 	if stepCount != 1 {
-		t.Fatalf("resume created %d step rows, want 1", stepCount)
+		t.Fatalf("stale save left %d step rows, want 1", stepCount)
+	}
+	if acceptedAfter != 1 || rejectedAfter != 1 || terminalAfter != 1 || providerAttemptAfter != providerAttemptID {
+		t.Fatalf("provenance after stale save accepted=%d rejected=%d terminal=%d tool_attempt=%s want=%s", acceptedAfter, rejectedAfter, terminalAfter, providerAttemptAfter, providerAttemptID)
 	}
 }

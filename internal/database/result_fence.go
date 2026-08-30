@@ -1,12 +1,15 @@
 package database
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/tobiasGuta/Reconductor/internal/canonicaljson"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
@@ -261,7 +264,20 @@ func lockAndValidateWorkflowSave(ctx context.Context, tx pgx.Tx, state *workflow
 		if found {
 			return lostLeaseError("scheduled claim identity is missing")
 		}
-		return nil
+		var taskID domain.ID
+		var persistedStatus domain.RunStatus
+		var persistedSummary json.RawMessage
+		err = tx.QueryRow(ctx, `SELECT task_id,status,summary FROM workflow_runs WHERE id=$1 FOR UPDATE`, state.Run.ID).Scan(&taskID, &persistedStatus, &persistedSummary)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if taskID != state.Run.TaskID {
+			return fmt.Errorf("%w: workflow task lineage does not match", workflow.ErrWorkflowCheckpointConflict)
+		}
+		return validateAuthoritativeWorkflowLifecycle(state.Run, persistedStatus, persistedSummary)
 	}
 	if fence.ExecutionID == "" || fence.LeaseOwner == "" || fence.Attempt < 1 {
 		return lostLeaseError("claim identity is incomplete")
@@ -299,7 +315,8 @@ func lockAndValidateWorkflowSave(ctx context.Context, tx pgx.Tx, state *workflow
 
 	var persistedTaskID domain.ID
 	var persistedStatus domain.RunStatus
-	err = tx.QueryRow(ctx, `SELECT task_id,status FROM workflow_runs WHERE id=$1 FOR UPDATE`, state.Run.ID).Scan(&persistedTaskID, &persistedStatus)
+	var persistedSummary json.RawMessage
+	err = tx.QueryRow(ctx, `SELECT task_id,status,summary FROM workflow_runs WHERE id=$1 FOR UPDATE`, state.Run.ID).Scan(&persistedTaskID, &persistedStatus, &persistedSummary)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		if item.Status != domain.ScheduledExecutionClaimed {
@@ -316,6 +333,9 @@ func lockAndValidateWorkflowSave(ctx context.Context, tx pgx.Tx, state *workflow
 		}
 		if persistedStatus == domain.RunPaused && item.Status != domain.ScheduledExecutionClaimed {
 			return lostLeaseError("paused workflow has not been reclaimed")
+		}
+		if err := validateAuthoritativeWorkflowLifecycle(state.Run, persistedStatus, persistedSummary); err != nil {
+			return err
 		}
 	}
 
@@ -351,6 +371,86 @@ func lockAndValidateWorkflowSave(ctx context.Context, tx pgx.Tx, state *workflow
 		}
 	}
 	return rows.Err()
+}
+
+func lockAndValidateAuthoritativeStepAttempts(ctx context.Context, tx pgx.Tx, state *workflow.State) error {
+	steps := make(map[domain.ID]*workflow.StepState, len(state.Steps))
+	stepIDs := make([]domain.ID, 0, len(state.Steps))
+	for _, stepState := range state.Steps {
+		if stepState == nil || stepState.Run.ID == "" {
+			return fmt.Errorf("%w: workflow state contains an invalid StepRun", workflow.ErrEffectiveStepInputConflict)
+		}
+		if _, duplicate := steps[stepState.Run.ID]; duplicate {
+			return fmt.Errorf("%w: workflow state repeats StepRun %s", workflow.ErrEffectiveStepInputConflict, stepState.Run.ID)
+		}
+		steps[stepState.Run.ID] = stepState
+		stepIDs = append(stepIDs, stepState.Run.ID)
+	}
+	sort.Slice(stepIDs, func(i, j int) bool { return stepIDs[i] < stepIDs[j] })
+	if len(stepIDs) == 0 {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `SELECT id,status,attempt_count,input FROM step_runs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE`, idStrings(stepIDs))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	persisted := make(map[domain.ID]struct{}, len(stepIDs))
+	for rows.Next() {
+		var id domain.ID
+		var status domain.StepStatus
+		var attemptCount int
+		var input json.RawMessage
+		if err := rows.Scan(&id, &status, &attemptCount, &input); err != nil {
+			return err
+		}
+		stepState := steps[id]
+		persisted[id] = struct{}{}
+		if stepState.Run.AttemptCount != attemptCount {
+			return fmt.Errorf("%w: StepRun %s has authoritative attempt %d, not %d", workflow.ErrEffectiveStepInputConflict, id, attemptCount, stepState.Run.AttemptCount)
+		}
+		if attemptCount > 0 && (!bytes.Equal(stepState.Run.Input, input) || stepState.InputHash != workflow.InputDigest(input)) {
+			return fmt.Errorf("%w: StepRun %s has different authoritative input", workflow.ErrEffectiveStepInputConflict, id)
+		}
+		if recoveryStepTerminal(status) && stepState.Run.Status != status {
+			return fmt.Errorf("%w: terminal StepRun %s is %s, not %s", workflow.ErrWorkflowLifecycleConflict, id, status, stepState.Run.Status)
+		}
+		if status == domain.StepRetryable && stepState.Run.Status != domain.StepRetryable && stepState.Run.Status != domain.StepFailed {
+			return fmt.Errorf("%w: result-owned retryable StepRun %s cannot transition to %s", workflow.ErrWorkflowLifecycleConflict, id, stepState.Run.Status)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range stepIDs {
+		if _, found := persisted[id]; !found && steps[id].Run.AttemptCount != 0 {
+			return fmt.Errorf("%w: StepRun %s attempt %d was not allocated by the result store", workflow.ErrEffectiveStepInputConflict, id, steps[id].Run.AttemptCount)
+		}
+	}
+	return nil
+}
+
+func validateAuthoritativeWorkflowLifecycle(incoming domain.WorkflowRun, persistedStatus domain.RunStatus, persistedSummary json.RawMessage) error {
+	if recoveryRunTerminal(persistedStatus) {
+		if incoming.Status != persistedStatus {
+			return fmt.Errorf("%w: terminal WorkflowRun %s is %s, not %s", workflow.ErrWorkflowLifecycleConflict, incoming.ID, persistedStatus, incoming.Status)
+		}
+		if !defaultWorkflowSummary(persistedSummary) && !equivalentJSON(persistedSummary, incoming.Summary) {
+			return fmt.Errorf("%w: terminal WorkflowRun %s has a newer authoritative summary", workflow.ErrWorkflowLifecycleConflict, incoming.ID)
+		}
+	}
+	return nil
+}
+
+func defaultWorkflowSummary(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || equivalentJSON(trimmed, json.RawMessage(`{}`))
+}
+
+func equivalentJSON(left, right json.RawMessage) bool {
+	canonicalLeft, leftErr := canonicaljson.Marshal(left)
+	canonicalRight, rightErr := canonicaljson.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(canonicalLeft, canonicalRight)
 }
 
 func staleResultError(reason resultFenceReasonCode, detail string) error {

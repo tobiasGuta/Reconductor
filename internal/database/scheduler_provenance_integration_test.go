@@ -44,6 +44,7 @@ func TestScheduledExecutionStructuredProvenance(t *testing.T) {
 		Run:   domain.WorkflowRun{ID: runID, TaskID: task.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)},
 		Steps: map[string]*workflow.StepState{},
 	}
+	materializeSyntheticWorkflowState(t, store, ctx, state)
 	persister := WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		return store.MarkScheduledExecutionRunning(lifecycleCtx, execution.ID, task.ID, state.Run.ID, &scopeVersionID, "provenance-owner-1", claimed.AttemptCount)
 	}}
@@ -219,6 +220,7 @@ func TestScheduledExecutionStructuredProvenanceFencingAndRollback(t *testing.T) 
 	rollbackRunID := domain.NewID()
 	now := time.Now().UTC()
 	rollbackState := &workflow.State{Run: domain.WorkflowRun{ID: rollbackRunID, TaskID: rollbackTask.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)}, Steps: map[string]*workflow.StepState{}}
+	materializeSyntheticWorkflowState(t, store, ctx, rollbackState)
 	rollbackPersister := WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		return store.MarkScheduledExecutionRunning(lifecycleCtx, rollbackExecution.ID, rollbackTask.ID, state.Run.ID, nil, "rollback-owner", rollbackExecution.AttemptCount)
 	}}
@@ -305,6 +307,7 @@ func startScheduledExecutionWithScope(t *testing.T, store *Store, ctx context.Co
 		Run:   domain.WorkflowRun{ID: domain.NewID(), TaskID: task.ID, WorkflowDefinitionID: definitionID, WorkflowVersion: "1", Status: domain.RunRunning, StartedAt: &now, TriggerSource: "run_now", Summary: json.RawMessage(`{}`)},
 		Steps: map[string]*workflow.StepState{},
 	}
+	materializeSyntheticWorkflowState(t, store, ctx, state)
 	persister := WorkflowPersister{Store: store, File: workflow.FileStore{Root: t.TempDir()}, Lifecycle: func(lifecycleCtx context.Context, state *workflow.State) error {
 		return store.MarkScheduledExecutionRunning(lifecycleCtx, execution.ID, task.ID, state.Run.ID, &scopeVersionID, owner, execution.AttemptCount)
 	}}

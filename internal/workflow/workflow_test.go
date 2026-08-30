@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -10,10 +12,76 @@ import (
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/budget"
+	"github.com/tobiasGuta/Reconductor/internal/canonicaljson"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 )
+
+func TestMaterializationStrictReleaseContract(t *testing.T) {
+	definition := Definition{ID: domain.NewID(), Name: "strict", Version: "1", Materializer: "web-recon/v1", Description: "strict decode", Steps: []Step{}, DefaultPolicyRequirements: json.RawMessage(`{}`), CreatedAt: time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC)}
+	raw, digest, err := Materialize(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := VerifyMaterialization(raw, digest)
+	if err != nil || verified.Materializer != "web-recon/v1" {
+		t.Fatalf("supported materialization verified=%#v error=%v", verified, err)
+	}
+
+	unknown := append(json.RawMessage(nil), raw[:len(raw)-1]...)
+	unknown = append(unknown, []byte(`,"unexpected":true}`)...)
+	canonical, err := canonicaljson.Marshal(unknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(canonical)
+	if _, err := VerifyMaterialization(unknown, hex.EncodeToString(sum[:])); !errors.Is(err, ErrWorkflowCheckpointConflict) {
+		t.Fatalf("unknown definition field error=%v", err)
+	}
+	if _, err := VerifyMaterialization(append(append(json.RawMessage(nil), raw...), []byte(` {}`)...), digest); !errors.Is(err, ErrWorkflowCheckpointConflict) {
+		t.Fatalf("trailing definition JSON error=%v", err)
+	}
+	missingRevision := definition
+	missingRevision.Materializer = ""
+	missingRaw, missingDigest, err := Materialize(missingRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyMaterialization(missingRaw, missingDigest); !errors.Is(err, ErrWorkflowCheckpointConflict) {
+		t.Fatalf("missing materializer error=%v", err)
+	}
+	unsupportedRevision := definition
+	unsupportedRevision.Materializer = "web-recon/v99"
+	unsupportedRaw, unsupportedDigest, err := Materialize(unsupportedRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyMaterialization(unsupportedRaw, unsupportedDigest); !errors.Is(err, ErrWorkflowCheckpointConflict) {
+		t.Fatalf("unsupported materializer error=%v", err)
+	}
+}
+
+func TestTemplateDescriptorStrictDecoding(t *testing.T) {
+	valid := json.RawMessage(`{"schema_version":1,"kind":"built-in","materializer":"web-recon/v1"}`)
+	if descriptor, err := DecodeTemplateDescriptor(valid); err != nil || descriptor.Materializer != "web-recon/v1" {
+		t.Fatalf("valid descriptor=%#v error=%v", descriptor, err)
+	}
+	for name, raw := range map[string]json.RawMessage{
+		"unknown field":        json.RawMessage(`{"schema_version":1,"kind":"built-in","materializer":"web-recon/v1","unexpected":true}`),
+		"trailing JSON":        json.RawMessage(`{"schema_version":1,"kind":"built-in","materializer":"web-recon/v1"} {}`),
+		"unsupported revision": json.RawMessage(`{"schema_version":1,"kind":"built-in","materializer":"web-recon/v99"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeTemplateDescriptor(raw); err == nil {
+				t.Fatal("expected strict descriptor rejection")
+			}
+		})
+	}
+	if _, err := (Template{Materializer: "web-recon/v99"}).Descriptor(); err == nil {
+		t.Fatal("unsupported template materializer revision was accepted")
+	}
+}
 
 type testCap struct {
 	name     string
@@ -228,6 +296,26 @@ func TestRetryIdempotencyAndResume(t *testing.T) {
 	}
 }
 
+type unavailableCheckpointPersister struct{}
+
+func (unavailableCheckpointPersister) Save(context.Context, *State) error {
+	return ErrWorkflowCheckpointUnavailable
+}
+
+func TestInitialCheckpointFailurePreventsProviderExecution(t *testing.T) {
+	calls := 0
+	registry := registryFor(t, testCap{"x", &calls, false})
+	definition := Definition{ID: domain.NewID(), Name: "checkpoint-failure", Version: "1", Steps: []Step{{ID: "provider", Capability: "x", Input: json.RawMessage(`{}`)}}}
+	engine := Engine{Registry: registry, Executor: &testRegistryExecutor{registry: registry}, Persister: unavailableCheckpointPersister{}, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
+	state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), WorkflowDefinitionID: definition.ID}, nil)
+	if !errors.Is(err, ErrWorkflowCheckpointUnavailable) {
+		t.Fatalf("error=%v state=%#v", err, state)
+	}
+	if calls != 0 {
+		t.Fatalf("provider calls=%d after initial checkpoint failure", calls)
+	}
+}
+
 type degradedRetryExecutor struct{ calls int }
 
 func (e *degradedRetryExecutor) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
@@ -390,7 +478,7 @@ func TestResumeAfterDNSFailureRetainsSuccessfulScopePreparation(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected retry DNS failure")
 	}
-	if executor.calls["discover.subdomains"] != 1 || executor.calls["targeting.prepare"] != 1 || executor.calls["resolve.dns"] != 2 {
+	if executor.calls["discover.subdomains"] != 1 || executor.calls["targeting.prepare"] != 1 || executor.calls["resolve.dns"] != 1 {
 		t.Fatalf("unexpected resume calls: %#v", executor.calls)
 	}
 	if state.Steps["dns"].Run.ID != dnsStepRunID {
