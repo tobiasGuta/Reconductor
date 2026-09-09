@@ -90,7 +90,7 @@ func newRecoveryIntegrationEnv(t *testing.T, name string) recoveryIntegrationEnv
 	for _, capName := range allCaps() {
 		setupRegistry.Register(&fakeProvider{name: capName, onExecute: setupExecute})
 	}
-	setupOrch := &orchestration.Service{Store: store, Registry: setupRegistry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+	setupOrch := &orchestration.Service{Store: store, Registry: setupRegistry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 	if _, err := setupOrch.Run(ctx, orchestration.WorkflowRequest{ProgramID: programID, ScopeReference: "scope.json", WorkflowName: workflows.ContinuousName, AcknowledgeScopeExpansion: true}); err != nil {
 		t.Fatalf("setup workflow run: %v", err)
 	}
@@ -104,7 +104,7 @@ func newRecoveryIntegrationEnv(t *testing.T, name string) recoveryIntegrationEnv
 }
 
 func newRecoveryOrch(env recoveryIntegrationEnv, registry *capability.Registry) *orchestration.Service {
-	return &orchestration.Service{Store: env.store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: env.root}, Scheduler: config.Scheduler{WorkflowStateRoot: env.root}, ArtifactStorage: config.ArtifactStorage{Root: env.root}}}
+	return &orchestration.Service{Store: env.store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: env.root}, Scheduler: config.Scheduler{WorkflowStateRoot: env.root}, ArtifactStorage: config.ArtifactStorage{Root: env.root}}}
 }
 
 func newRecoverySvc(env recoveryIntegrationEnv, orch *orchestration.Service, owner string) *Service {

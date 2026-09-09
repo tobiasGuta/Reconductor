@@ -180,6 +180,7 @@ func TestConsoleUsesPerRunSanitizedTopology(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	ensureTestArtifactStore(t, ctx, store)
 
 	template := workflow.Template{ID: domain.NewID(), Name: "console-modern-" + string(domain.NewID()), Version: "1", Description: "console modern", Materializer: "web-recon/v1", DefaultPolicyRequirements: json.RawMessage(`{}`), CreatedAt: now}
 	if err := store.EnsureWorkflowTemplate(ctx, template); err != nil {
@@ -210,6 +211,7 @@ func TestConsoleUsesPerRunSanitizedTopology(t *testing.T) {
 	olderRunID := createRun(programID, "older", now.Add(-2*time.Hour), []workflow.Step{{ID: "older-only", Capability: "older.capability", Input: json.RawMessage(`{"secret":"CONSOLE_MATERIALIZED_INPUT_SENTINEL"}`), Bindings: map[string]string{"target": "CONSOLE_MATERIALIZED_BINDING_SENTINEL"}, ApprovalRequired: true}})
 	latestRunID := createRun(programID, "latest", now.Add(-time.Hour), []workflow.Step{{ID: "latest-only", Capability: "latest.capability", DependsOn: []string{"prior"}, Input: json.RawMessage(`{"secret":"LATEST_RAW_INPUT_MARKER"}`)}})
 	toolID, artifactID := domain.NewID(), domain.NewID()
+	artifactAddress := withTestArtifactAddress(domain.Artifact{ID: artifactID})
 	if _, err := store.Pool.Exec(ctx, `UPDATE scope_versions SET target_plan=$2 WHERE id=$1`, scopeID, json.RawMessage(`{"raw":"CONSOLE_RAW_TARGET_PLAN_SENTINEL"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +221,7 @@ func TestConsoleUsesPerRunSanitizedTopology(t *testing.T) {
 	if _, err := store.Pool.Exec(ctx, `INSERT INTO tool_runs(id,step_run_id,capability,provider,tool_version,sanitized_arguments,execution_environment,started_at,completed_at,exit_code,timed_out) VALUES($1,$2,'legacy.capability','sentinel-provider','1',$3,'{}',$4,$4,0,false)`, toolID, legacyStepID, json.RawMessage(`{"raw":"CONSOLE_PROVIDER_ARGS_SENTINEL"}`), now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Pool.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,'raw-provider-output','text/plain',1,'sentinel-sha',$6,$7,'redacted',false)`, artifactID, legacyTaskID, legacyRunID, legacyStepID, toolID, "synthetic://CONSOLE_ARTIFACT_PATH_SENTINEL", now); err != nil {
+	if _, err := store.Pool.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,addressing_version,artifact_store_id,storage_key,created_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,'raw-provider-output','text/plain',1,'sentinel-sha',$6,$7,$8,$9,'redacted',false)`, artifactID, legacyTaskID, legacyRunID, legacyStepID, toolID, artifactAddress.AddressingVersion, artifactAddress.ArtifactStoreID, artifactAddress.StorageKey, now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -265,9 +267,9 @@ func TestConsoleUsesPerRunSanitizedTopology(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, forbidden := range []string{
-		"materialized_definition", `"target_plan":`, `"sanitized_arguments":`, `"storage_location":`,
+		"materialized_definition", `"target_plan":`, `"sanitized_arguments":`, `"storage_location":`, `"storage_key":`,
 		"CONSOLE_MATERIALIZED_INPUT_SENTINEL", "CONSOLE_MATERIALIZED_BINDING_SENTINEL", "CONSOLE_RAW_TARGET_PLAN_SENTINEL",
-		"CONSOLE_PROVIDER_ARGS_SENTINEL", "CONSOLE_ARTIFACT_PATH_SENTINEL", "CONSOLE_PROVIDER_OUTPUT_SENTINEL",
+		"CONSOLE_PROVIDER_ARGS_SENTINEL", *artifactAddress.StorageKey, "CONSOLE_PROVIDER_OUTPUT_SENTINEL",
 		"LATEST_RAW_INPUT_MARKER", "OTHER_PROGRAM_MARKER",
 	} {
 		if strings.Contains(string(encoded), forbidden) {

@@ -20,6 +20,25 @@ func NewID() ID {
 	return ID(hex.EncodeToString(b[0:4]) + "-" + hex.EncodeToString(b[4:6]) + "-" + hex.EncodeToString(b[6:8]) + "-" + hex.EncodeToString(b[8:10]) + "-" + hex.EncodeToString(b[10:16]))
 }
 
+func ParseID(value string) (ID, error) {
+	if len(value) != 36 {
+		return "", fmt.Errorf("ID must be a canonical lowercase UUID")
+	}
+	for index := range value {
+		switch index {
+		case 8, 13, 18, 23:
+			if value[index] != '-' {
+				return "", fmt.Errorf("ID must be a canonical lowercase UUID")
+			}
+		default:
+			if (value[index] < '0' || value[index] > '9') && (value[index] < 'a' || value[index] > 'f') {
+				return "", fmt.Errorf("ID must be a canonical lowercase UUID")
+			}
+		}
+	}
+	return ID(value), nil
+}
+
 type TaskStatus string
 
 const (
@@ -292,20 +311,36 @@ type ActionResult struct {
 	Error       *StructuredError `json:"error,omitempty"`
 }
 type Artifact struct {
-	ID              ID         `json:"id"`
-	TaskID          ID         `json:"task_id"`
-	WorkflowRunID   ID         `json:"workflow_run_id"`
-	StepRunID       ID         `json:"step_run_id"`
-	ToolRunID       ID         `json:"tool_run_id"`
-	Type            string     `json:"type"`
-	ContentType     string     `json:"content_type"`
-	Size            int64      `json:"size"`
-	SHA256          string     `json:"sha256"`
-	StorageLocation string     `json:"storage_location"`
-	CreatedAt       time.Time  `json:"created_at"`
-	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
-	RedactionState  string     `json:"redaction_state"`
-	Sensitive       bool       `json:"sensitive"`
+	ID                ID         `json:"id"`
+	TaskID            ID         `json:"task_id"`
+	WorkflowRunID     ID         `json:"workflow_run_id"`
+	StepRunID         ID         `json:"step_run_id"`
+	ToolRunID         ID         `json:"tool_run_id"`
+	Type              string     `json:"type"`
+	ContentType       string     `json:"content_type"`
+	Size              int64      `json:"size"`
+	SHA256            string     `json:"sha256"`
+	AddressingVersion int16      `json:"addressing_version"`
+	ArtifactStoreID   *ID        `json:"artifact_store_id,omitempty"`
+	StorageKey        *string    `json:"storage_key,omitempty"`
+	StorageLocation   *string    `json:"storage_location,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
+	RedactionState    string     `json:"redaction_state"`
+	Sensitive         bool       `json:"sensitive"`
+}
+
+type ArtifactStoreRegistration struct {
+	ID               ID     `json:"id"`
+	IncarnationNonce ID     `json:"incarnation_nonce"`
+	BackendKind      string `json:"backend_kind"`
+	MarkerFormat     string `json:"marker_format"`
+	MarkerVersion    int    `json:"marker_version"`
+}
+
+type ArtifactStore struct {
+	ArtifactStoreRegistration
+	CreatedAt time.Time `json:"created_at"`
 }
 type Asset struct {
 	ID             ID        `json:"id"`

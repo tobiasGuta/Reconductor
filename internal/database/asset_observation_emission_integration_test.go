@@ -450,8 +450,8 @@ func TestArtifactExpirationPreservesAssetObservationEmission(t *testing.T) {
 	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE artifacts SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, artifactID); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.env.store.DeleteArtifact(fixture.env.ctx, artifactID); err != nil {
-		t.Fatal(err)
+	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `DELETE FROM artifacts WHERE id=$1`, artifactID); err == nil || !strings.Contains(err.Error(), "metadata deletion is prohibited") {
+		t.Fatalf("artifact delete error=%v", err)
 	}
 	var emissions, retainedEvidence, artifactsRemaining int
 	if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT
@@ -460,7 +460,7 @@ func TestArtifactExpirationPreservesAssetObservationEmission(t *testing.T) {
 		(SELECT count(*) FROM artifacts WHERE id=$3)`, observationID, acceptedEventID, artifactID).Scan(&emissions, &retainedEvidence, &artifactsRemaining); err != nil {
 		t.Fatal(err)
 	}
-	if emissions != 1 || retainedEvidence != 0 || artifactsRemaining != 0 {
+	if emissions != 1 || retainedEvidence != 1 || artifactsRemaining != 1 {
 		t.Fatalf("emissions=%d retained_evidence=%d artifacts=%d", emissions, retainedEvidence, artifactsRemaining)
 	}
 }

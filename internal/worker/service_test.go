@@ -1,14 +1,18 @@
 package worker
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -120,11 +124,19 @@ func (s *workerStore) PersistEffectiveStepInput(_ context.Context, _ domain.ID, 
 	s.effectiveAttempts[action.StepRunID] = action.StepAttempt
 	return append(json.RawMessage(nil), frozen...), nil
 }
-func (s *workerStore) PersistResult(_ context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) error {
+func (s *workerStore) PersistResultWithArtifactPublication(ctx context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, result *domain.ActionResult, admission *capability.ResultAdmissionProvenance, publish func(context.Context) ([]domain.Artifact, error)) error {
+	var artifacts []domain.Artifact
+	if publish != nil {
+		var err error
+		artifacts, err = publish(ctx)
+		if err != nil {
+			return err
+		}
+	}
 	s.step = step
 	s.tool = tool
 	s.artifacts = append([]domain.Artifact(nil), artifacts...)
-	s.result = result
+	s.result = *result
 	s.admission = admission
 	s.admissions = append(s.admissions, admission)
 	return nil
@@ -136,7 +148,13 @@ type workerArtifacts struct {
 
 func (s *workerArtifacts) Put(_ context.Context, req artifact.PutRequest) (domain.Artifact, error) {
 	s.puts = append(s.puts, req)
-	return domain.Artifact{ID: domain.NewID(), TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), StorageLocation: "memory://" + req.Name, CreatedAt: time.Now().UTC()}, nil
+	id := domain.NewID()
+	key, err := artifact.StorageKeyFor(id)
+	if err != nil {
+		return domain.Artifact{}, err
+	}
+	storeID := domain.ID("00000000-0000-4000-8000-000000009001")
+	return domain.Artifact{ID: id, TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), AddressingVersion: 1, ArtifactStoreID: &storeID, StorageKey: &key, CreatedAt: time.Now().UTC()}, nil
 }
 
 type workerScope struct{}
@@ -213,21 +231,25 @@ func TestWorkerExecutionUsesSharedPipelineForHistoryAndArtifacts(t *testing.T) {
 	}
 	var stdoutID, stderrID, resultID domain.ID
 	for _, artifact := range store.artifacts {
-		switch artifact.StorageLocation {
-		case "memory://stdout.jsonl":
+		switch {
+		case store.tool.StdoutArtifactID != nil && artifact.ID == *store.tool.StdoutArtifactID:
 			stdoutID = artifact.ID
 			if artifact.Type != "raw-provider-output" || artifact.ContentType != "application/x-ndjson" {
 				t.Fatalf("stdout artifact mismatch: %#v", artifact)
 			}
-		case "memory://stderr.txt":
+		case store.tool.StderrArtifactID != nil && artifact.ID == *store.tool.StderrArtifactID:
 			stderrID = artifact.ID
 			if artifact.Type != "raw-provider-output" || artifact.ContentType != "text/plain" {
 				t.Fatalf("stderr artifact mismatch: %#v", artifact)
 			}
-		case "memory://result.json":
-			resultID = artifact.ID
-			if artifact.Type != "normalized-result" || artifact.ContentType != "application/json" {
-				t.Fatalf("result artifact mismatch: %#v", artifact)
+		default:
+			for _, id := range store.result.ArtifactIDs {
+				if id == artifact.ID {
+					resultID = artifact.ID
+					if artifact.Type != "normalized-result" || artifact.ContentType != "application/json" {
+						t.Fatalf("result artifact mismatch: %#v", artifact)
+					}
+				}
 			}
 		}
 	}
@@ -378,6 +400,191 @@ func TestWorkerTerminalAuditWarningDoesNotLogInternalError(t *testing.T) {
 	}
 }
 
+func TestWorkerStartupReachesQueueConsumerWithoutRetentionPrerequisite(t *testing.T) {
+	spy := newRedisCommandSpy(t)
+	client := redis.NewClient(&redis.Options{Addr: spy.listener.Addr().String(), Protocol: 2, DisableIdentity: true, MaxRetries: -1})
+	t.Cleanup(func() { _ = client.Close() })
+	service := &Service{
+		Queue:        queue.New(client, "worker-startup-liveness", "worker", 0, time.Millisecond),
+		Registry:     capability.NewRegistry(),
+		Results:      &workerStore{},
+		Artifacts:    &workerArtifacts{},
+		PoolSize:     1,
+		ReadBlock:    10 * time.Millisecond,
+		LeaseTimeout: time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- service.Run(ctx) }()
+	for _, command := range []string{"XGROUP", "XAUTOCLAIM", "XREADGROUP"} {
+		spy.waitFor(t, command, time.Second)
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("worker shutdown error=%v", err)
+	}
+}
+
+func TestWorkerPeriodicRetryLifecycleNeedsNoRetentionMaintenance(t *testing.T) {
+	spy := newRedisCommandSpy(t)
+	client := redis.NewClient(&redis.Options{Addr: spy.listener.Addr().String(), Protocol: 2, DisableIdentity: true, MaxRetries: -1})
+	t.Cleanup(func() { _ = client.Close() })
+	service := &Service{
+		Queue:        queue.New(client, "worker-periodic-liveness", "worker", 0, time.Millisecond),
+		Registry:     capability.NewRegistry(),
+		Results:      &workerStore{},
+		Artifacts:    &workerArtifacts{},
+		PoolSize:     1,
+		ReadBlock:    10 * time.Millisecond,
+		LeaseTimeout: time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- service.Run(ctx) }()
+	spy.waitFor(t, "XREADGROUP", time.Second)
+	spy.waitFor(t, "ZRANGEBYSCORE", 2*time.Second)
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("worker shutdown error=%v", err)
+	}
+}
+
+type redisCommandSpy struct {
+	listener net.Listener
+	mu       sync.Mutex
+	commands []string
+	seen     chan string
+}
+
+func newRedisCommandSpy(t *testing.T) *redisCommandSpy {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spy := &redisCommandSpy{listener: listener, seen: make(chan string, 64)}
+	t.Cleanup(func() { _ = listener.Close() })
+	go spy.accept()
+	return spy
+}
+
+func (s *redisCommandSpy) accept() {
+	for {
+		connection, err := s.listener.Accept()
+		if err != nil {
+			return
+		}
+		go s.serve(connection)
+	}
+}
+
+func (s *redisCommandSpy) serve(connection net.Conn) {
+	defer connection.Close()
+	reader := bufio.NewReader(connection)
+	for {
+		command, err := readRedisCommand(reader)
+		if err != nil {
+			return
+		}
+		s.record(command[0])
+		var response string
+		switch command[0] {
+		case "HELLO":
+			response = "-ERR unknown command 'hello'\r\n"
+		case "XGROUP":
+			response = "+OK\r\n"
+		case "XAUTOCLAIM":
+			response = "*3\r\n$3\r\n0-0\r\n*0\r\n*0\r\n"
+		case "XREADGROUP":
+			response = "*-1\r\n"
+		case "ZRANGEBYSCORE":
+			response = "*0\r\n"
+		default:
+			response = "+OK\r\n"
+		}
+		if _, err := io.WriteString(connection, response); err != nil {
+			return
+		}
+	}
+}
+
+func (s *redisCommandSpy) record(command string) {
+	s.mu.Lock()
+	s.commands = append(s.commands, command)
+	s.mu.Unlock()
+	select {
+	case s.seen <- command:
+	default:
+	}
+}
+
+func (s *redisCommandSpy) waitFor(t *testing.T, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		s.mu.Lock()
+		for _, command := range s.commands {
+			if command == want {
+				s.mu.Unlock()
+				return
+			}
+		}
+		s.mu.Unlock()
+		select {
+		case <-s.seen:
+		case <-deadline.C:
+			t.Fatalf("Redis command %s was not observed; commands=%v", want, s.commands)
+		}
+	}
+}
+
+func readRedisCommand(reader *bufio.Reader) ([]string, error) {
+	prefix, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if prefix != '*' {
+		return nil, fmt.Errorf("RESP command prefix=%q", prefix)
+	}
+	count, err := readRESPInteger(reader)
+	if err != nil {
+		return nil, err
+	}
+	command := make([]string, count)
+	for index := range command {
+		prefix, err := reader.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		if prefix != '$' {
+			return nil, fmt.Errorf("RESP bulk prefix=%q", prefix)
+		}
+		size, err := readRESPInteger(reader)
+		if err != nil {
+			return nil, err
+		}
+		value := make([]byte, size)
+		if _, err := io.ReadFull(reader, value); err != nil {
+			return nil, err
+		}
+		if tail, err := reader.ReadString('\n'); err != nil || tail != "\r\n" {
+			return nil, fmt.Errorf("RESP bulk terminator=%q error=%v", tail, err)
+		}
+		command[index] = string(value)
+	}
+	command[0] = strings.ToUpper(command[0])
+	return command, nil
+}
+
+func readRESPInteger(reader *bufio.Reader) (int, error) {
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"))
+}
+
 func parityAction(taskID, runID, stepID domain.ID) domain.ActionRequest {
 	return domain.ActionRequest{ID: domain.NewID(), TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "parity.cap", Input: json.RawMessage(`{"ok":true}`), IdempotencyKey: string(stepID), StepAttempt: 1}
 }
@@ -395,13 +602,7 @@ func assertArtifactRoles(t *testing.T, name string, store *workerStore, artifact
 		t.Fatalf("%s artifact roles=%#v", name, roles)
 	}
 	for _, artifact := range store.artifacts {
-		if artifact.StorageLocation == "memory://stdout.jsonl" && (store.tool.StdoutArtifactID == nil || *store.tool.StdoutArtifactID != artifact.ID) {
-			t.Fatalf("%s stdout pointer mismatch", name)
-		}
-		if artifact.StorageLocation == "memory://stderr.txt" && (store.tool.StderrArtifactID == nil || *store.tool.StderrArtifactID != artifact.ID) {
-			t.Fatalf("%s stderr pointer mismatch", name)
-		}
-		if artifact.StorageLocation == "memory://result.json" {
+		if artifact.Type == "normalized-result" {
 			for _, id := range store.result.ArtifactIDs {
 				if id == artifact.ID {
 					return

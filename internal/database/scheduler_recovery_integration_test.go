@@ -1078,7 +1078,8 @@ func insertRecoveryEvidence(t *testing.T, env recoveryTestEnvironment, fixture r
 	t.Helper()
 	now := time.Now().UTC()
 	artifactID := domain.NewID()
-	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,'stdout','application/json',8,'preserved-sha','artifact://preserved',$6,'redacted',false)`, artifactID, fixture.task.ID, fixture.runID, fixture.steps["done"], toolID, now); err != nil {
+	address := withTestArtifactAddress(domain.Artifact{ID: artifactID})
+	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,addressing_version,artifact_store_id,storage_key,created_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,'stdout','application/json',8,'preserved-sha',$6,$7,$8,$9,'redacted',false)`, artifactID, fixture.task.ID, fixture.runID, fixture.steps["done"], toolID, address.AddressingVersion, address.ArtifactStoreID, address.StorageKey, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := env.store.Pool.Exec(env.ctx, `UPDATE tool_runs SET stdout_artifact_id=$2 WHERE id=$1`, toolID, artifactID); err != nil {
@@ -1124,7 +1125,7 @@ func recoveryEvidenceSnapshot(t *testing.T, env recoveryTestEnvironment, runID, 
 		{`SELECT jsonb_build_object('status',status,'completed_at',completed_at,'summary',summary)::text FROM workflow_runs WHERE id=$1`, runID, &run},
 		{`SELECT jsonb_build_object('status',status,'output',output,'error_classification',error_classification,'completed_at',completed_at)::text FROM step_runs WHERE id=$1`, stepID, &step},
 		{`SELECT jsonb_build_object('completed_at',completed_at,'exit_code',exit_code,'sanitized_arguments',sanitized_arguments,'stdout_artifact_id',stdout_artifact_id)::text FROM tool_runs WHERE id=$1`, toolID, &tool},
-		{`SELECT jsonb_build_object('sha256',sha256,'storage_location',storage_location,'redaction_state',redaction_state)::text FROM artifacts WHERE id=$1`, artifactID, &artifact},
+		{`SELECT jsonb_build_object('sha256',sha256,'addressing_version',addressing_version,'artifact_store_id',artifact_store_id,'storage_key',storage_key,'storage_location',storage_location,'redaction_state',redaction_state)::text FROM artifacts WHERE id=$1`, artifactID, &artifact},
 		{`SELECT jsonb_build_object('observed_value',observed_value,'metadata',metadata,'evidence_artifact_ids',evidence_artifact_ids)::text FROM asset_observations WHERE id=$1`, observationID, &observation},
 	}
 	for _, item := range queries {

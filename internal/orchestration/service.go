@@ -17,7 +17,6 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/execution"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
-	"github.com/tobiasGuta/Reconductor/internal/redaction"
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
 	"github.com/tobiasGuta/Reconductor/internal/targeting"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
@@ -54,10 +53,10 @@ type WorkflowResult struct {
 }
 
 type Service struct {
-	Config          config.Config
-	Store           *database.Store
-	Registry        *capability.Registry
-	ArtifactFactory func(string, *redaction.Redactor) (*artifact.Local, error)
+	Config    config.Config
+	Store     *database.Store
+	Registry  *capability.Registry
+	Artifacts artifact.Storage
 }
 
 func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, error) {
@@ -345,17 +344,8 @@ func (s Service) resolveTask(ctx context.Context, req WorkflowRequest, def workf
 }
 
 func (s Service) engine(ctx context.Context, task domain.Task, sc capability.Scope, headless bool, fileStore workflow.FileStore, lifecycle Lifecycle, scopeVersionID domain.ID) (workflow.Engine, error) {
-	redactor := redaction.New(s.Config.Logging.SecretNames...)
-	artifactFactory := s.ArtifactFactory
-	if artifactFactory == nil {
-		artifactFactory = artifact.NewLocal
-	}
-	artifacts, err := artifactFactory(s.Config.ArtifactStorage.Root, redactor)
-	if err != nil {
-		return workflow.Engine{}, err
-	}
-	if _, err := artifact.PurgeExpired(ctx, s.Store, artifacts, 1000); err != nil {
-		return workflow.Engine{}, fmt.Errorf("purge expired artifacts: %w", err)
+	if s.Artifacts == nil {
+		return workflow.Engine{}, fmt.Errorf("artifact storage is required")
 	}
 	pol := policy.Policy{ID: "runtime", AllowedCapabilities: s.Registry.Names(), RateLimit: s.Config.Policy.DefaultRateLimit, Concurrency: s.Config.Policy.DefaultConcurrency, ProviderConcurrency: s.Config.Policy.DefaultProviderConcurrency, HostConcurrency: s.Config.Policy.DefaultHostConcurrency, ScanWindows: s.Config.Policy.ScanWindows, AllowedHTTPMethods: s.Config.Policy.AllowedMethods, AuthenticationUsage: s.Config.Policy.AuthenticationUsage, HeadlessBrowser: headless, DirectoryFuzzing: s.Config.Policy.DirectoryFuzzing, MaximumPayloadSize: s.Config.Policy.MaxPayloadBytes, FollowRedirects: s.Config.Policy.FollowRedirects, CrossOrigin: s.Config.Policy.CrossOrigin, IntrusiveChecks: s.Config.Policy.IntrusiveChecks, ArtifactRetention: s.Config.Policy.ArtifactRetention, ExcludedTemplateTags: s.Config.Nuclei.ExcludeTags}
 	maxParallel := policy.ProgramParallelism(pol)
@@ -366,7 +356,7 @@ func (s Service) engine(ctx context.Context, task domain.Task, sc capability.Sco
 			return lifecycle.WorkflowCreated(ctx, task, state.Run, scopeVersionID)
 		}
 	}
-	return workflow.Engine{Registry: s.Registry, Executor: execution.Service{Registry: s.Registry, Store: s.Store, Artifacts: artifacts, ProgramID: task.ProgramID}, Persister: persister, Policy: pol, Scope: sc, Budget: limiter, MaxParallel: maxParallel, OriginalScopeVersionID: scopeVersionID}, nil
+	return workflow.Engine{Registry: s.Registry, Executor: execution.Service{Registry: s.Registry, Store: s.Store, Artifacts: s.Artifacts, ProgramID: task.ProgramID}, Persister: persister, Policy: pol, Scope: sc, Budget: limiter, MaxParallel: maxParallel, OriginalScopeVersionID: scopeVersionID}, nil
 }
 
 func (s Service) resumeApproval(ctx context.Context, state *workflow.State) (bool, error) {

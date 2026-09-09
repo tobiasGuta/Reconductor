@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/database"
@@ -62,7 +63,26 @@ func testDatabaseStore(t *testing.T) (*database.Store, context.Context) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("migrate isolated test schema: %v", err)
 	}
+	if _, err := store.RegisterArtifactStore(ctx, schedulerTestStoreRegistration()); err != nil {
+		t.Fatalf("register isolated test artifact store: %v", err)
+	}
 	return store, ctx
+}
+
+type schedulerTestArtifacts struct{}
+
+func (schedulerTestArtifacts) Put(_ context.Context, req artifact.PutRequest) (domain.Artifact, error) {
+	id := domain.NewID()
+	key, err := artifact.StorageKeyFor(id)
+	if err != nil {
+		return domain.Artifact{}, err
+	}
+	storeID := schedulerTestStoreRegistration().ID
+	return domain.Artifact{ID: id, TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), AddressingVersion: 1, ArtifactStoreID: &storeID, StorageKey: &key, CreatedAt: time.Now().UTC()}, nil
+}
+
+func schedulerTestStoreRegistration() domain.ArtifactStoreRegistration {
+	return domain.ArtifactStoreRegistration{ID: "00000000-0000-4000-8000-000000009005", IncarnationNonce: "00000000-0000-4000-8000-000000009006", BackendKind: artifact.BackendKind, MarkerFormat: artifact.MarkerFormat, MarkerVersion: artifact.MarkerVersion}
 }
 
 type fakeProvider struct {
@@ -204,7 +224,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		setupRegistry.Register(&fakeProvider{name: capName, onExecute: setupExecute})
 	}
 
-	setupOrch := &orchestration.Service{Store: store, Registry: setupRegistry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+	setupOrch := &orchestration.Service{Store: store, Registry: setupRegistry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 	if _, err := setupOrch.Run(ctx, orchestration.WorkflowRequest{ProgramID: programID, ScopeReference: "scope.json", WorkflowName: workflows.ContinuousName, AcknowledgeScopeExpansion: true}); err != nil {
 		t.Fatalf("setup workflow run failed: %v", err)
 	}
@@ -238,7 +258,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		for _, capName := range allCaps() {
 			registry.Register(&fakeProvider{name: capName, onExecute: fakeExecute})
 		}
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		svc := New(store, orch, config.Scheduler{LeaseTimeout: 1 * time.Second, PollInterval: time.Minute})
 		svc.Owner = "test-owner"
 
@@ -315,7 +335,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		for _, capName := range allCaps() {
 			registry.Register(&fakeProvider{name: capName, onExecute: fakeExecute})
 		}
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		svc := New(store, orch, config.Scheduler{LeaseTimeout: 10 * time.Second, PollInterval: time.Minute})
 		svc.Owner = "test-owner"
 		err = svc.Dispatch(ctx)
@@ -352,7 +372,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 			return store.MarkScheduledExecutionCompleted(ctx, id, owner, attempt)
 		}
 
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		svc := New(store, orch, config.Scheduler{LeaseTimeout: 10 * time.Second, PollInterval: time.Minute})
 		svc.Owner = "test-owner"
 		svc.Store = wrapper
@@ -383,7 +403,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		for _, capName := range allCaps() {
 			registry.Register(&fakeProvider{name: capName, onExecute: fakeExecute})
 		}
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		svc := New(store, orch, config.Scheduler{LeaseTimeout: 1 * time.Second, PollInterval: time.Minute})
 		svc.Owner = "test-owner"
 		wrapper := &storeWrapper{Store: store}
@@ -447,7 +467,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		for _, capName := range allCaps() {
 			registry.Register(&fakeProvider{name: capName, onExecute: fakeExecute})
 		}
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		svc := New(store, orch, config.Scheduler{LeaseTimeout: 10 * time.Second, PollInterval: time.Minute})
 		svc.Owner = "test-owner"
 		if err := svc.Dispatch(ctx); err != nil {
@@ -475,7 +495,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		for _, capName := range allCaps() {
 			registry.Register(&fakeProvider{name: capName, onExecute: fakeExecute})
 		}
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		svc := New(store, orch, config.Scheduler{LeaseTimeout: 10 * time.Second, PollInterval: time.Minute})
 		svc.Owner = "test-owner"
 		if err := svc.Dispatch(ctx); err != nil {
@@ -508,7 +528,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		for _, capName := range allCaps() {
 			registry.Register(&fakeProvider{name: capName, onExecute: fakeExecute})
 		}
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		svc := New(store, orch, config.Scheduler{LeaseTimeout: 10 * time.Second, PollInterval: time.Minute})
 		svc.Owner = "test-owner"
 
@@ -575,7 +595,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		}
 
 		wrapper := &storeWrapper{Store: store}
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		svc := New(store, orch, config.Scheduler{LeaseTimeout: 10 * time.Second, PollInterval: time.Minute})
 		svc.Owner = "test-owner"
 		svc.Store = wrapper
@@ -812,7 +832,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		for _, capName := range allCaps() {
 			registry.Register(&fakeProvider{name: capName, onExecute: fakeExecute})
 		}
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		if _, err := orch.Run(ctx, orchestration.WorkflowRequest{
 			ProgramID:                 programID,
 			WorkflowName:              workflows.ContinuousName,
@@ -868,7 +888,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 			close(heartbeatExited)
 			return ctx.Err()
 		}
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		svc := New(store, orch, config.Scheduler{LeaseTimeout: 5 * time.Second, PollInterval: time.Minute})
 		svc.Owner = "test-owner"
 		svc.Store = wrapper
@@ -932,7 +952,7 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		for _, capName := range allCaps() {
 			registry.Register(&fakeProvider{name: capName, onExecute: fakeExecute})
 		}
-		orch := &orchestration.Service{Store: store, Registry: registry, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
+		orch := &orchestration.Service{Store: store, Registry: registry, Artifacts: schedulerTestArtifacts{}, Config: config.Config{Scope: config.Scope{Root: root}, Scheduler: config.Scheduler{WorkflowStateRoot: root}, ArtifactStorage: config.ArtifactStorage{Root: root}}}
 		svc := New(store, orch, config.Scheduler{LeaseTimeout: 10 * time.Second, PollInterval: time.Minute})
 		svc.Owner = "test-owner"
 		cancelCtx, cancel := context.WithCancel(ctx)

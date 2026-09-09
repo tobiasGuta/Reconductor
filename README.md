@@ -194,8 +194,12 @@ The doctor resolves every configured provider, verifies its identity and tested 
 Copy-Item .env.example .env
 docker compose up -d postgres redis
 go run ./cmd/platform migrate
+$env:ARTIFACT_STORE_ID = '<native-store-uuid>'
+go run ./cmd/platform artifact-store init
 go run ./cmd/platform capabilities
 ```
+
+Artifact-producing commands require a pre-initialized store. Native and Docker roots are separate physical stores and require different IDs; see [artifact storage ownership](docs/artifact-storage.md).
 
 Set an optional project/data root for portable logical scope references, then
 start the persistent scheduler. Relative references resolve beneath
@@ -246,12 +250,16 @@ The examples below use `scope/acme.json` as a placeholder for your own Burp-comp
 
 ### Docker-first run
 
-Build and start the local database, Redis, and worker image:
+Build the worker image, configure an operator-generated Docker-volume StoreID, migrate, initialize the named artifact volume, and only then start the worker:
 
 ```powershell
 Copy-Item .env.example .env
-docker compose up -d --build worker
+$env:DOCKER_ARTIFACT_STORE_ID = '<docker-volume-store-uuid>'
+docker compose build worker
+docker compose up -d postgres redis
 docker compose run --rm --entrypoint /usr/local/bin/platform worker migrate
+docker compose run --rm --entrypoint /usr/local/bin/platform worker artifact-store init
+docker compose up -d worker
 ```
 
 Check the environment without sending target traffic:
@@ -333,11 +341,7 @@ To see which providers actually executed, query `tool_runs` through Postgres. Th
 docker compose exec postgres psql -U platform -d security_platform -c "select s.step_definition_id,t.provider,t.started_at,t.completed_at,t.exit_code,t.timed_out,t.sanitized_arguments from tool_runs t join step_runs s on s.id=t.step_run_id order by t.started_at desc limit 30;"
 ```
 
-Provider stdout, stderr, and normalized result artifacts are stored under the artifact root with `Program -> Task -> WorkflowRun -> StepRun -> ToolRun` lineage. In Docker, the worker writes to the Compose artifact volume at `/data/artifacts`:
-
-```powershell
-docker compose run --rm --entrypoint /bin/sh worker -c "find /data/artifacts -path '*<workflow-run-id>*' -type f | sort"
-```
+Provider stdout, stderr, and normalized result artifacts retain `Task -> WorkflowRun -> StepRun -> ToolRun` database lineage. Version-1 bytes use UUID-only keys beneath the validated artifact root. In Docker, the worker writes to the Compose artifact volume at `/data/artifacts`; storage paths are intentionally not exposed by the database or console. See [artifact storage ownership](docs/artifact-storage.md).
 
 The platform records sanitized tool details rather than full raw command lines with every target or secret. Use workflow state for step progress, `tool_runs` for provider execution metadata, queue commands for Redis delivery state, and artifacts for redacted provider output.
 
@@ -348,7 +352,9 @@ If you have PostgreSQL, Redis, and the required provider tools installed locally
 ```powershell
 Copy-Item .env.example .env
 docker compose up -d postgres redis
+$env:ARTIFACT_STORE_ID = '<native-store-uuid>'
 go run ./cmd/platform migrate
+go run ./cmd/platform artifact-store init
 go run ./cmd/platform doctor
 go run ./cmd/platform capabilities
 go run ./cmd/platform program create --name acme --platform private --scope .\scope\acme.json
@@ -385,6 +391,7 @@ platform console [--listen 127.0.0.1:8088]
 platform capabilities
 platform doctor [--format table|json]
 platform migrate
+platform artifact-store init [--allow-nonempty-root] [--resume-registration]
 ```
 
 `run retry <run-id>` accepts the same `--program-id`, `--domain`, `--scope`, and approval flags as `workflow run`; successful unchanged steps are retained. Queue inspection uses the single Redis consumer group and dead-letter stream.
@@ -404,10 +411,11 @@ Workers acknowledge only after the result, execution lineage, artifacts, observa
 
 ## Worker scaling
 
-Run migrations before starting workers against a fresh database:
+Run migrations and explicitly initialize the matching physical store before starting workers against a fresh database:
 
 ```powershell
 docker compose run --rm --entrypoint /usr/local/bin/platform worker migrate
+docker compose run --rm --entrypoint /usr/local/bin/platform worker artifact-store init
 ```
 
 There are two worker scaling knobs:

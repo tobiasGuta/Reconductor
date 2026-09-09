@@ -309,6 +309,7 @@ func TestProbeHTTPMalformedV4PreservesConcurrentInsertConflictPrecedence(t *test
 			queryPattern: `%INSERT INTO artifacts(id,task_id,%`,
 			apply: func(sharedID domain.ID, candidate *providerResultCollisionCandidate) {
 				candidate.artifacts[0].ID = sharedID
+				candidate.artifacts[0] = withTestArtifactAddress(candidate.artifacts[0])
 				candidate.result.ArtifactIDs[0] = sharedID
 				candidate.tool.StdoutArtifactID = &candidate.artifacts[0].ID
 			},
@@ -790,7 +791,7 @@ func TestProbeHTTPSourceArtifactLineageAndReferencedIdentityGuards(t *testing.T)
 		}
 	})
 
-	t.Run("referenced identity is immutable while lifecycle and retention remain available", func(t *testing.T) {
+	t.Run("referenced identity is immutable while expiry metadata remains available", func(t *testing.T) {
 		fixture := newScheduledResultFixture(t, "concrete-http-source-identity-guards", "probe.http")
 		action := scheduledProviderAction(fixture, 1)
 		admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, nil, "fixture-provider")
@@ -863,48 +864,15 @@ func TestProbeHTTPSourceArtifactLineageAndReferencedIdentityGuards(t *testing.T)
 				t.Fatalf("allowed lifecycle update failed: %v", err)
 			}
 		}
-		if err := fixture.env.store.DeleteArtifact(fixture.env.ctx, artifacts[0].ID); err != nil {
-			t.Fatalf("retention delete: %v", err)
+		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `DELETE FROM artifacts WHERE id=$1`, artifacts[0].ID); err == nil || !strings.Contains(err.Error(), "metadata deletion is prohibited") {
+			t.Fatalf("artifact delete error=%v", err)
 		}
 		var artifactCount, sourceCount int
 		if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT (SELECT count(*) FROM artifacts WHERE id=$1),(SELECT count(*) FROM probe_http_source_records WHERE normalized_result_artifact_id=$1)`, artifacts[0].ID).Scan(&artifactCount, &sourceCount); err != nil {
 			t.Fatal(err)
 		}
-		if artifactCount != 0 || sourceCount != 1 {
-			t.Fatalf("retention artifact=%d source_occurrences=%d", artifactCount, sourceCount)
-		}
-		reinsertArtifact := func(artifact domain.Artifact) error {
-			_, insertErr := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO artifacts(
-				id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive
-			) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, artifact.ID, artifact.TaskID, artifact.WorkflowRunID, artifact.StepRunID, artifact.ToolRunID, artifact.Type, artifact.ContentType, artifact.Size, artifact.SHA256, artifact.StorageLocation, artifact.CreatedAt, artifact.ExpiresAt, artifact.RedactionState, artifact.Sensitive)
-			return insertErr
-		}
-		for _, test := range []struct {
-			name   string
-			mutate func(*domain.Artifact)
-		}{
-			{name: "Task", mutate: func(artifact *domain.Artifact) { artifact.TaskID = other.lineage.task.ID }},
-			{name: "WorkflowRun", mutate: func(artifact *domain.Artifact) { artifact.WorkflowRunID = other.lineage.runID }},
-			{name: "StepRun", mutate: func(artifact *domain.Artifact) { artifact.StepRunID = other.stepID }},
-			{name: "ToolRun", mutate: func(artifact *domain.Artifact) { artifact.ToolRunID = otherToolID }},
-			{name: "type", mutate: func(artifact *domain.Artifact) { artifact.Type = "raw-provider-output" }},
-		} {
-			t.Run("same UUID wrong "+test.name, func(t *testing.T) {
-				candidate := artifacts[0]
-				test.mutate(&candidate)
-				if err := reinsertArtifact(candidate); err == nil || !strings.Contains(err.Error(), "cannot be rebound") {
-					t.Fatalf("same-UUID %s reinsert error=%v", test.name, err)
-				}
-			})
-		}
-		if err := reinsertArtifact(artifacts[0]); err != nil {
-			t.Fatalf("same-lineage artifact reinsert: %v", err)
-		}
-		if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT (SELECT count(*) FROM artifacts WHERE id=$1),(SELECT count(*) FROM probe_http_source_records WHERE normalized_result_artifact_id=$1)`, artifacts[0].ID).Scan(&artifactCount, &sourceCount); err != nil {
-			t.Fatal(err)
-		}
 		if artifactCount != 1 || sourceCount != 1 {
-			t.Fatalf("same-lineage reinsert artifact=%d source_occurrences=%d", artifactCount, sourceCount)
+			t.Fatalf("retained artifact=%d source_occurrences=%d", artifactCount, sourceCount)
 		}
 	})
 }
@@ -1102,9 +1070,10 @@ func directOtherProgramResource(t *testing.T, lineage directProbeHTTPSourceLinea
 func insertDirectSourceArtifact(t *testing.T, lineage directProbeHTTPSourceLineage, taskID, workflowRunID, stepRunID, toolRunID domain.ID, artifactType string) domain.ID {
 	t.Helper()
 	artifactID := domain.NewID()
+	address := withTestArtifactAddress(domain.Artifact{ID: artifactID})
 	if _, err := lineage.fixture.env.store.Pool.Exec(lineage.fixture.env.ctx, `INSERT INTO artifacts(
-		id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,redaction_state
-	) VALUES($1,$2,$3,$4,$5,$6,'application/json',2,$7,$8,'redacted')`, artifactID, taskID, workflowRunID, stepRunID, toolRunID, artifactType, strings.Repeat("a", 64), "synthetic://"+string(artifactID)); err != nil {
+		id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,addressing_version,artifact_store_id,storage_key,redaction_state
+	) VALUES($1,$2,$3,$4,$5,$6,'application/json',2,$7,$8,$9,$10,'redacted')`, artifactID, taskID, workflowRunID, stepRunID, toolRunID, artifactType, strings.Repeat("a", 64), address.AddressingVersion, address.ArtifactStoreID, address.StorageKey); err != nil {
 		t.Fatal(err)
 	}
 	return artifactID

@@ -9,6 +9,7 @@ import (
 	"sort"
 
 	"github.com/jackc/pgx/v5"
+	artifactstorage "github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/canonicaljson"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
@@ -117,6 +118,15 @@ func lockAndValidateResultArtifacts(ctx context.Context, tx pgx.Tx, lineage lock
 	for _, artifact := range artifacts {
 		if artifact.ID == "" {
 			return resultConflict(lineage.scheduled, resultFenceArtifactIdentityInvalid, "artifact identity is missing")
+		}
+		if artifact.AddressingVersion != 1 || artifact.ArtifactStoreID == nil || artifact.StorageKey == nil || artifact.StorageLocation != nil {
+			return resultConflict(lineage.scheduled, resultFenceArtifactIdentityInvalid, "artifact addressing is not complete modern version 1")
+		}
+		if _, err := domain.ParseID(string(*artifact.ArtifactStoreID)); err != nil {
+			return resultConflict(lineage.scheduled, resultFenceArtifactIdentityInvalid, "artifact store identity is not canonical")
+		}
+		if err := artifactstorage.ValidateStorageKey(*artifact.StorageKey, artifact.ID); err != nil {
+			return resultConflict(lineage.scheduled, resultFenceArtifactIdentityInvalid, "artifact storage key does not match its identity")
 		}
 		if _, duplicate := seen[artifact.ID]; duplicate {
 			return resultConflict(lineage.scheduled, resultFenceArtifactIdentityInvalid, "artifact identity is duplicated")

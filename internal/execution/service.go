@@ -29,7 +29,7 @@ type ResultStore interface {
 	PreviousObservationValues(context.Context, domain.ID, domain.ID, string) ([]string, error)
 	LoadEffectiveStepInput(context.Context, domain.ID, domain.ActionRequest) (json.RawMessage, bool, error)
 	PersistEffectiveStepInput(context.Context, domain.ID, domain.ActionRequest, json.RawMessage) (json.RawMessage, error)
-	PersistResult(context.Context, domain.ID, domain.StepRun, *domain.ToolRun, []domain.Artifact, domain.ActionResult, *capability.ResultAdmissionProvenance) error
+	PersistResultWithArtifactPublication(context.Context, domain.ID, domain.StepRun, *domain.ToolRun, *domain.ActionResult, *capability.ResultAdmissionProvenance, func(context.Context) ([]domain.Artifact, error)) error
 }
 
 func (s Service) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
@@ -147,7 +147,6 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 		attemptID := *result.ProviderAttemptID
 		tool.ProviderAttemptID = &attemptID
 	}
-	var artifacts []domain.Artifact
 	var persistenceErr error
 	persistCtx := ctx
 	persistCancel := func() {}
@@ -155,45 +154,6 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 		persistCtx, persistCancel = context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	}
 	defer persistCancel()
-	for _, raw := range []struct {
-		name, contentType string
-		data              []byte
-	}{{"stdout.jsonl", "application/x-ndjson", result.RawStdout}, {"stderr.txt", "text/plain", result.RawStderr}} {
-		if len(raw.data) == 0 {
-			continue
-		}
-		if s.Artifacts == nil {
-			persistenceErr = errors.Join(persistenceErr, fmt.Errorf("persist %s: artifact storage is required", raw.name))
-			continue
-		}
-		a, putErr := s.Artifacts.Put(persistCtx, artifact.PutRequest{ProgramID: s.ProgramID, TaskID: req.Action.TaskID, WorkflowRunID: req.Action.WorkflowRunID, StepRunID: req.Action.StepRunID, ToolRunID: tool.ID, Type: "raw-provider-output", ContentType: raw.contentType, Name: raw.name, Retention: req.Policy.ArtifactRetention, Data: raw.data})
-		if putErr != nil {
-			persistenceErr = errors.Join(persistenceErr, fmt.Errorf("persist %s: %w", raw.name, putErr))
-			continue
-		}
-		artifacts = append(artifacts, a)
-		tool.ArtifactIDs = append(tool.ArtifactIDs, a.ID)
-		if raw.name == "stdout.jsonl" {
-			tool.StdoutArtifactID = &a.ID
-		}
-		if raw.name == "stderr.txt" {
-			tool.StderrArtifactID = &a.ID
-		}
-	}
-	if len(result.Action.Output) > 0 {
-		if s.Artifacts == nil {
-			persistenceErr = errors.Join(persistenceErr, fmt.Errorf("persist result.json: artifact storage is required"))
-		} else {
-			a, putErr := s.Artifacts.Put(persistCtx, artifact.PutRequest{ProgramID: s.ProgramID, TaskID: req.Action.TaskID, WorkflowRunID: req.Action.WorkflowRunID, StepRunID: req.Action.StepRunID, ToolRunID: tool.ID, Type: "normalized-result", ContentType: "application/json", Name: "result.json", Retention: req.Policy.ArtifactRetention, Data: result.Action.Output})
-			if putErr != nil {
-				persistenceErr = errors.Join(persistenceErr, fmt.Errorf("persist result.json: %w", putErr))
-			} else {
-				artifacts = append(artifacts, a)
-				tool.ArtifactIDs = append(tool.ArtifactIDs, a.ID)
-				result.Action.ArtifactIDs = append(result.Action.ArtifactIDs, a.ID)
-			}
-		}
-	}
 	now := time.Now().UTC()
 	step := domain.StepRun{ID: req.Action.StepRunID, WorkflowRunID: req.Action.WorkflowRunID, Capability: req.Action.Capability, Status: domain.StepSucceeded, Output: result.Action.Output, CompletedAt: &now, IdempotencyKey: req.Action.IdempotencyKey}
 	if executionErr != nil {
@@ -209,13 +169,61 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 	}
 	if s.Store == nil {
 		persistenceErr = errors.Join(persistenceErr, fmt.Errorf("result store is required"))
-	} else if err := s.Store.PersistResult(persistCtx, s.ProgramID, step, tool, artifacts, result.Action, result.AdmissionProvenance); err != nil {
-		persistenceErr = errors.Join(persistenceErr, err)
+	} else {
+		var publish func(context.Context) ([]domain.Artifact, error)
+		if !callerCancelled {
+			publish = func(publicationCtx context.Context) ([]domain.Artifact, error) {
+				return s.publishResultArtifacts(publicationCtx, req, tool, &result)
+			}
+		}
+		if err := s.Store.PersistResultWithArtifactPublication(persistCtx, s.ProgramID, step, tool, &result.Action, result.AdmissionProvenance, publish); err != nil {
+			persistenceErr = errors.Join(persistenceErr, err)
+		}
 	}
 	if persistenceErr != nil {
 		return result, errors.Join(executionErr, fmt.Errorf("persist execution result: %w", persistenceErr))
 	}
 	return result, executionErr
+}
+
+func (s Service) publishResultArtifacts(ctx context.Context, req capability.Request, tool *domain.ToolRun, result *capability.Result) ([]domain.Artifact, error) {
+	var artifacts []domain.Artifact
+	for _, raw := range []struct {
+		name, contentType string
+		data              []byte
+	}{{"stdout.jsonl", "application/x-ndjson", result.RawStdout}, {"stderr.txt", "text/plain", result.RawStderr}} {
+		if len(raw.data) == 0 {
+			continue
+		}
+		if s.Artifacts == nil {
+			return nil, fmt.Errorf("persist %s: artifact storage is required", raw.name)
+		}
+		a, err := s.Artifacts.Put(ctx, artifact.PutRequest{ProgramID: s.ProgramID, TaskID: req.Action.TaskID, WorkflowRunID: req.Action.WorkflowRunID, StepRunID: req.Action.StepRunID, ToolRunID: tool.ID, Type: "raw-provider-output", ContentType: raw.contentType, Name: raw.name, Retention: req.Policy.ArtifactRetention, Data: raw.data})
+		if err != nil {
+			return nil, fmt.Errorf("persist %s: %w", raw.name, err)
+		}
+		artifacts = append(artifacts, a)
+		tool.ArtifactIDs = append(tool.ArtifactIDs, a.ID)
+		if raw.name == "stdout.jsonl" {
+			tool.StdoutArtifactID = &a.ID
+		} else {
+			tool.StderrArtifactID = &a.ID
+		}
+	}
+	if len(result.Action.Output) == 0 {
+		return artifacts, nil
+	}
+	if s.Artifacts == nil {
+		return nil, fmt.Errorf("persist result.json: artifact storage is required")
+	}
+	a, err := s.Artifacts.Put(ctx, artifact.PutRequest{ProgramID: s.ProgramID, TaskID: req.Action.TaskID, WorkflowRunID: req.Action.WorkflowRunID, StepRunID: req.Action.StepRunID, ToolRunID: tool.ID, Type: "normalized-result", ContentType: "application/json", Name: "result.json", Retention: req.Policy.ArtifactRetention, Data: result.Action.Output})
+	if err != nil {
+		return nil, fmt.Errorf("persist result.json: %w", err)
+	}
+	artifacts = append(artifacts, a)
+	tool.ArtifactIDs = append(tool.ArtifactIDs, a.ID)
+	result.Action.ArtifactIDs = append(result.Action.ArtifactIDs, a.ID)
+	return artifacts, nil
 }
 
 func historicalRecords(values []string) ([]any, error) {

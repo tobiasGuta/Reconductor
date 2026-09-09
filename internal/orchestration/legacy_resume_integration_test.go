@@ -21,7 +21,6 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/migrations"
 	"github.com/tobiasGuta/Reconductor/internal/providers"
-	"github.com/tobiasGuta/Reconductor/internal/redaction"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 	"github.com/tobiasGuta/Reconductor/internal/workflows"
 )
@@ -114,12 +113,9 @@ func TestFreshPreparationFailureNeverLeavesOrphanRunningTask(t *testing.T) {
 	t.Run("artifact initialization", func(t *testing.T) {
 		store, ctx := fullOrchestrationIntegrationStore(t)
 		programID, cfg := createFreshOrchestrationProgram(t, ctx, store)
-		cfg.ArtifactStorage.Root = t.TempDir()
-		service := Service{Config: cfg, Store: store, Registry: providers.Registry(cfg), ArtifactFactory: func(string, *redaction.Redactor) (*artifact.Local, error) {
-			return nil, errors.New("injected artifact initialization failure")
-		}}
+		service := Service{Config: cfg, Store: store, Registry: providers.Registry(cfg)}
 		_, err := service.Run(ctx, WorkflowRequest{ProgramID: programID, RequestedBy: "integration", AcknowledgeScopeExpansion: true})
-		if err == nil || !strings.Contains(err.Error(), "artifact initialization failure") {
+		if err == nil || !strings.Contains(err.Error(), "artifact storage is required") {
 			t.Fatalf("error=%v", err)
 		}
 		assertNoOrphanRunningTask(t, ctx, store, programID, 1, 0)
@@ -134,7 +130,7 @@ func TestFreshPreparationFailureNeverLeavesOrphanRunningTask(t *testing.T) {
 			t.Fatal(err)
 		}
 		cfg.Scheduler.WorkflowStateRoot = occupied
-		_, err := (Service{Config: cfg, Store: store, Registry: providers.Registry(cfg)}).Run(ctx, WorkflowRequest{ProgramID: programID, RequestedBy: "integration", AcknowledgeScopeExpansion: true})
+		_, err := (Service{Config: cfg, Store: store, Registry: providers.Registry(cfg), Artifacts: orchestrationTestArtifacts{}}).Run(ctx, WorkflowRequest{ProgramID: programID, RequestedBy: "integration", AcknowledgeScopeExpansion: true})
 		if !errors.Is(err, workflow.ErrWorkflowCheckpointUnavailable) {
 			t.Fatalf("error=%v", err)
 		}
@@ -230,7 +226,26 @@ func fullOrchestrationIntegrationStore(t *testing.T) (*database.Store, context.C
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.RegisterArtifactStore(ctx, orchestrationTestStoreRegistration()); err != nil {
+		t.Fatal(err)
+	}
 	return store, ctx
+}
+
+type orchestrationTestArtifacts struct{}
+
+func (orchestrationTestArtifacts) Put(_ context.Context, req artifact.PutRequest) (domain.Artifact, error) {
+	id := domain.NewID()
+	key, err := artifact.StorageKeyFor(id)
+	if err != nil {
+		return domain.Artifact{}, err
+	}
+	storeID := orchestrationTestStoreRegistration().ID
+	return domain.Artifact{ID: id, TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), AddressingVersion: 1, ArtifactStoreID: &storeID, StorageKey: &key, CreatedAt: time.Now().UTC()}, nil
+}
+
+func orchestrationTestStoreRegistration() domain.ArtifactStoreRegistration {
+	return domain.ArtifactStoreRegistration{ID: "00000000-0000-4000-8000-000000009003", IncarnationNonce: "00000000-0000-4000-8000-000000009004", BackendKind: artifact.BackendKind, MarkerFormat: artifact.MarkerFormat, MarkerVersion: artifact.MarkerVersion}
 }
 
 func createRawProgram(t *testing.T, ctx context.Context, store *database.Store, label string) domain.ID {
@@ -373,6 +388,10 @@ func preMaterializationMigrationStore(t *testing.T) (*database.Store, context.Co
 		tx, err := store.Pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7212026)`); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("acquire migration lock: %v", err)
 		}
 		if _, err := tx.Exec(ctx, string(body)); err != nil {
 			_ = tx.Rollback(ctx)

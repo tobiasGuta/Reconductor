@@ -33,6 +33,8 @@ func (failingRunner) Version(context.Context, string, []string) (string, error) 
 
 type capturedStore struct {
 	called         bool
+	persisted      bool
+	publications   int
 	step           domain.StepRun
 	tool           *domain.ToolRun
 	artifacts      []domain.Artifact
@@ -509,10 +511,23 @@ func TestCompareAssetsExecutionDoesNotReplaceInvalidPreviousInput(t *testing.T) 
 	}
 }
 
-func (s *capturedStore) PersistResult(_ context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) error {
-	s.called, s.step, s.tool, s.artifacts, s.result = true, step, tool, append([]domain.Artifact(nil), artifacts...), result
+func (s *capturedStore) PersistResultWithArtifactPublication(ctx context.Context, _ domain.ID, step domain.StepRun, tool *domain.ToolRun, result *domain.ActionResult, admission *capability.ResultAdmissionProvenance, publish func(context.Context) ([]domain.Artifact, error)) error {
+	s.called = true
+	if s.err != nil {
+		return s.err
+	}
+	var artifacts []domain.Artifact
+	if publish != nil {
+		s.publications++
+		var err error
+		artifacts, err = publish(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	s.persisted, s.step, s.tool, s.artifacts, s.result = true, step, tool, append([]domain.Artifact(nil), artifacts...), *result
 	s.admission = admission
-	return s.err
+	return nil
 }
 
 func TestFailedProviderAndPersistenceErrorsAreBothPreserved(t *testing.T) {
@@ -525,19 +540,57 @@ func TestFailedProviderAndPersistenceErrorsAreBothPreserved(t *testing.T) {
 	}
 	persistCause := errors.New("database unavailable")
 	store := &capturedStore{err: persistCause}
+	artifacts := &capturedArtifacts{}
 	input, _ := json.Marshal(commandprovider.Input{Targets: []string{"https://local.example.test/"}})
 	req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "probe.http", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"probe.http"}}, Scope: allowedScope{}}
-	_, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req)
+	_, err := (Service{Registry: registry, Store: store, Artifacts: artifacts, ProgramID: domain.NewID()}).Execute(context.Background(), req)
 	if !errors.Is(err, errFakeExit) || !errors.Is(err, persistCause) {
 		t.Fatalf("execution and persistence causes were not preserved: %v", err)
 	}
+	if len(artifacts.requests) != 0 || store.persisted || store.publications != 0 {
+		t.Fatalf("result-store denial published artifacts: puts=%d persisted=%v publications=%d", len(artifacts.requests), store.persisted, store.publications)
+	}
 }
 
-type capturedArtifacts struct{ requests []artifact.PutRequest }
+func TestArtifactPublicationFailurePreventsResultAcceptance(t *testing.T) {
+	registry := capability.NewRegistry()
+	provider := commandprovider.New(commandprovider.Definition{Name: "probe.http", Provider: "fake-httpx", Executable: "fake-httpx", Version: "1", Risk: policy.Low, BuildArgs: func(i commandprovider.Input, _ policy.Policy) ([]string, error) {
+		return []string{"-u", i.Targets[0]}, nil
+	}}, failingRunner{}, redaction.New())
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	publicationCause := errors.New("artifact device unavailable")
+	store := &capturedStore{}
+	artifacts := &capturedArtifacts{err: publicationCause}
+	input, _ := json.Marshal(commandprovider.Input{Targets: []string{"https://local.example.test/"}})
+	req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "probe.http", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"probe.http"}}, Scope: allowedScope{}}
+	_, err := (Service{Registry: registry, Store: store, Artifacts: artifacts, ProgramID: domain.NewID()}).Execute(context.Background(), req)
+	if !errors.Is(err, errFakeExit) || !errors.Is(err, publicationCause) {
+		t.Fatalf("execution and publication causes were not preserved: %v", err)
+	}
+	if !store.called || store.persisted || store.publications != 1 || len(artifacts.requests) != 1 {
+		t.Fatalf("publication failure was accepted: called=%v persisted=%v publications=%d puts=%d", store.called, store.persisted, store.publications, len(artifacts.requests))
+	}
+}
+
+type capturedArtifacts struct {
+	requests []artifact.PutRequest
+	err      error
+}
 
 func (s *capturedArtifacts) Put(_ context.Context, req artifact.PutRequest) (domain.Artifact, error) {
 	s.requests = append(s.requests, req)
-	return domain.Artifact{ID: domain.NewID(), TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), CreatedAt: time.Now().UTC()}, nil
+	if s.err != nil {
+		return domain.Artifact{}, s.err
+	}
+	id := domain.NewID()
+	key, err := artifact.StorageKeyFor(id)
+	if err != nil {
+		return domain.Artifact{}, err
+	}
+	storeID := domain.ID("00000000-0000-4000-8000-000000009002")
+	return domain.Artifact{ID: id, TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), AddressingVersion: 1, ArtifactStoreID: &storeID, StorageKey: &key, CreatedAt: time.Now().UTC()}, nil
 }
 
 type allowedScope struct{}
@@ -563,7 +616,7 @@ func TestFailedProviderAttemptPersistsToolStepArtifactsAndOriginalError(t *testi
 	if !strings.Contains(err.Error(), "resolver configuration failed") {
 		t.Fatalf("diagnostic missing: %v", err)
 	}
-	if !store.called || store.step.Status != domain.StepFailed || store.step.ErrorClassification == "" {
+	if !store.called || !store.persisted || store.publications != 1 || store.step.Status != domain.StepFailed || store.step.ErrorClassification == "" {
 		t.Fatalf("failed step not persisted: %#v", store.step)
 	}
 	if store.tool == nil || store.tool.ExitCode == nil || *store.tool.ExitCode != 1 || store.tool.StepRunID != stepID {
@@ -602,6 +655,7 @@ type contextErrorCapability struct {
 	err            error
 	waitForContext bool
 	started        chan struct{}
+	rawStdout      []byte
 	calls          int
 }
 
@@ -618,7 +672,7 @@ func (c *contextErrorCapability) Execute(ctx context.Context, _ capability.Reque
 	}
 	if c.waitForContext {
 		<-ctx.Done()
-		return capability.Result{}, ctx.Err()
+		return capability.Result{RawStdout: append([]byte(nil), c.rawStdout...)}, ctx.Err()
 	}
 	return capability.Result{}, c.err
 }
@@ -642,12 +696,13 @@ func executionContextErrorRequest() capability.Request {
 
 func TestOwningContextCancellationPersistsCancelledResult(t *testing.T) {
 	registry := capability.NewRegistry()
-	provider := &contextErrorCapability{waitForContext: true, started: make(chan struct{})}
+	provider := &contextErrorCapability{waitForContext: true, started: make(chan struct{}), rawStdout: []byte("cancelled output must not publish\n")}
 	if err := registry.Register(provider); err != nil {
 		t.Fatal(err)
 	}
 	store := &capturedStore{}
-	service := Service{Registry: registry, Store: store, ProgramID: domain.NewID()}
+	artifacts := &capturedArtifacts{}
+	service := Service{Registry: registry, Store: store, Artifacts: artifacts, ProgramID: domain.NewID()}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	type executionOutcome struct {
@@ -674,6 +729,9 @@ func TestOwningContextCancellationPersistsCancelledResult(t *testing.T) {
 	}
 	if store.terminal.Outcome != capability.ProviderInvocationCancelled || store.admission == nil || store.admission.StepAttempt != 1 || store.admission.ProviderAttemptID != store.startID || store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != store.startID {
 		t.Fatalf("terminal=%#v admission=%#v tool=%#v start=%s", store.terminal, store.admission, store.tool, store.startID)
+	}
+	if len(artifacts.requests) != 0 || store.publications != 0 {
+		t.Fatalf("cancelled execution published artifacts: puts=%d publications=%d", len(artifacts.requests), store.publications)
 	}
 }
 

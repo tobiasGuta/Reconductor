@@ -58,6 +58,7 @@ services:
       NUCLEI_EXCLUDE_TAGS: ${NUCLEI_EXCLUDE_TAGS:-dos,fuzz,bruteforce,intrusive}
       NUCLEI_TEMPLATE_DIR: /opt/nuclei-templates
       ARTIFACT_ROOT: /data/artifacts
+      ARTIFACT_STORE_ID: ${DOCKER_ARTIFACT_STORE_ID:?DOCKER_ARTIFACT_STORE_ID is required for the Docker artifact volume}
     volumes:
       - artifacts:/data/artifacts
     depends_on:

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 )
 
@@ -82,8 +83,9 @@ type Nuclei struct {
 	UpdateTemplates     bool
 }
 type ArtifactStorage struct {
-	Driver string
-	Root   string
+	Driver  string
+	Root    string
+	StoreID string
 }
 type Policy struct {
 	DefaultRateLimit           int
@@ -125,7 +127,7 @@ func loadWith(get Lookup, requireDatabase bool) (Config, error) {
 		Worker:          Worker{ConsumerGroup: value(get, "WORKER_CONSUMER_GROUP", "capability-workers"), ConsumerName: value(get, "WORKER_CONSUMER_NAME", hostname()), PoolSize: integer(get, "WORKER_POOL_SIZE", 4), LeaseTimeout: duration(get, "WORKER_LEASE_TIMEOUT", 2*time.Minute), ReadBlock: duration(get, "WORKER_READ_BLOCK", 5*time.Second), MaxRetries: integer(get, "WORKER_MAX_RETRIES", 3), RetryBase: duration(get, "WORKER_RETRY_BASE", 2*time.Second)},
 		Scheduler:       Scheduler{PollInterval: duration(get, "SCHEDULER_POLL_INTERVAL", 15*time.Second), MaxConcurrentRuns: integer(get, "SCHEDULER_MAX_CONCURRENT_RUNS", 1), LeaseTimeout: duration(get, "SCHEDULER_LEASE_TIMEOUT", 2*time.Minute), WorkflowStateRoot: value(get, "WORKFLOW_STATE_ROOT", "state/runs")},
 		Nuclei:          Nuclei{RateLimit: integer(get, "NUCLEI_RATE_LIMIT", 50), HostConcurrency: integer(get, "NUCLEI_HOST_CONCURRENCY", 10), TemplateConcurrency: integer(get, "NUCLEI_TEMPLATE_CONCURRENCY", 10), HeadlessConcurrency: integer(get, "NUCLEI_HEADLESS_CONCURRENCY", 2), Timeout: duration(get, "NUCLEI_TIMEOUT", 10*time.Minute), Severity: csv(get, "NUCLEI_SEVERITY", "low,medium,high,critical"), IncludeTags: csv(get, "NUCLEI_INCLUDE_TAGS", "cve,exposure,misconfig"), ExcludeTags: csv(get, "NUCLEI_EXCLUDE_TAGS", "dos,fuzz,bruteforce,intrusive"), TemplateDirectory: get("NUCLEI_TEMPLATE_DIR"), UpdateTemplates: boolean(get, "NUCLEI_UPDATE_TEMPLATES", false)},
-		ArtifactStorage: ArtifactStorage{Driver: value(get, "ARTIFACT_DRIVER", "local"), Root: value(get, "ARTIFACT_ROOT", "artifacts")},
+		ArtifactStorage: ArtifactStorage{Driver: value(get, "ARTIFACT_DRIVER", "local"), Root: value(get, "ARTIFACT_ROOT", "artifacts"), StoreID: strings.TrimSpace(get("ARTIFACT_STORE_ID"))},
 		Policy:          Policy{DefaultRateLimit: integer(get, "POLICY_RATE_LIMIT", 50), DefaultConcurrency: integer(get, "POLICY_CONCURRENCY", 10), DefaultProviderConcurrency: integer(get, "POLICY_PROVIDER_CONCURRENCY", 2), DefaultHostConcurrency: integer(get, "POLICY_HOST_CONCURRENCY", 1), MaxPayloadBytes: int64(integer(get, "POLICY_MAX_PAYLOAD_BYTES", 1048576)), AllowedMethods: csv(get, "POLICY_ALLOWED_METHODS", "GET,HEAD,OPTIONS"), FollowRedirects: boolean(get, "POLICY_FOLLOW_REDIRECTS", false), ScanWindows: csv(get, "POLICY_SCAN_WINDOWS", ""), AuthenticationUsage: boolean(get, "POLICY_AUTHENTICATION_USAGE", false), DirectoryFuzzing: boolean(get, "POLICY_DIRECTORY_FUZZING", false), CrossOrigin: boolean(get, "POLICY_CROSS_ORIGIN", false), IntrusiveChecks: boolean(get, "POLICY_INTRUSIVE_CHECKS", false), ArtifactRetention: duration(get, "POLICY_ARTIFACT_RETENTION", 720*time.Hour)},
 		Logging:         Logging{Level: value(get, "LOG_LEVEL", "info"), SecretNames: csv(get, "REDACT_SECRET_NAMES", "")},
 	}
@@ -145,6 +147,17 @@ func loadWith(get Lookup, requireDatabase bool) (Config, error) {
 		}
 	}
 	return c, errors.Join(append(parseErrs, c.validate(requireDatabase))...)
+}
+
+func (a ArtifactStorage) RequiredStoreID() (domain.ID, error) {
+	if strings.TrimSpace(a.StoreID) == "" {
+		return "", errors.New("ARTIFACT_STORE_ID is required for artifact-producing execution")
+	}
+	id, err := domain.ParseID(a.StoreID)
+	if err != nil {
+		return "", errors.New("ARTIFACT_STORE_ID must be a canonical lowercase UUID")
+	}
+	return id, nil
 }
 
 func (c Config) Validate() error { return c.validate(true) }
