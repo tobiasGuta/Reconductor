@@ -389,6 +389,10 @@ func preMaterializationMigrationStore(t *testing.T) (*database.Store, context.Co
 		if err != nil {
 			t.Fatal(err)
 		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7212026)`); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("acquire migration lock: %v", err)
+		}
 		if _, err := tx.Exec(ctx, string(body)); err != nil {
 			_ = tx.Rollback(ctx)
 			t.Fatalf("apply migration %s: %v", name, err)
