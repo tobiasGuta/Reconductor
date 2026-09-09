@@ -31,8 +31,6 @@ type Service struct {
 	Logger                  *slog.Logger
 	Budget                  budget.Limiter
 	PolicyAuditor           capability.PolicyDecisionRecorder
-	Retention               artifact.RetentionStore
-	RetentionEvery          time.Duration
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -42,11 +40,8 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.Logger == nil {
 		s.Logger = slog.Default()
 	}
-	if s.RetentionEvery <= 0 {
-		s.RetentionEvery = time.Minute
-	}
-	if err := s.purgeExpired(ctx); err != nil {
-		return err
+	if s.Artifacts == nil {
+		return fmt.Errorf("artifact storage is required")
 	}
 	if err := s.Queue.EnsureGroup(ctx); err != nil {
 		return err
@@ -66,9 +61,7 @@ func (s *Service) Run(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		retryTicker := time.NewTicker(time.Second)
-		retentionTicker := time.NewTicker(s.RetentionEvery)
 		defer retryTicker.Stop()
-		defer retentionTicker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
@@ -76,10 +69,6 @@ func (s *Service) Run(ctx context.Context) error {
 			case <-retryTicker.C:
 				if _, err := s.Queue.PumpRetries(ctx, 100); err != nil {
 					s.Logger.Error("retry pump failed", "error", err)
-				}
-			case <-retentionTicker.C:
-				if err := s.purgeExpired(ctx); err != nil {
-					s.Logger.Error("artifact retention purge failed", "error", err)
 				}
 			}
 		}
@@ -208,16 +197,4 @@ func (s *Service) executeJob(ctx context.Context, d queue.Delivery, provider str
 		queueJobID = &id
 	}
 	return (execution.Service{Registry: s.Registry, Store: s.Results, Artifacts: s.Artifacts, ProgramID: d.Job.ProgramID, PolicyAuditor: auditor}).Execute(ctx, capability.Request{Action: d.Job.Action, Provider: provider, Approved: d.Job.Approved, Policy: d.Job.Policy, Scope: sc, QueueJobID: queueJobID})
-}
-
-func (s *Service) purgeExpired(ctx context.Context) error {
-	if s.Retention == nil {
-		return nil
-	}
-	deleter, ok := s.Artifacts.(artifact.Deleter)
-	if !ok {
-		return fmt.Errorf("artifact storage does not support retention deletion")
-	}
-	_, err := artifact.PurgeExpired(ctx, s.Retention, deleter, 1000)
-	return err
 }

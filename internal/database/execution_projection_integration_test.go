@@ -349,7 +349,8 @@ func TestExecutionProjectionIntegration(t *testing.T) {
 		if _, err := writeTx.Exec(ctx, `INSERT INTO approvals(id,request_id,task_id,action_request_id,requested_risk_level,reason,requested_at,decision) VALUES($1,$2,$3,$4,'moderate','snapshot child',$5,'pending')`, approvalID, fixture.steps["active"], fixture.task.ID, domain.NewID(), completedAt); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := writeTx.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,'normalized-result','application/json',2,'snapshot-sha','snapshot://hidden',$6,$7,'redacted',false)`, artifactID, fixture.task.ID, fixture.runID, fixture.steps["active"], toolID, completedAt, completedAt.Add(time.Hour)); err != nil {
+		address := withTestArtifactAddress(domain.Artifact{ID: artifactID})
+		if _, err := writeTx.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,addressing_version,artifact_store_id,storage_key,created_at,expires_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,'normalized-result','application/json',2,'snapshot-sha',$6,$7,$8,$9,$10,'redacted',false)`, artifactID, fixture.task.ID, fixture.runID, fixture.steps["active"], toolID, address.AddressingVersion, address.ArtifactStoreID, address.StorageKey, completedAt, completedAt.Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := writeTx.Exec(ctx, `INSERT INTO assets(id,program_id,type,canonical_value,created_at,updated_at) VALUES($1,$2,'url','https://snapshot-candidate.example.test/',$3,$3)`, assetID, env.programID, completedAt); err != nil {
@@ -553,15 +554,15 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 		insertProjectionTool(t, env, toolID, fixture.steps["artifact"], "test.artifact", now.Add(-time.Second), &completed, &exitCode, `{"secret":"artifact-tool-arguments-sentinel"}`, `{"secret":"artifact-tool-environment-sentinel"}`)
 		visibleID := insertProjectionArtifact(t, env, projectionArtifactSpec{
 			TaskID: fixture.task.ID, WorkflowRunID: fixture.runID, StepRunID: fixture.steps["artifact"], ToolRunID: toolID,
-			Type: "normalized-result", StorageLocation: "artifact://visible-storage-sentinel", ExpiresAt: timePointer(now.Add(time.Hour)),
+			Type: "normalized-result", ExpiresAt: timePointer(now.Add(time.Hour)),
 		})
 		insertProjectionArtifact(t, env, projectionArtifactSpec{
 			TaskID: fixture.task.ID, WorkflowRunID: fixture.runID, StepRunID: fixture.steps["artifact"], ToolRunID: toolID,
-			Type: "sensitive-type-sentinel", StorageLocation: "artifact://sensitive-storage-sentinel", Sensitive: true, ExpiresAt: timePointer(now.Add(time.Hour)),
+			Type: "sensitive-type-sentinel", Sensitive: true, ExpiresAt: timePointer(now.Add(time.Hour)),
 		})
 		insertProjectionArtifact(t, env, projectionArtifactSpec{
 			TaskID: fixture.task.ID, WorkflowRunID: fixture.runID, StepRunID: fixture.steps["artifact"], ToolRunID: toolID,
-			Type: "expired-type-sentinel", StorageLocation: "artifact://expired-storage-sentinel", ExpiresAt: timePointer(now.Add(-time.Hour)),
+			Type: "expired-type-sentinel", ExpiresAt: timePointer(now.Add(-time.Hour)),
 		})
 
 		other := createRecoveryFixture(t, env, "projection-artifact-other", &running, domain.TaskRunning, []recoveryStepSpec{{name: "other", status: domain.StepRunning, started: true, attemptCount: 1}})
@@ -569,7 +570,7 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 		insertProjectionTool(t, env, otherToolID, other.steps["other"], "test.other", now, &completed, &exitCode, `{}`, `{}`)
 		contradictoryID := insertProjectionArtifact(t, env, projectionArtifactSpec{
 			TaskID: other.task.ID, WorkflowRunID: fixture.runID, StepRunID: other.steps["other"], ToolRunID: otherToolID,
-			Type: "contradictory", StorageLocation: "artifact://contradictory-storage-sentinel", ExpiresAt: timePointer(now.Add(time.Hour)),
+			Type: "contradictory", ExpiresAt: timePointer(now.Add(time.Hour)),
 		})
 
 		projection, err := env.store.GetExecutionProjection(env.ctx, fixture.execution.ID)
@@ -593,10 +594,12 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		visibleAddress := withTestArtifactAddress(domain.Artifact{ID: visibleID})
+		contradictoryAddress := withTestArtifactAddress(domain.Artifact{ID: contradictoryID})
 		for _, secret := range []string{
 			"artifact-tool-arguments-sentinel", "artifact-tool-environment-sentinel",
-			"visible-storage-sentinel", "sensitive-type-sentinel", "sensitive-storage-sentinel",
-			"expired-type-sentinel", "expired-storage-sentinel", "contradictory-storage-sentinel",
+			*visibleAddress.StorageKey, *contradictoryAddress.StorageKey,
+			"sensitive-type-sentinel", "expired-type-sentinel",
 		} {
 			if strings.Contains(string(encoded), secret) {
 				t.Fatalf("projection leaked %q: %s", secret, encoded)
@@ -615,7 +618,7 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 			}
 			artifactID := insertProjectionArtifact(t, env, projectionArtifactSpec{
 				TaskID: taskID, WorkflowRunID: limited.runID, StepRunID: stepRunID, ToolRunID: toolRunID,
-				Type: "normalized-result", StorageLocation: fmt.Sprintf("artifact://limit/%d", index), CreatedAt: &created, ExpiresAt: timePointer(now.Add(time.Hour)),
+				Type: "normalized-result", CreatedAt: &created, ExpiresAt: timePointer(now.Add(time.Hour)),
 			})
 			if index == executionProjectionArtifactLimit {
 				contradictoryAfterLimitID = artifactID
@@ -1317,15 +1320,14 @@ func insertProjectionApproval(t *testing.T, env recoveryTestEnvironment, stepID,
 }
 
 type projectionArtifactSpec struct {
-	TaskID          domain.ID
-	WorkflowRunID   domain.ID
-	StepRunID       domain.ID
-	ToolRunID       domain.ID
-	Type            string
-	StorageLocation string
-	CreatedAt       *time.Time
-	ExpiresAt       *time.Time
-	Sensitive       bool
+	TaskID        domain.ID
+	WorkflowRunID domain.ID
+	StepRunID     domain.ID
+	ToolRunID     domain.ID
+	Type          string
+	CreatedAt     *time.Time
+	ExpiresAt     *time.Time
+	Sensitive     bool
 }
 
 func insertProjectionArtifact(t *testing.T, env recoveryTestEnvironment, spec projectionArtifactSpec) domain.ID {
@@ -1335,16 +1337,13 @@ func insertProjectionArtifact(t *testing.T, env recoveryTestEnvironment, spec pr
 	if artifactType == "" {
 		artifactType = "normalized-result"
 	}
-	storageLocation := spec.StorageLocation
-	if storageLocation == "" {
-		storageLocation = "artifact://projection-fixture/" + string(id)
-	}
+	address := withTestArtifactAddress(domain.Artifact{ID: id})
 	createdAt := time.Now().UTC()
 	if spec.CreatedAt != nil {
 		createdAt = *spec.CreatedAt
 	}
-	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive)
-		VALUES($1,$2,$3,$4,$5,$6,'application/json',2,$7,$8,$9,$10,$11,$12)`, id, spec.TaskID, spec.WorkflowRunID, spec.StepRunID, spec.ToolRunID, artifactType, "sha-"+string(id), storageLocation, createdAt, spec.ExpiresAt, map[bool]string{true: "sensitive-separated", false: "redacted"}[spec.Sensitive], spec.Sensitive); err != nil {
+	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,addressing_version,artifact_store_id,storage_key,created_at,expires_at,redaction_state,sensitive)
+		VALUES($1,$2,$3,$4,$5,$6,'application/json',2,$7,$8,$9,$10,$11,$12,$13,$14)`, id, spec.TaskID, spec.WorkflowRunID, spec.StepRunID, spec.ToolRunID, artifactType, "sha-"+string(id), address.AddressingVersion, address.ArtifactStoreID, address.StorageKey, createdAt, spec.ExpiresAt, map[bool]string{true: "sensitive-unredacted", false: "redacted"}[spec.Sensitive], spec.Sensitive); err != nil {
 		t.Fatal(err)
 	}
 	return id

@@ -3,6 +3,7 @@ package migrations
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -20,6 +21,12 @@ type DB interface {
 	Begin(context.Context) (pgx.Tx, error)
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }
+
+type SchemaDB interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+var ErrSchemaNotCurrent = errors.New("database schema is not current")
 
 func Up(ctx context.Context, db DB) error {
 	if _, err := db.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
@@ -77,6 +84,45 @@ func Up(ctx context.Context, db DB) error {
 		}
 	}
 	return nil
+}
+
+// RequireCurrent verifies the newest embedded migration without changing the
+// database. Runtime commands use this fail-closed check; only the explicit
+// administrative migration command may call Up.
+func RequireCurrent(ctx context.Context, db SchemaDB) error {
+	version, name, err := requiredMigration()
+	if err != nil {
+		return err
+	}
+	var appliedVersion int64
+	var appliedName string
+	if err := db.QueryRow(ctx, `SELECT version,name FROM schema_migrations ORDER BY version DESC LIMIT 1`).Scan(&appliedVersion, &appliedName); err != nil {
+		return fmt.Errorf("%w: required migration %d (%s) is not the current schema frontier: %v; run platform migrate as a coordinated administrative action", ErrSchemaNotCurrent, version, name, err)
+	}
+	if appliedVersion != version || appliedName != name {
+		return fmt.Errorf("%w: schema frontier is %d (%s), want %d (%s)", ErrSchemaNotCurrent, appliedVersion, appliedName, version, name)
+	}
+	return nil
+}
+
+func requiredMigration() (int64, string, error) {
+	versions, err := Versions()
+	if err != nil {
+		return 0, "", err
+	}
+	if len(versions) == 0 {
+		return 0, "", fmt.Errorf("no embedded migrations")
+	}
+	name := versions[len(versions)-1]
+	prefix, _, ok := strings.Cut(name, "_")
+	if !ok {
+		return 0, "", fmt.Errorf("migration %s has no numeric prefix", name)
+	}
+	version, err := strconv.ParseInt(prefix, 10, 64)
+	if err != nil {
+		return 0, "", fmt.Errorf("migration %s: %w", name, err)
+	}
+	return version, name, nil
 }
 
 func Versions() ([]string, error) {

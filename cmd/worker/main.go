@@ -35,6 +35,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	storeID, err := cfg.ArtifactStorage.RequiredStoreID()
+	if err != nil {
+		return err
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	providerChecks := doctor.CheckProviderEnvironment(ctx, cfg, nil)
@@ -49,7 +53,7 @@ func run() error {
 		return err
 	}
 	defer store.Close()
-	if err := store.Migrate(ctx); err != nil {
+	if err := store.RequireCurrentSchema(ctx); err != nil {
 		return err
 	}
 	opts := &redis.Options{Addr: cfg.Redis.Address, Username: cfg.Redis.Username, Password: cfg.Redis.Password, DB: cfg.Redis.DB, DialTimeout: 5 * time.Second, ReadTimeout: cfg.Worker.ReadBlock + time.Second, WriteTimeout: 5 * time.Second}
@@ -61,13 +65,13 @@ func run() error {
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		return err
 	}
-	artifacts, err := artifact.NewLocal(cfg.ArtifactStorage.Root, redaction.New(cfg.Logging.SecretNames...))
+	artifacts, err := artifact.OpenLocal(ctx, cfg.ArtifactStorage.Root, storeID, store, redaction.New(cfg.Logging.SecretNames...))
 	if err != nil {
 		return err
 	}
 	workerPolicy := policy.Policy{RateLimit: cfg.Policy.DefaultRateLimit, Concurrency: cfg.Policy.DefaultConcurrency}
 	limiter := budget.NewLocal(budget.Limits{Program: policy.ProgramParallelism(workerPolicy), Provider: cfg.Policy.DefaultProviderConcurrency, Host: cfg.Policy.DefaultHostConcurrency})
-	service := worker.Service{Queue: queue.New(rdb, cfg.Worker.ConsumerGroup, cfg.Worker.ConsumerName, cfg.Worker.MaxRetries, cfg.Worker.RetryBase), Registry: providers.Registry(cfg), Artifacts: artifacts, Results: store, PoolSize: cfg.Worker.PoolSize, ReadBlock: cfg.Worker.ReadBlock, LeaseTimeout: cfg.Worker.LeaseTimeout, Logger: slog.Default(), Budget: limiter, PolicyAuditor: store, Retention: store}
+	service := worker.Service{Queue: queue.New(rdb, cfg.Worker.ConsumerGroup, cfg.Worker.ConsumerName, cfg.Worker.MaxRetries, cfg.Worker.RetryBase), Registry: providers.Registry(cfg), Artifacts: artifacts, Results: store, PoolSize: cfg.Worker.PoolSize, ReadBlock: cfg.Worker.ReadBlock, LeaseTimeout: cfg.Worker.LeaseTimeout, Logger: slog.Default(), Budget: limiter, PolicyAuditor: store}
 	slog.Info("worker started", "config", cfg.String())
 	return service.Run(ctx)
 }

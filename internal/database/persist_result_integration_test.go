@@ -137,7 +137,14 @@ func (c *postgresWorkflowRetryCapability) Execute(ctx context.Context, req capab
 type postgresWorkflowRetryArtifacts struct{}
 
 func (postgresWorkflowRetryArtifacts) Put(_ context.Context, req artifact.PutRequest) (domain.Artifact, error) {
-	return domain.Artifact{ID: domain.NewID(), TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), SHA256: strings.Repeat("a", 64), StorageLocation: "synthetic://" + req.Name, CreatedAt: time.Now().UTC(), RedactionState: "redacted"}, nil
+	item := domain.Artifact{ID: domain.NewID(), TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), SHA256: strings.Repeat("a", 64), CreatedAt: time.Now().UTC(), RedactionState: "redacted"}
+	key, err := artifact.StorageKeyFor(item.ID)
+	if err != nil {
+		return domain.Artifact{}, err
+	}
+	storeID := testArtifactStoreID
+	item.AddressingVersion, item.ArtifactStoreID, item.StorageKey = 1, &storeID, &key
+	return item, nil
 }
 
 type postgresClassifyResumeCapability struct {
@@ -726,6 +733,7 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	ensureTestArtifactStore(t, ctx, store)
 
 	now := time.Now().UTC()
 	programID, definitionID, taskID := domain.NewID(), domain.NewID(), domain.NewID()
@@ -867,7 +875,7 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	completed := now.Add(time.Second)
 	tool := &domain.ToolRun{ID: toolID, StepRunID: stepID, Capability: "resolve.dns", Provider: "dnsx", ToolVersion: "test", SanitizedArguments: json.RawMessage(`{"stdin_bytes":19}`), ExecutionEnvironment: json.RawMessage(`{"kind":"local-process","shell":false}`), StartedAt: now, CompletedAt: &completed, ExitCode: &exitCode, StderrArtifactID: &artifactID, ProviderAttemptID: &providerAttemptID}
 	expires := now.Add(-time.Minute)
-	artifact := domain.Artifact{ID: artifactID, TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, ToolRunID: toolID, Type: "raw-provider-output", ContentType: "text/plain", Size: 24, SHA256: strings.Repeat("a", 64), StorageLocation: "synthetic://stderr.txt", CreatedAt: completed, ExpiresAt: &expires, RedactionState: "redacted"}
+	artifact := withTestArtifactAddress(domain.Artifact{ID: artifactID, TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, ToolRunID: toolID, Type: "raw-provider-output", ContentType: "text/plain", Size: 24, SHA256: strings.Repeat("a", 64), CreatedAt: completed, ExpiresAt: &expires, RedactionState: "redacted"})
 	step := domain.StepRun{ID: stepID, WorkflowRunID: runID, Capability: "resolve.dns", Status: domain.StepFailed, Output: json.RawMessage(`{"lines":[],"authorized":[],"filtered":[]}`), ErrorClassification: "provider_error", ErrorDetails: "exit status 1: fake DNS failure", CompletedAt: &completed, IdempotencyKey: state.Steps["dns"].Run.IdempotencyKey}
 	action := domain.ActionResult{RequestID: actionRequest.ID, Status: "failed", Summary: "dnsx execution failed", Output: step.Output, Error: &domain.StructuredError{Classification: "provider_error", Message: step.ErrorDetails}}
 	admission := &capability.ResultAdmissionProvenance{ProviderAttemptID: providerAttemptID, ActionRequestID: actionRequest.ID, StepAttempt: actionRequest.StepAttempt, ExecutionAuthorizationEventID: authorizationID, Provider: "dnsx"}
@@ -1007,12 +1015,8 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 		t.Fatalf("terminal event was fabricated after audit failure: count=%d", missingTerminal)
 	}
 
-	expired, err := store.ExpiredArtifacts(ctx, 10)
-	if err != nil || len(expired) != 1 || expired[0].ID != artifactID {
-		t.Fatalf("expired=%#v err=%v", expired, err)
-	}
-	if err := store.DeleteArtifact(ctx, artifactID); err != nil {
-		t.Fatal(err)
+	if _, err := store.Pool.Exec(ctx, `DELETE FROM artifacts WHERE id=$1`, artifactID); err == nil || !strings.Contains(err.Error(), "metadata deletion is prohibited") {
+		t.Fatalf("artifact delete error=%v", err)
 	}
 	var artifactRows, expiryEvents int
 	if err := store.Pool.QueryRow(ctx, `SELECT count(*) FROM artifacts WHERE id=$1`, artifactID).Scan(&artifactRows); err != nil {
@@ -1021,7 +1025,7 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	if err := store.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE step_run_id=$1 AND event_type='artifact_expired'`, stepID).Scan(&expiryEvents); err != nil {
 		t.Fatal(err)
 	}
-	if artifactRows != 0 || expiryEvents != 1 {
+	if artifactRows != 1 || expiryEvents != 0 {
 		t.Fatalf("artifact rows=%d expiry audits=%d", artifactRows, expiryEvents)
 	}
 

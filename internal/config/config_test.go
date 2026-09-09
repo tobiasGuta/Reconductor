@@ -40,3 +40,43 @@ func TestConfigValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestArtifactStoreIDIsCommandScopedAndDockerVariableIsIgnored(t *testing.T) {
+	env := map[string]string{
+		"DATABASE_URL":             "postgres://integration",
+		"REDIS_ADDR":               "localhost:6379",
+		"DOCKER_ARTIFACT_STORE_ID": "00000000-0000-4000-8000-000000000099",
+	}
+	cfg, err := LoadWith(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ArtifactStorage.StoreID != "" {
+		t.Fatalf("Docker-only store ID entered Go configuration: %q", cfg.ArtifactStorage.StoreID)
+	}
+	if _, err := cfg.ArtifactStorage.RequiredStoreID(); err == nil {
+		t.Fatal("artifact-producing execution accepted a missing native StoreID")
+	}
+	env["ARTIFACT_STORE_ID"] = "00000000-0000-4000-8000-000000000001"
+	cfg, err = LoadWith(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, err := cfg.ArtifactStorage.RequiredStoreID(); err != nil || id != "00000000-0000-4000-8000-000000000001" {
+		t.Fatalf("StoreID=%q error=%v", id, err)
+	}
+	env["ARTIFACT_STORE_ID"] = "00000000-0000-4000-8000-000000000001 "
+	if cfg, err = LoadWith(func(key string) string { return env[key] }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.ArtifactStorage.RequiredStoreID(); err != nil {
+		t.Fatalf("trimmed configured StoreID rejected: %v", err)
+	}
+	env["ARTIFACT_STORE_ID"] = "00000000-0000-4000-8000-00000000000A"
+	if cfg, err = LoadWith(func(key string) string { return env[key] }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.ArtifactStorage.RequiredStoreID(); err == nil {
+		t.Fatal("noncanonical StoreID accepted")
+	}
+}

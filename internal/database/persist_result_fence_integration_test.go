@@ -204,6 +204,145 @@ func TestScheduledPersistResultFenceAcceptanceAndRejection(t *testing.T) {
 	})
 }
 
+func TestArtifactPublicationIsAdmittedInsideResultFenceTransaction(t *testing.T) {
+	t.Run("stale owner is denied before publication", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "publication-stale-owner", "probe.http")
+		step, tool, artifacts, result := fixture.validPayload()
+		staleFence := fixture.fence
+		staleFence.LeaseOwner = "stale-owner"
+		publicationCalls := 0
+		before := resultFenceSnapshot(t, fixture)
+		err := fixture.env.store.PersistResultWithArtifactPublication(WithScheduledExecutionFence(fixture.env.ctx, staleFence), fixture.env.programID, step, tool, &result, nil, func(context.Context) ([]domain.Artifact, error) {
+			publicationCalls++
+			return artifacts, nil
+		})
+		if !errors.Is(err, ErrStaleScheduledExecutionResult) || publicationCalls != 0 {
+			t.Fatalf("stale result error=%v publication_calls=%d", err, publicationCalls)
+		}
+		if after := resultFenceSnapshot(t, fixture); after != before {
+			t.Fatalf("stale publication attempt mutated database\nbefore=%s\nafter=%s", before, after)
+		}
+	})
+
+	t.Run("stale provider attempt is denied before publication", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "publication-stale-provider-attempt", "probe.http")
+		admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, scheduledProviderAction(fixture, 1), nil, "fixture-provider")
+		step, tool, artifacts, result := fixture.validPayload()
+		applyScheduledProviderAdmission(tool, &result, admission)
+		if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE step_runs SET attempt_count=2 WHERE id=$1`, fixture.stepID); err != nil {
+			t.Fatal(err)
+		}
+		publicationCalls := 0
+		err := fixture.env.store.PersistResultWithArtifactPublication(fixture.context(), fixture.env.programID, step, tool, &result, admission, func(context.Context) ([]domain.Artifact, error) {
+			publicationCalls++
+			return artifacts, nil
+		})
+		if !errors.Is(err, ErrStaleScheduledExecutionResult) || publicationCalls != 0 {
+			t.Fatalf("stale provider result error=%v publication_calls=%d", err, publicationCalls)
+		}
+		assertResultRowCounts(t, fixture, 0, 0, 0, 0, 0)
+	})
+
+	t.Run("expired lease is denied before publication", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "publication-expired-lease", "probe.http")
+		expireRecoveryLease(t, fixture.env, fixture.lineage.execution.ID, 1)
+		step, tool, artifacts, result := fixture.validPayload()
+		publicationCalls := 0
+		err := fixture.env.store.PersistResultWithArtifactPublication(fixture.context(), fixture.env.programID, step, tool, &result, nil, func(context.Context) ([]domain.Artifact, error) {
+			publicationCalls++
+			return artifacts, nil
+		})
+		if !errors.Is(err, ErrStaleScheduledExecutionResult) || publicationCalls != 0 {
+			t.Fatalf("expired result error=%v publication_calls=%d", err, publicationCalls)
+		}
+	})
+
+	t.Run("authoritative publication and metadata commit together", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "publication-authoritative", "probe.http")
+		step, tool, artifacts, result := fixture.validPayload()
+		publicationCalls := 0
+		if err := fixture.env.store.PersistResultWithArtifactPublication(fixture.context(), fixture.env.programID, step, tool, &result, nil, func(context.Context) ([]domain.Artifact, error) {
+			publicationCalls++
+			return artifacts, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if publicationCalls != 1 {
+			t.Fatalf("publication calls=%d want=1", publicationCalls)
+		}
+		assertResultRowCounts(t, fixture, 1, 1, 1, 0, 1)
+	})
+
+	t.Run("publication failure rolls back result admission", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "publication-failure", "probe.http")
+		step, tool, _, result := fixture.validPayload()
+		publicationError := errors.New("simulated artifact publication failure")
+		before := resultFenceSnapshot(t, fixture)
+		err := fixture.env.store.PersistResultWithArtifactPublication(fixture.context(), fixture.env.programID, step, tool, &result, nil, func(context.Context) ([]domain.Artifact, error) {
+			return nil, publicationError
+		})
+		if !errors.Is(err, publicationError) {
+			t.Fatalf("publication error=%v", err)
+		}
+		if after := resultFenceSnapshot(t, fixture); after != before {
+			t.Fatalf("publication failure admitted result\nbefore=%s\nafter=%s", before, after)
+		}
+	})
+
+	t.Run("authority lock remains held through publication", func(t *testing.T) {
+		fixture := newScheduledResultFixture(t, "publication-lock", "probe.http")
+		step, tool, artifacts, result := fixture.validPayload()
+		publicationEntered := make(chan struct{})
+		releasePublication := make(chan struct{})
+		defer func() {
+			select {
+			case <-releasePublication:
+			default:
+				close(releasePublication)
+			}
+		}()
+		persisted := make(chan error, 1)
+		go func() {
+			persisted <- fixture.env.store.PersistResultWithArtifactPublication(fixture.context(), fixture.env.programID, step, tool, &result, nil, func(context.Context) ([]domain.Artifact, error) {
+				close(publicationEntered)
+				<-releasePublication
+				return artifacts, nil
+			})
+		}()
+		select {
+		case <-publicationEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("publication callback was not reached")
+		}
+		claimMutation := make(chan error, 1)
+		go func() {
+			_, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `UPDATE scheduled_executions SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, fixture.lineage.execution.ID)
+			claimMutation <- err
+		}()
+		lockCtx, lockCancel := context.WithTimeout(fixture.env.ctx, 5*time.Second)
+		waitForPostgresLock(t, lockCtx, fixture.env.store, `%UPDATE scheduled_executions SET lease_expires_at=clock_timestamp()-interval '1 second'%`)
+		lockCancel()
+		close(releasePublication)
+		select {
+		case err := <-persisted:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("result persistence did not complete")
+		}
+		select {
+		case err := <-claimMutation:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("scheduled authority mutation did not resume after result commit")
+		}
+		assertResultRowCounts(t, fixture, 1, 1, 1, 0, 1)
+	})
+}
+
 func TestScheduledProviderStartRequiresExactAuthorizationProvenance(t *testing.T) {
 	fixture := newScheduledResultFixture(t, "provider-start-scheduled", "probe.http")
 	action := scheduledProviderAction(fixture, 1)
@@ -647,6 +786,37 @@ func TestProviderResultRejectedReasonCodes(t *testing.T) {
 		}},
 		{code: resultFenceArtifactIdentityInvalid, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
 			(*artifacts)[0].ID = ""
+		}},
+		{code: resultFenceArtifactIdentityInvalid, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			(*artifacts)[0].AddressingVersion = 0
+		}},
+		{code: resultFenceArtifactIdentityInvalid, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			(*artifacts)[0].ArtifactStoreID = nil
+		}},
+		{code: resultFenceArtifactIdentityInvalid, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			(*artifacts)[0].StorageKey = nil
+		}},
+		{code: resultFenceArtifactIdentityInvalid, prepare: func(t *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			canonical := domain.ID("00000000-0000-4000-8000-00000000101a")
+			if _, err := domain.ParseID(string(canonical)); err != nil {
+				t.Fatalf("canonical store ID invalid: %v", err)
+			}
+			uppercase := domain.ID(strings.ToUpper(string(canonical)))
+			if uppercase == canonical {
+				t.Fatalf("uppercase store ID must differ from canonical: %s", uppercase)
+			}
+			if _, err := domain.ParseID(string(uppercase)); err == nil {
+				t.Fatalf("uppercase store ID %s must not be canonical", uppercase)
+			}
+			(*artifacts)[0].ArtifactStoreID = &uppercase
+		}},
+		{code: resultFenceArtifactIdentityInvalid, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			wrong := "v1/ff/" + string((*artifacts)[0].ID)
+			(*artifacts)[0].StorageKey = &wrong
+		}},
+		{code: resultFenceArtifactIdentityInvalid, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
+			location := "modern://forbidden"
+			(*artifacts)[0].StorageLocation = &location
 		}},
 		{code: resultFenceArtifactLineageMismatch, prepare: func(_ *testing.T, _ scheduledResultFixture, _ *context.Context, _ *domain.ID, _ *domain.StepRun, _ *domain.ToolRun, artifacts *[]domain.Artifact, _ *domain.ActionResult, _ *capability.ResultAdmissionProvenance) {
 			(*artifacts)[0].ToolRunID = domain.NewID()
@@ -1209,6 +1379,7 @@ func TestProviderResultConcurrentGlobalIdentityCollisions(t *testing.T) {
 			queryPattern: `%INSERT INTO artifacts(id,task_id,%`,
 			apply: func(sharedID domain.ID, candidate *providerResultCollisionCandidate) {
 				candidate.artifacts[0].ID = sharedID
+				candidate.artifacts[0] = withTestArtifactAddress(candidate.artifacts[0])
 				candidate.result.ArtifactIDs[0] = sharedID
 				candidate.tool.StdoutArtifactID = &candidate.artifacts[0].ID
 			},
@@ -1747,7 +1918,7 @@ func scheduledResultPayload(fixture scheduledResultFixture, output json.RawMessa
 	exitCode := 0
 	step := domain.StepRun{ID: fixture.stepID, WorkflowRunID: fixture.lineage.runID, Capability: fixture.capability, Status: domain.StepSucceeded, Output: output, CompletedAt: &now, IdempotencyKey: fixture.idempotencyKey}
 	tool := &domain.ToolRun{ID: toolID, StepRunID: fixture.stepID, Capability: fixture.capability, Provider: "fixture", ToolVersion: "1", SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"integration"}`), StartedAt: now.Add(-time.Second), CompletedAt: &now, ExitCode: &exitCode, StdoutArtifactID: &artifactID}
-	artifacts := []domain.Artifact{{ID: artifactID, TaskID: fixture.lineage.task.ID, WorkflowRunID: fixture.lineage.runID, StepRunID: fixture.stepID, ToolRunID: toolID, Type: "normalized-result", ContentType: "application/json", Size: int64(len(output)), SHA256: strings.Repeat("a", 64), StorageLocation: "synthetic://result.json", CreatedAt: now, RedactionState: "redacted"}}
+	artifacts := []domain.Artifact{withTestArtifactAddress(domain.Artifact{ID: artifactID, TaskID: fixture.lineage.task.ID, WorkflowRunID: fixture.lineage.runID, StepRunID: fixture.stepID, ToolRunID: toolID, Type: "normalized-result", ContentType: "application/json", Size: int64(len(output)), SHA256: strings.Repeat("a", 64), CreatedAt: now, RedactionState: "redacted"})}
 	result := domain.ActionResult{RequestID: domain.NewID(), Status: "succeeded", Summary: "fixture result succeeded", Output: output, ArtifactIDs: []domain.ID{artifactID}}
 	return step, tool, artifacts, result
 }
@@ -2224,8 +2395,8 @@ func prepareArtifactResultConflict(t *testing.T, fixture scheduledResultFixture,
 		t.Fatal(err)
 	}
 	a := (*artifacts)[0]
-	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,redaction_state,sensitive)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)`, a.ID, a.TaskID, a.WorkflowRunID, foreignStepID, foreignToolID, a.Type, a.ContentType, a.Size, a.SHA256, a.StorageLocation, a.CreatedAt, a.RedactionState); err != nil {
+	if _, err := fixture.env.store.Pool.Exec(fixture.env.ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,addressing_version,artifact_store_id,storage_key,storage_location,created_at,redaction_state,sensitive)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,false)`, a.ID, a.TaskID, a.WorkflowRunID, foreignStepID, foreignToolID, a.Type, a.ContentType, a.Size, a.SHA256, a.AddressingVersion, a.ArtifactStoreID, a.StorageKey, a.StorageLocation, a.CreatedAt, a.RedactionState); err != nil {
 		t.Fatal(err)
 	}
 }

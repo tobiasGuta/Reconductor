@@ -1107,6 +1107,7 @@ func schedulerIntegrationStore(t *testing.T) (*Store, context.Context) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	ensureTestArtifactStore(t, ctx, store)
 	return store, ctx
 }
 

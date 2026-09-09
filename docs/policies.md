@@ -15,9 +15,9 @@ Scan windows are UTC, start-inclusive, and end-exclusive. Accepted forms are `HH
 | `DirectoryFuzzing` | trusted capability manifest requirements | `policy_denied` before provider validation |
 | `CrossOrigin` | trusted capability manifest requirements | `policy_denied` before provider validation |
 | `IntrusiveChecks` | trusted capability manifest requirements | `policy_denied` before provider validation |
-| `ArtifactRetention` | artifact creation, database expiry, and retention collector | `artifact_retention_applied` and `artifact_expired` audits |
+| `ArtifactRetention` | artifact creation and database expiry assignment | `artifact_retention_applied` audit |
 
-`POLICY_ARTIFACT_RETENTION` defaults to `720h`. Set it to `0s` only when indefinite retention is explicitly intended. Existing artifacts from before the expiry migration retain a null expiry and are not retroactively deleted.
+`POLICY_ARTIFACT_RETENTION` defaults to `720h`. It currently assigns `expires_at` metadata only; automatic content and Artifact-row deletion are disabled, and expired bytes accumulate. Set it to `0s` only when indefinite retention metadata is explicitly intended. Existing artifacts from before the expiry migration retain a null expiry and are not retroactively changed. See [artifact storage ownership](artifact-storage.md).
 
 Approval records link a request, task, action, risk, reason, decision maker, decision time, and optional expiration. Policy is evaluated before dispatch and again inside the worker immediately before execution.
 

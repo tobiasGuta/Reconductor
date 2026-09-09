@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/console"
@@ -25,6 +26,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/providers"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
+	"github.com/tobiasGuta/Reconductor/internal/redaction"
 	schedulecron "github.com/tobiasGuta/Reconductor/internal/scheduler"
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
 	"github.com/tobiasGuta/Reconductor/internal/targeting"
@@ -70,6 +72,8 @@ func run(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "migrate":
 		return withStore(ctx, cfg, func(s *database.Store) error { return s.Migrate(ctx) })
+	case "artifact-store":
+		return artifactStoreCommand(ctx, cfg, args[1:])
 	case "program":
 		return programCommand(ctx, cfg, args[1:])
 	case "task":
@@ -99,7 +103,44 @@ func run(ctx context.Context, args []string) error {
 	}
 }
 func usage() error {
-	return fmt.Errorf("usage: platform <migrate|program|task|scope|workflow|run|approvals|queue|report|schedule|changes|console|capabilities|doctor> ...")
+	return fmt.Errorf("usage: platform <migrate|artifact-store|program|task|scope|workflow|run|approvals|queue|report|schedule|changes|console|capabilities|doctor> ...")
+}
+
+type artifactStoreInitOutput struct {
+	StoreID       domain.ID `json:"store_id"`
+	BackendKind   string    `json:"backend_kind"`
+	MarkerFormat  string    `json:"marker_format"`
+	MarkerVersion int       `json:"marker_version"`
+	Status        string    `json:"status"`
+}
+
+func artifactStoreCommand(ctx context.Context, cfg config.Config, args []string) error {
+	if len(args) == 0 || args[0] != "init" {
+		return fmt.Errorf("artifact-store requires init")
+	}
+	fs := flag.NewFlagSet("artifact-store init", flag.ContinueOnError)
+	allowNonempty := fs.Bool("allow-nonempty-root", false, "acknowledge initialization of a nonempty unmarked legacy root")
+	resumeRegistration := fs.Bool("resume-registration", false, "resume database registration from an existing exact marker")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("artifact-store init accepts no positional arguments")
+	}
+	storeID, err := cfg.ArtifactStorage.RequiredStoreID()
+	if err != nil {
+		return err
+	}
+	store, err := readyStore(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	result, err := artifact.InitializeLocal(ctx, cfg.ArtifactStorage.Root, storeID, store, artifact.InitializationOptions{AllowNonemptyRoot: *allowNonempty, ResumeRegistration: *resumeRegistration})
+	if err != nil {
+		return err
+	}
+	return printJSON(artifactStoreInitOutput{StoreID: result.Store.ID, BackendKind: result.Store.BackendKind, MarkerFormat: result.Store.MarkerFormat, MarkerVersion: result.Store.MarkerVersion, Status: result.Status})
 }
 
 func consoleCommand(ctx context.Context, cfg config.Config, args []string) error {
@@ -184,7 +225,7 @@ func readyStore(ctx context.Context, cfg config.Config) (*database.Store, error)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.Migrate(ctx); err != nil {
+	if err := s.RequireCurrentSchema(ctx); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -559,11 +600,19 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 	if *domainName != "" {
 		fmt.Fprintln(os.Stderr, "warning: --domain is deprecated; it is treated only as a passive discovery root")
 	}
+	storeID, err := cfg.ArtifactStorage.RequiredStoreID()
+	if err != nil {
+		return err
+	}
 	s, err := readyStore(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
+	artifacts, err := artifact.OpenLocal(ctx, cfg.ArtifactStorage.Root, storeID, s, redaction.New(cfg.Logging.SecretNames...))
+	if err != nil {
+		return err
+	}
 	if *programID == "" && *resumeID != "" {
 		state, err := s.LoadWorkflowState(ctx, domain.ID(*resumeID))
 		if err != nil {
@@ -579,7 +628,7 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 		return fmt.Errorf("--program-id is required")
 	}
 	req := orchestration.WorkflowRequest{ProgramID: domain.ID(*programID), WorkflowName: *workflowName, Objective: *objective, RequestedBy: "cli", ScopeReference: *scopePath, ManualDiscoveryRoots: manual, AcknowledgeScopeExpansion: *ackScopeExpansion, ResumeRunID: domain.ID(*resumeID), ExistingTaskID: domain.ID(*taskID), ApproveModerate: *approve, Headless: *headless}
-	result, err := (orchestration.Service{Config: cfg, Store: s, Registry: registry}).Run(ctx, req)
+	result, err := (orchestration.Service{Config: cfg, Store: s, Registry: registry, Artifacts: artifacts}).Run(ctx, req)
 	_ = printJSON(result.State)
 	if errors.Is(err, orchestration.ErrScopeExpansion) {
 		return fmt.Errorf("scope change expands authorization; review the plan and rerun with --acknowledge-scope-expansion")

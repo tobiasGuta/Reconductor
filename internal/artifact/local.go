@@ -1,10 +1,12 @@
 package artifact
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,73 +27,108 @@ type Storage interface {
 	Put(context.Context, PutRequest) (domain.Artifact, error)
 }
 type Local struct {
-	root     string
-	redactor *redaction.Redactor
+	root        string
+	storeID     domain.ID
+	redactor    *redaction.Redactor
+	newID       func() domain.ID
+	initialized bool
 }
 
-func NewLocal(root string, r *redaction.Redactor) (*Local, error) {
-	abs, err := filepath.Abs(root)
-	if err != nil {
-		return nil, err
+func (l *Local) Put(_ context.Context, request PutRequest) (domain.Artifact, error) {
+	if l == nil || !l.initialized || l.root == "" || l.storeID == "" || l.redactor == nil || l.newID == nil {
+		return domain.Artifact{}, fmt.Errorf("artifact store is not initialized")
 	}
-	if r == nil {
-		r = redaction.New()
-	}
-	return &Local{root: abs, redactor: r}, nil
-}
-func (l *Local) Put(_ context.Context, r PutRequest) (domain.Artifact, error) {
-	if r.ProgramID == "" || r.TaskID == "" || r.WorkflowRunID == "" || r.StepRunID == "" || r.ToolRunID == "" {
+	if request.ProgramID == "" || request.TaskID == "" || request.WorkflowRunID == "" || request.StepRunID == "" || request.ToolRunID == "" {
 		return domain.Artifact{}, fmt.Errorf("complete artifact lineage is required")
 	}
-	name := filepath.Base(r.Name)
-	if name == "." || name == "" {
-		name = "artifact.bin"
+	for _, identity := range []struct {
+		name string
+		id   domain.ID
+	}{{"ProgramID", request.ProgramID}, {"TaskID", request.TaskID}, {"WorkflowRunID", request.WorkflowRunID}, {"StepRunID", request.StepRunID}, {"ToolRunID", request.ToolRunID}} {
+		if _, err := domain.ParseID(string(identity.id)); err != nil {
+			return domain.Artifact{}, fmt.Errorf("artifact %s is not canonical", identity.name)
+		}
 	}
-	parts := []string{l.root, "programs", string(r.ProgramID), "tasks", string(r.TaskID), "runs", string(r.WorkflowRunID), "steps", string(r.StepRunID), "tool-runs", string(r.ToolRunID)}
-	if r.Sensitive {
-		parts = append(parts, "sensitive")
-	}
-	dir := filepath.Join(parts...)
-	if !within(l.root, dir) {
-		return domain.Artifact{}, fmt.Errorf("artifact path escapes storage root")
-	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return domain.Artifact{}, err
-	}
-	data := r.Data
-	state := "sensitive-separated"
-	if !r.Sensitive {
+	data := request.Data
+	state := "sensitive-unredacted"
+	if !request.Sensitive {
 		data = []byte(l.redactor.Text(string(data)))
 		state = "redacted"
 	}
-	location := filepath.Join(dir, name)
-	if err := os.WriteFile(location, data, 0600); err != nil {
+	id := l.newID()
+	key, err := StorageKeyFor(id)
+	if err != nil {
 		return domain.Artifact{}, err
+	}
+	location, err := l.pathForKey(key, id)
+	if err != nil {
+		return domain.Artifact{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(location), 0700); err != nil {
+		return domain.Artifact{}, fmt.Errorf("create artifact key directory: %w", err)
+	}
+	file, err := os.OpenFile(location, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return domain.Artifact{}, fmt.Errorf("publish artifact without overwrite: %w", err)
+	}
+	written, writeErr := io.Copy(file, bytes.NewReader(data))
+	if writeErr != nil || written != int64(len(data)) {
+		_ = file.Close()
+		if writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
+		return domain.Artifact{}, fmt.Errorf("write artifact content: %w", writeErr)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return domain.Artifact{}, fmt.Errorf("sync artifact content: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return domain.Artifact{}, fmt.Errorf("close artifact content: %w", err)
+	}
+	if err := syncDirectoryChain(filepath.Dir(location), l.root); err != nil {
+		return domain.Artifact{}, fmt.Errorf("durably publish artifact path: %w", err)
 	}
 	sum := sha256.Sum256(data)
 	created := time.Now().UTC()
 	var expires *time.Time
-	if r.Retention > 0 {
-		value := created.Add(r.Retention)
+	if request.Retention > 0 {
+		value := created.Add(request.Retention)
 		expires = &value
 	}
-	return domain.Artifact{ID: domain.NewID(), TaskID: r.TaskID, WorkflowRunID: r.WorkflowRunID, StepRunID: r.StepRunID, ToolRunID: r.ToolRunID, Type: r.Type, ContentType: r.ContentType, Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:]), StorageLocation: location, CreatedAt: created, ExpiresAt: expires, RedactionState: state, Sensitive: r.Sensitive}, nil
+	storeID := l.storeID
+	storageKey := key
+	return domain.Artifact{
+		ID:                id,
+		TaskID:            request.TaskID,
+		WorkflowRunID:     request.WorkflowRunID,
+		StepRunID:         request.StepRunID,
+		ToolRunID:         request.ToolRunID,
+		Type:              request.Type,
+		ContentType:       request.ContentType,
+		Size:              int64(len(data)),
+		SHA256:            hex.EncodeToString(sum[:]),
+		AddressingVersion: 1,
+		ArtifactStoreID:   &storeID,
+		StorageKey:        &storageKey,
+		CreatedAt:         created,
+		ExpiresAt:         expires,
+		RedactionState:    state,
+		Sensitive:         request.Sensitive,
+	}, nil
 }
 
-func (l *Local) Delete(_ context.Context, a domain.Artifact) error {
-	location, err := filepath.Abs(a.StorageLocation)
-	if err != nil {
-		return err
+func (l *Local) pathForKey(key string, id domain.ID) (string, error) {
+	if err := ValidateStorageKey(key, id); err != nil {
+		return "", err
 	}
+	location := filepath.Join(append([]string{l.root}, strings.Split(key, "/")...)...)
 	if !within(l.root, location) {
-		return fmt.Errorf("artifact path escapes storage root")
+		return "", fmt.Errorf("artifact path escapes storage root")
 	}
-	err = os.Remove(location)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
+	return location, nil
 }
+
 func within(root, target string) bool {
 	rel, err := filepath.Rel(root, target)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))

@@ -41,6 +41,53 @@ func TestScopePlanCLIProducesJSONWithoutRuntimeConfiguration(t *testing.T) {
 	}
 }
 
+func TestArtifactStoreInitCLIHasOnlyFrozenFlagsAndRequiresStoreID(t *testing.T) {
+	cfg := config.Config{ArtifactStorage: config.ArtifactStorage{Driver: "local", Root: t.TempDir()}}
+	if err := artifactStoreCommand(context.Background(), cfg, []string{"init"}); err == nil || !strings.Contains(err.Error(), "ARTIFACT_STORE_ID is required") {
+		t.Fatalf("missing StoreID error=%v", err)
+	}
+	if err := artifactStoreCommand(context.Background(), cfg, []string{"init", "unexpected"}); err == nil || !strings.Contains(err.Error(), "accepts no positional arguments") {
+		t.Fatalf("positional argument error=%v", err)
+	}
+	if err := artifactStoreCommand(context.Background(), cfg, []string{"init", "--repair"}); err == nil {
+		t.Fatal("unfrozen repair flag was accepted")
+	}
+	if err := artifactStoreCommand(context.Background(), cfg, []string{"show"}); err == nil {
+		t.Fatal("unsupported artifact-store subcommand was accepted")
+	}
+	encoded, err := json.Marshal(artifactStoreInitOutput{StoreID: "00000000-0000-4000-8000-000000000001", BackendKind: "local-v1", MarkerFormat: "reconductor-artifact-store", MarkerVersion: 1, Status: "initialized"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "nonce") {
+		t.Fatalf("successful output exposed nonce field: %s", encoded)
+	}
+}
+
+func TestOnlyExplicitAdministrativeCommandAppliesMigrations(t *testing.T) {
+	read := func(path string) string {
+		t.Helper()
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	platformSource := read("main.go")
+	if strings.Count(platformSource, ".Migrate(ctx)") != 1 || !strings.Contains(platformSource, `case "migrate":`) {
+		t.Fatal("platform schema mutation is not confined to the explicit migrate command")
+	}
+	if strings.Count(platformSource, "database.Open(ctx") != 2 || !strings.Contains(platformSource, "s.RequireCurrentSchema(ctx)") {
+		t.Fatal("ordinary platform database startup does not use the fail-closed schema check")
+	}
+	for _, path := range []string{filepath.Join("..", "worker", "main.go"), filepath.Join("..", "scheduler", "main.go")} {
+		source := read(path)
+		if strings.Contains(source, ".Migrate(") || !strings.Contains(source, ".RequireCurrentSchema(ctx)") {
+			t.Fatalf("ordinary startup schema contract is not enforced in %s", path)
+		}
+	}
+}
+
 func TestWorkflowPlanCLIAndRepeatedManualRoots(t *testing.T) {
 	path := filepath.ToSlash(filepath.Join("internal", "targeting", "testdata", "mixed_real_world_scope.json"))
 	cfg, err := config.LoadPlanning()
