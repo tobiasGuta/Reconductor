@@ -42,10 +42,10 @@ type mockCleanupStore struct {
 	finalizedCalls   []domain.ID
 	retryCalls       []domain.ID
 	quarantinedCalls []domain.ID
-	claimCalls int
-	claimStoreID domain.ID
-	claimLimit int
-	observations []string
+	claimCalls       int
+	claimStoreID     domain.ID
+	claimLimit       int
+	observations     []string
 }
 
 func (m *mockCleanupStore) ClaimExpiredArtifacts(ctx context.Context, storeID domain.ID, limit int) ([]CleanupClaim, error) {
@@ -148,7 +148,9 @@ func TestCleanupBatchStopsOnInvariantMismatchWithoutTouchingDiskOrState(t *testi
 	if store.claimCalls != 1 || store.claims[0] != claimBefore {
 		t.Fatal("claim was changed or reacquired after invariant failure")
 	}
-	if strings.Contains(err.Error(), claimBefore.StorageKey) { t.Fatal("invariant error exposed storage key") }
+	if strings.Contains(err.Error(), claimBefore.StorageKey) {
+		t.Fatal("invariant error exposed storage key")
+	}
 }
 
 func TestCleanupBatchProcessesMixedOutcomesAndLostClaims(t *testing.T) {
@@ -229,17 +231,28 @@ func TestCleanupBatchProcessesMixedOutcomesAndLostClaims(t *testing.T) {
 func TestCleanupBatchEmptyQuarantineAndLostClaims(t *testing.T) {
 	storeID, id := domain.NewID(), domain.NewID()
 	key, _ := StorageKeyFor(id)
-	for _, tc := range []struct { name string; deletionErr error }{
+	for _, tc := range []struct {
+		name        string
+		deletionErr error
+	}{
 		{"finalize", nil}, {"retry", errors.New("filesystem failure")}, {"quarantine", ErrUnexpectedEntryType},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store := &mockCleanupStore{claims: []CleanupClaim{{ID:id, ArtifactStoreID:storeID, StorageKey:key, CleanupClaimToken:domain.NewID()}}, finalizeLost:true, retryLost:true, quarantineLost:true}
-			deleter := &mockDeleter{storeID:storeID, deleteFn:func(context.Context, domain.ID, string)(ContentDeletionOutcome,error){ return ContentRemoved, tc.deletionErr }}
+			store := &mockCleanupStore{claims: []CleanupClaim{{ID: id, ArtifactStoreID: storeID, StorageKey: key, CleanupClaimToken: domain.NewID()}}, finalizeLost: true, retryLost: true, quarantineLost: true}
+			deleter := &mockDeleter{storeID: storeID, deleteFn: func(context.Context, domain.ID, string) (ContentDeletionOutcome, error) {
+				return ContentRemoved, tc.deletionErr
+			}}
 			result, err := CleanupBatch(context.Background(), store, deleter, 1)
-			if err != nil || result.LostClaim != 1 || result.Removed != 0 || result.AlreadyAbsent != 0 || result.RetryScheduled != 0 || len(result.Quarantined) != 0 { t.Fatalf("result=%+v err=%v", result,err) }
+			if err != nil || result.LostClaim != 1 || result.Removed != 0 || result.AlreadyAbsent != 0 || result.RetryScheduled != 0 || len(result.Quarantined) != 0 {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
 			encoded, err := json.Marshal(result)
-			if err != nil || !strings.Contains(string(encoded), `"quarantined":[]`) { t.Fatalf("empty quarantine output=%s err=%v", encoded,err) }
-			if store.claimCalls != 1 || len(store.finalizedCalls)+len(store.retryCalls)+len(store.quarantinedCalls) != 1 { t.Fatal("lost claim caused fallback mutation or another claim") }
+			if err != nil || !strings.Contains(string(encoded), `"quarantined":[]`) {
+				t.Fatalf("empty quarantine output=%s err=%v", encoded, err)
+			}
+			if store.claimCalls != 1 || len(store.finalizedCalls)+len(store.retryCalls)+len(store.quarantinedCalls) != 1 {
+				t.Fatal("lost claim caused fallback mutation or another claim")
+			}
 		})
 	}
 }

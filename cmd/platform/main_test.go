@@ -125,8 +125,8 @@ func TestArtifactStoreCleanupCLIOneBatchAndConfiguredAuthority(t *testing.T) {
 	const storeID = "00000000-0000-4000-8000-000000000001"
 	const artifactID = "00000000-0000-4000-8000-000000000002"
 	for _, tc := range []struct {
-		name string
-		args []string
+		name  string
+		args  []string
 		batch int
 	}{
 		{"default", []string{"cleanup"}, 100},
@@ -143,18 +143,28 @@ func TestArtifactStoreCleanupCLIOneBatchAndConfiguredAuthority(t *testing.T) {
 						t.Fatalf("dispatch calls=%d id=%s batch=%d", calls, gotID, batch)
 					}
 					// A full batch must still return without requesting another batch.
-					return artifact.CleanupResult{ArtifactStoreID: gotID, Claimed: batch, Removed: batch-1, Quarantined: []artifact.QuarantinedArtifact{{ArtifactID: artifactID, ErrorCode: "unexpected_entry_type"}}}, nil
+					return artifact.CleanupResult{ArtifactStoreID: gotID, Claimed: batch, Removed: batch - 1, Quarantined: []artifact.QuarantinedArtifact{{ArtifactID: artifactID, ErrorCode: "unexpected_entry_type"}}}, nil
 				})
 			})
-			if err != nil || calls != 1 { t.Fatalf("calls=%d err=%v", calls, err) }
+			if err != nil || calls != 1 {
+				t.Fatalf("calls=%d err=%v", calls, err)
+			}
 			var result map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(out), &result); err != nil { t.Fatal(err) }
-			if len(result) != 7 { t.Fatalf("unexpected output fields: %s", out) }
+			if err := json.Unmarshal([]byte(out), &result); err != nil {
+				t.Fatal(err)
+			}
+			if len(result) != 7 {
+				t.Fatalf("unexpected output fields: %s", out)
+			}
 			for _, key := range []string{"artifact_store_id", "claimed", "removed", "already_absent", "retry_scheduled", "lost_claim", "quarantined"} {
-				if _, ok := result[key]; !ok { t.Fatalf("missing %s: %s", key, out) }
+				if _, ok := result[key]; !ok {
+					t.Fatalf("missing %s: %s", key, out)
+				}
 			}
 			var quarantined []map[string]string
-			if err := json.Unmarshal(result["quarantined"], &quarantined); err != nil { t.Fatal(err) }
+			if err := json.Unmarshal(result["quarantined"], &quarantined); err != nil {
+				t.Fatal(err)
+			}
 			if len(quarantined) != 1 || len(quarantined[0]) != 2 || quarantined[0]["artifact_id"] != artifactID || quarantined[0]["error_code"] != "unexpected_entry_type" {
 				t.Fatalf("quarantine output: %s", out)
 			}
@@ -166,7 +176,9 @@ func TestArtifactStoreCleanupCLIOneBatchAndConfiguredAuthority(t *testing.T) {
 			t.Fatal("cleanup called with invalid configured identity")
 			return artifact.CleanupResult{}, nil
 		})
-		if err == nil { t.Fatal("invalid configured identity accepted") }
+		if err == nil {
+			t.Fatal("invalid configured identity accepted")
+		}
 	}
 }
 
