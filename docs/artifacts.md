@@ -7,3 +7,11 @@ Metadata records artifact type, content type, byte size, SHA-256, storage locati
 Command-provider `stdout.jsonl` and `stderr.txt` are stored as `raw-provider-output` artifacts and populate the tool run's stdout/stderr artifact pointers. Normalized `result.json` is stored separately as `normalized-result` and is attached to the action result artifact IDs. Local workflow execution and Redis worker execution use the same execution service, so artifact meaning does not change by delivery mode.
 
 Normal logs and notifications must never contain credentials, authorization headers, cookies, JWTs, API keys, webhook URLs, password fields, or user-configured secret names. Notifications should use internal candidate/finding IDs and safe summaries, not credential-bearing curl commands.
+
+## Tombstone state and evidence preservation
+
+Artifact records are permanent and never deleted from the database. When an artifact reaches retention expiration (`expires_at <= statement_timestamp()`) and cleanup is executed, only the physical payload on the filesystem is deleted. The metadata row transitions to the tombstoned state (`content_deleted_at IS NOT NULL`).
+
+This design preserves evidence lineage integrity:
+- `candidate_findings`, `asset_observations`, `change_items`, and audit event records can reference evidence artifact IDs indefinitely without risking foreign key violations or dangling IDs.
+- Downstream read models (such as execution projections) exclude expired and tombstoned artifacts from user-facing result sets, preventing access to purged payloads while leaving historical lineage verifiable in database audit logs.
