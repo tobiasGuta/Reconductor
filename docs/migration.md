@@ -44,6 +44,30 @@ The migration makes every workflow-definition release field immutable: `id`, `na
 
 A legacy null-materialization run stays visible but returns `ErrWorkflowResumeUnavailable` before state mutation or provider traffic. A valid modern run uses its database snapshot as authority. A genuinely missing initial FileStore checkpoint can be reconstructed only for a non-terminal run with a valid start time and zero StepRuns; malformed/conflicting checkpoints and missing checkpoints after any StepRun return a checkpoint error without traffic.
 
+### Artifact store tombstone cleanup migration 0017
+
+Migration `0017_artifact_store_tombstone_cleanup.sql` introduces the store-scoped tombstone cleanup state graph for version-1 artifacts. It adds 6 nullable columns to `artifacts`: `content_deleted_at`, `cleanup_claim_token`, `cleanup_claimed_at`, `cleanup_retry_after`, `cleanup_last_error_code`, and `cleanup_quarantined_at`.
+
+The migration establishes:
+- 8 named CHECK constraints guaranteeing state shape mutual exclusivity (`artifacts_cleanup_state_shape_ck`), claim token/timestamp pairing (`artifacts_cleanup_claim_pair_ck`), valid error codes (`artifacts_cleanup_error_code_ck`), lifecycle addressing rules (`artifacts_cleanup_lifecycle_address_ck`), legacy version-0 nullity (`artifacts_cleanup_legacy_v0_null_ck`), tombstone timestamp ordering (`artifacts_cleanup_tombstone_time_ck`), retry state constraints (`artifacts_cleanup_retry_error_ck`), and quarantine error tracking (`artifacts_cleanup_quarantine_error_ck`).
+- A partial structural candidate index `artifacts_cleanup_eligible_idx`:
+  - **keys**:
+    - `artifact_store_id`
+    - `expires_at`
+    - `id`
+    (indexed as `(artifact_store_id, expires_at ASC, id ASC)`)
+  - **structural predicate**:
+    `addressing_version = 1 AND expires_at IS NOT NULL AND content_deleted_at IS NULL AND cleanup_quarantined_at IS NULL`
+  - **no temporal predicate** (no `expires_at <= CURRENT_TIMESTAMP`)
+  - **no retry predicate** (no `cleanup_retry_after IS NULL`)
+  Temporal eligibility (expiration time and retry wait) is evaluated authoritatively at claim time, not in the index predicate.
+- A BEFORE UPDATE trigger `artifacts_cleanup_transition_guard` enforcing valid state transitions across canonical states (`UNCLAIMED`, `CLAIMED`, `RETRY_WAIT`, `CONTENT_DELETED`, `QUARANTINED`):
+  - Valid transitions: `UNCLAIMED -> CLAIMED`, `CLAIMED -> CONTENT_DELETED`, `CLAIMED -> RETRY_WAIT`, `CLAIMED -> QUARANTINED`, `CLAIMED -> CLAIMED` (token renewal during stale-claim takeover), and `RETRY_WAIT -> CLAIMED` (reclaiming after retry interval).
+  - Terminal states: `CONTENT_DELETED` and `QUARANTINED` are terminal and immutable.
+  - Full expiry-freeze invariant: `expires_at` may change before cleanup lifecycle entry. Once ANY cleanup lifecycle field (`content_deleted_at`, `cleanup_claim_token`, `cleanup_claimed_at`, `cleanup_retry_after`, `cleanup_last_error_code`, or `cleanup_quarantined_at`) is non-null, `expires_at` is immutable forever. The trigger evaluates OLD OR NEW cleanup lifecycle state, so one statement cannot change `expires_at` and enter the cleanup lifecycle simultaneously. Expiry freeze is not merely protection against extending an already tombstoned artifact; it protects the entire cleanup lifecycle once touched.
+
+Applying 0017 requires running `platform migrate`. Existing pre-0017 rows remain fully compatible and default to the unclaimed state (`UNCLAIMED`, where all cleanup lifecycle fields are null). Operators can then run bounded cleanup via `platform artifact-store cleanup [--batch-size N]`.
+
 ## Environment and Compose
 
 Replace `RATE_LIMIT` with `NUCLEI_RATE_LIMIT` and `CONCURRENCY` with explicit host/template/headless concurrency variables. Add `DATABASE_URL` and `REDIS_PASSWORD`. Compare the complete new `.env.example`; duplicated per-binary parsers no longer exist.

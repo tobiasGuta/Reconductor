@@ -171,3 +171,87 @@ func initializedLocal(t *testing.T) (string, *Local) {
 func completePutRequest() PutRequest {
 	return PutRequest{ProgramID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), ToolRunID: domain.NewID(), Type: "log", ContentType: "text/plain", Name: "ignored.log", Data: []byte("ok")}
 }
+
+func TestLocalDeleteContent(t *testing.T) {
+	_, store := initializedLocal(t)
+
+	// 1. Publish an artifact and successfully delete it
+	published, err := store.Put(context.Background(), completePutRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	location, err := store.pathForKey(*published.StorageKey, published.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(location); err != nil {
+		t.Fatalf("artifact not found before delete: %v", err)
+	}
+
+	outcome, err := store.DeleteContent(context.Background(), published.ID, *published.StorageKey)
+	if err != nil {
+		t.Fatalf("delete content error: %v", err)
+	}
+	if outcome != ContentRemoved {
+		t.Fatalf("outcome=%v want=%v", outcome, ContentRemoved)
+	}
+	if _, err := os.Stat(location); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("file still exists after delete: %v", err)
+	}
+
+	// 2. Second delete sees ENOENT with existing shard directory
+	outcome, err = store.DeleteContent(context.Background(), published.ID, *published.StorageKey)
+	if err != nil {
+		t.Fatalf("second delete error: %v", err)
+	}
+	if outcome != ContentAlreadyAbsent {
+		t.Fatalf("second outcome=%v want=%v", outcome, ContentAlreadyAbsent)
+	}
+
+	// 3. Delete non-existent artifact with missing shard directory
+	missingID := domain.ID("00000000-0000-4000-8000-000000009999")
+	missingKey, _ := StorageKeyFor(missingID)
+	shardDir := filepath.Dir(filepath.Join(store.root, "v1", string(missingID)[:2], string(missingID)))
+	_ = os.RemoveAll(shardDir) // ensure shard dir does not exist
+
+	outcome, err = store.DeleteContent(context.Background(), missingID, missingKey)
+	if err != nil {
+		t.Fatalf("delete with missing shard dir error: %v", err)
+	}
+	if outcome != ContentAlreadyAbsent {
+		t.Fatalf("outcome with missing shard dir=%v want=%v", outcome, ContentAlreadyAbsent)
+	}
+	if _, err := os.Stat(shardDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("missing shard directory was unexpectedly created")
+	}
+
+	// 4. ID / key mismatch rejected before filesystem I/O
+	otherID := domain.ID("00000000-0000-4000-8000-000000001111")
+	if _, err := store.DeleteContent(context.Background(), published.ID, "v1/11/00000000-0000-4000-8000-000000001111"); err == nil {
+		t.Fatal("mismatched ID/key was accepted")
+	}
+	if _, err := store.DeleteContent(context.Background(), otherID, *published.StorageKey); err == nil {
+		t.Fatal("mismatched otherID/key was accepted")
+	}
+
+	// 5. Unexpected entry type: target is a directory
+	dirID := domain.ID("00000000-0000-4000-8000-000000002222")
+	dirKey, _ := StorageKeyFor(dirID)
+	dirLoc, err := store.pathForKey(dirKey, dirID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dirLoc, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DeleteContent(context.Background(), dirID, dirKey); !errors.Is(err, ErrUnexpectedEntryType) {
+		t.Fatalf("directory target error=%v want ErrUnexpectedEntryType", err)
+	}
+
+	// 6. Context cancellation
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.DeleteContent(canceledCtx, published.ID, *published.StorageKey); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled context error=%v", err)
+	}
+}

@@ -16,7 +16,52 @@ The key contains no filename, extension, lineage, sensitivity, or user/provider 
 
 Rows that existed before migration 0016 remain version 0. Their `storage_location` is retained byte-for-byte, and they have no StoreID or storage key. They are historical records only and do not establish ownership of any configured store. After 0016, obsolete writers are incompatible: omitted version-1 ownership fields or an explicit new version-0 insert are rejected. Artifact addresses and store registrations are immutable, and Artifact metadata deletion is rejected.
 
-Automatic retention deletion is temporarily disabled. `POLICY_ARTIFACT_RETENTION`, `expires_at`, and `artifact_retention_applied` record policy and expiry assignment only. Expiry does not mean content or metadata deletion; bytes intentionally accumulate until a future tombstone-based cleanup design is implemented.
+Artifact Store Ownership Foundation Slice 2 introduces the Store-Scoped Tombstone Cleanup Protocol. Retention policy assignment (`POLICY_ARTIFACT_RETENTION`, `expires_at`, and `artifact_retention_applied`) stamps artifact expiration. Once expired (`expires_at <= statement_timestamp()`), physical payload deletion is performed via explicit operator cleanup without destroying database metadata.
+
+## Tombstone cleanup protocol
+
+Tombstone cleanup is explicit and scoped to one physical store:
+
+```powershell
+$env:ARTIFACT_STORE_ID = '<native-store-uuid>'
+go run ./cmd/platform artifact-store cleanup [--batch-size N]
+```
+
+`--batch-size` accepts values between 1 and 1000 (default 100). The command executes one bounded batch and exits, printing structured JSON results. Background daemon cleanup and cross-store reconciliation remain deferred.
+
+### State lifecycle and concurrency
+
+Migration 0017 adds a formal state graph enforced by 8 named CHECK constraints and the `artifacts_cleanup_transition_guard` trigger:
+
+- **Claiming**: Bounded batches are claimed with `ORDER BY expires_at ASC, id ASC LIMIT $2 FOR UPDATE OF a SKIP LOCKED` scoped strictly to `artifact_store_id`. Each claimed row receives an independently generated volatile token (`gen_random_uuid()`) and a claim timestamp. Stale claims (`cleanup_claimed_at <= statement_timestamp() - interval '15 minutes'`) become reclaimable automatically.
+- **Token fencing & finalization**: Deletion finalization is guarded by the row's claim token. On successful filesystem deletion, `content_deleted_at = statement_timestamp()` is stamped, claim fields are cleared, and an `artifact_content_deleted` audit event is atomically inserted.
+- **Claim token authority & physical deletion**: The cleanup claim token grants DATABASE work-distribution authority and finalization authority. It does NOT grant exclusive operating-system unlink authority, and it is NOT an OS filesystem mutex. Stale physical deletion can safely be duplicated across workers because:
+  - Artifact ID is immutable
+  - Canonical v1 StorageKey is immutable and bijective with Artifact ID
+  - Storage keys are never reused
+  - Expiry is immutable after cleanup lifecycle entry
+  - Deletion eligibility cannot later be revoked through expiry change
+  - Physical absence is idempotent
+  - Database finalization remains StoreID + claim-token fenced
+- **Transient failures & retry**: Transient filesystem I/O or directory durability sync failures transition the row to `RETRY_WAIT` with `cleanup_retry_after = statement_timestamp() + interval '5 minutes'` and record the error code (`filesystem_io` or `durability_sync`).
+- **Terminal quarantine**: Non-retryable filesystem entry-type safety errors (such as non-regular files, symlinks, directories, or unexpected entry types under the trusted root) transition the row to `QUARANTINED`, recording `cleanup_last_error_code` (`unexpected_entry_type`) and atomically emitting an `artifact_quarantined` audit event. Quarantined rows are terminal and require manual operator investigation.
+- **Invariant failures**: Artifact ID <-> canonical StorageKey mismatch is an infrastructure / invariant failure. On mismatch:
+  - filesystem I/O: NO
+  - retry: NO
+  - quarantine: NO
+  - finalization: NO
+  - command/coordinator: STOP
+  - claim: LEFT INTACT
+  Authoritative database ID/StorageKey invariant mismatch is not quarantined and not scheduled for retry; it immediately stops the command/coordinator with an invariant error without performing filesystem I/O, retry, quarantine, or finalization, leaving the claim intact for 15-minute stale reclamation or operator inspection.
+- **Tombstone metadata & evidence preservation**: `content_deleted_at IS NOT NULL` represents the physical tombstone. The artifact row is never deleted from PostgreSQL, guaranteeing that candidate findings, observations, change items, and audit events retain valid evidence references. Excluded from execution projections, tombstoned artifacts remain permanently queryable for audit integrity.
+
+### Filesystem deletion semantics
+
+Filesystem payload deletion uses `Local.DeleteContent`:
+- Validates canonical key format and lexical containment within the configured store root.
+- Rejects symlinks and directories via `os.Lstat` (`unexpected_entry_type`).
+- Handles already-absent files idempotently (`ENOENT`), distinguishing between missing file in an existing parent directory and missing parent directories by walking upward with `os.Lstat` inside the root without following symlinks or creating missing directories.
+- Flushes parent directory metadata changes up to the store root where supported by the operating system.
 
 ## Initialization and rollout
 

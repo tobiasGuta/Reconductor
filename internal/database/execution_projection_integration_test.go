@@ -564,6 +564,12 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 			TaskID: fixture.task.ID, WorkflowRunID: fixture.runID, StepRunID: fixture.steps["artifact"], ToolRunID: toolID,
 			Type: "expired-type-sentinel", ExpiresAt: timePointer(now.Add(-time.Hour)),
 		})
+		deletedAt := now.Add(-30 * time.Minute)
+		tombstonedExpiresAt := now.Add(-time.Hour)
+		insertProjectionArtifact(t, env, projectionArtifactSpec{
+			TaskID: fixture.task.ID, WorkflowRunID: fixture.runID, StepRunID: fixture.steps["artifact"], ToolRunID: toolID,
+			Type: "tombstoned-type-sentinel", ExpiresAt: &tombstonedExpiresAt, ContentDeletedAt: &deletedAt,
+		})
 
 		other := createRecoveryFixture(t, env, "projection-artifact-other", &running, domain.TaskRunning, []recoveryStepSpec{{name: "other", status: domain.StepRunning, started: true, attemptCount: 1}})
 		otherToolID := domain.NewID()
@@ -599,7 +605,7 @@ func TestExecutionProjectionEvidenceChildrenIntegration(t *testing.T) {
 		for _, secret := range []string{
 			"artifact-tool-arguments-sentinel", "artifact-tool-environment-sentinel",
 			*visibleAddress.StorageKey, *contradictoryAddress.StorageKey,
-			"sensitive-type-sentinel", "expired-type-sentinel",
+			"sensitive-type-sentinel", "expired-type-sentinel", "tombstoned-type-sentinel",
 		} {
 			if strings.Contains(string(encoded), secret) {
 				t.Fatalf("projection leaked %q: %s", secret, encoded)
@@ -1320,14 +1326,15 @@ func insertProjectionApproval(t *testing.T, env recoveryTestEnvironment, stepID,
 }
 
 type projectionArtifactSpec struct {
-	TaskID        domain.ID
-	WorkflowRunID domain.ID
-	StepRunID     domain.ID
-	ToolRunID     domain.ID
-	Type          string
-	CreatedAt     *time.Time
-	ExpiresAt     *time.Time
-	Sensitive     bool
+	TaskID           domain.ID
+	WorkflowRunID    domain.ID
+	StepRunID        domain.ID
+	ToolRunID        domain.ID
+	Type             string
+	CreatedAt        *time.Time
+	ExpiresAt        *time.Time
+	ContentDeletedAt *time.Time
+	Sensitive        bool
 }
 
 func insertProjectionArtifact(t *testing.T, env recoveryTestEnvironment, spec projectionArtifactSpec) domain.ID {
@@ -1342,8 +1349,8 @@ func insertProjectionArtifact(t *testing.T, env recoveryTestEnvironment, spec pr
 	if spec.CreatedAt != nil {
 		createdAt = *spec.CreatedAt
 	}
-	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,addressing_version,artifact_store_id,storage_key,created_at,expires_at,redaction_state,sensitive)
-		VALUES($1,$2,$3,$4,$5,$6,'application/json',2,$7,$8,$9,$10,$11,$12,$13,$14)`, id, spec.TaskID, spec.WorkflowRunID, spec.StepRunID, spec.ToolRunID, artifactType, "sha-"+string(id), address.AddressingVersion, address.ArtifactStoreID, address.StorageKey, createdAt, spec.ExpiresAt, map[bool]string{true: "sensitive-unredacted", false: "redacted"}[spec.Sensitive], spec.Sensitive); err != nil {
+	if _, err := env.store.Pool.Exec(env.ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,addressing_version,artifact_store_id,storage_key,created_at,expires_at,redaction_state,sensitive,content_deleted_at)
+		VALUES($1,$2,$3,$4,$5,$6,'application/json',2,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, id, spec.TaskID, spec.WorkflowRunID, spec.StepRunID, spec.ToolRunID, artifactType, "sha-"+string(id), address.AddressingVersion, address.ArtifactStoreID, address.StorageKey, createdAt, spec.ExpiresAt, map[bool]string{true: "sensitive-unredacted", false: "redacted"}[spec.Sensitive], spec.Sensitive, spec.ContentDeletedAt); err != nil {
 		t.Fatal(err)
 	}
 	return id

@@ -115,32 +115,83 @@ type artifactStoreInitOutput struct {
 }
 
 func artifactStoreCommand(ctx context.Context, cfg config.Config, args []string) error {
-	if len(args) == 0 || args[0] != "init" {
-		return fmt.Errorf("artifact-store requires init")
+	return artifactStoreCommandWithCleanup(ctx, cfg, args, cleanupArtifactStore)
+}
+
+func artifactStoreCommandWithCleanup(ctx context.Context, cfg config.Config, args []string, cleanup func(context.Context, config.Config, domain.ID, int) (artifact.CleanupResult, error)) error {
+	if len(args) == 0 {
+		return fmt.Errorf("artifact-store requires init or cleanup")
 	}
-	fs := flag.NewFlagSet("artifact-store init", flag.ContinueOnError)
-	allowNonempty := fs.Bool("allow-nonempty-root", false, "acknowledge initialization of a nonempty unmarked legacy root")
-	resumeRegistration := fs.Bool("resume-registration", false, "resume database registration from an existing exact marker")
-	if err := fs.Parse(args[1:]); err != nil {
-		return err
+	switch args[0] {
+	case "init":
+		fs := flag.NewFlagSet("artifact-store init", flag.ContinueOnError)
+		allowNonempty := fs.Bool("allow-nonempty-root", false, "acknowledge initialization of a nonempty unmarked legacy root")
+		resumeRegistration := fs.Bool("resume-registration", false, "resume database registration from an existing exact marker")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return fmt.Errorf("artifact-store init accepts no positional arguments")
+		}
+		storeID, err := cfg.ArtifactStorage.RequiredStoreID()
+		if err != nil {
+			return err
+		}
+		store, err := readyStore(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		result, err := artifact.InitializeLocal(ctx, cfg.ArtifactStorage.Root, storeID, store, artifact.InitializationOptions{AllowNonemptyRoot: *allowNonempty, ResumeRegistration: *resumeRegistration})
+		if err != nil {
+			return err
+		}
+		return printJSON(artifactStoreInitOutput{StoreID: result.Store.ID, BackendKind: result.Store.BackendKind, MarkerFormat: result.Store.MarkerFormat, MarkerVersion: result.Store.MarkerVersion, Status: result.Status})
+
+	case "cleanup":
+		fs := flag.NewFlagSet("artifact-store cleanup", flag.ContinueOnError)
+		batchSize := fs.Int("batch-size", 100, "maximum number of expired artifacts to claim and clean in this batch (1..1000)")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return fmt.Errorf("artifact-store cleanup accepts no positional arguments")
+		}
+		if *batchSize < 1 || *batchSize > 1000 {
+			return fmt.Errorf("batch-size %d must be between 1 and 1000", *batchSize)
+		}
+		storeID, err := cfg.ArtifactStorage.RequiredStoreID()
+		if err != nil {
+			return err
+		}
+		result, err := cleanup(ctx, cfg, storeID, *batchSize)
+		if err != nil {
+			return err
+		}
+		return printJSON(result)
+
+	default:
+		return fmt.Errorf("artifact-store requires init or cleanup")
 	}
-	if fs.NArg() != 0 {
-		return fmt.Errorf("artifact-store init accepts no positional arguments")
-	}
-	storeID, err := cfg.ArtifactStorage.RequiredStoreID()
-	if err != nil {
-		return err
-	}
+}
+
+func cleanupArtifactStore(ctx context.Context, cfg config.Config, storeID domain.ID, batchSize int) (artifact.CleanupResult, error) {
 	store, err := readyStore(ctx, cfg)
 	if err != nil {
-		return err
+		return artifact.CleanupResult{}, err
 	}
 	defer store.Close()
-	result, err := artifact.InitializeLocal(ctx, cfg.ArtifactStorage.Root, storeID, store, artifact.InitializationOptions{AllowNonemptyRoot: *allowNonempty, ResumeRegistration: *resumeRegistration})
-	if err != nil {
-		return err
+	if err := store.RequireCurrentSchema(ctx); err != nil {
+		return artifact.CleanupResult{}, err
 	}
-	return printJSON(artifactStoreInitOutput{StoreID: result.Store.ID, BackendKind: result.Store.BackendKind, MarkerFormat: result.Store.MarkerFormat, MarkerVersion: result.Store.MarkerVersion, Status: result.Status})
+	localStore, err := artifact.OpenLocal(ctx, cfg.ArtifactStorage.Root, storeID, store, nil)
+	if err != nil {
+		return artifact.CleanupResult{}, err
+	}
+	if localStore.StoreID() != storeID {
+		return artifact.CleanupResult{}, fmt.Errorf("local artifact store ID does not match configured store")
+	}
+	return artifact.CleanupBatch(ctx, store, localStore, batchSize)
 }
 
 func consoleCommand(ctx context.Context, cfg config.Config, args []string) error {

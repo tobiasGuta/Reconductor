@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -116,6 +117,99 @@ func (l *Local) Put(_ context.Context, request PutRequest) (domain.Artifact, err
 		RedactionState:    state,
 		Sensitive:         request.Sensitive,
 	}, nil
+}
+
+func (l *Local) StoreID() domain.ID {
+	if l == nil {
+		return ""
+	}
+	return l.storeID
+}
+
+func (l *Local) DeleteContent(ctx context.Context, id domain.ID, storageKey string) (ContentDeletionOutcome, error) {
+	if l == nil || !l.initialized || l.root == "" || l.storeID == "" {
+		return "", fmt.Errorf("artifact store is not initialized")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if _, err := domain.ParseID(string(id)); err != nil {
+		return "", fmt.Errorf("artifact ID is not canonical: %w", err)
+	}
+	if err := ValidateStorageKey(storageKey, id); err != nil {
+		return "", fmt.Errorf("artifact storage key is not canonical for its identity: %w", err)
+	}
+
+	location, err := l.pathForKey(storageKey, id)
+	if err != nil {
+		return "", err
+	}
+
+	info, err := os.Lstat(location)
+	switch {
+	case err == nil:
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("%w: entry at %s is not a regular file", ErrUnexpectedEntryType, storageKey)
+		}
+		if err := os.Remove(location); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return l.syncExistingAncestorForAbsent(filepath.Dir(location))
+			}
+			return "", fmt.Errorf("remove artifact file: %w", err)
+		}
+		if err := syncDirectoryChain(filepath.Dir(location), l.root); err != nil {
+			return "", &DurabilitySyncError{Err: fmt.Errorf("sync directory chain after delete: %w", err)}
+		}
+		return ContentRemoved, nil
+
+	case errors.Is(err, os.ErrNotExist):
+		return l.syncExistingAncestorForAbsent(filepath.Dir(location))
+
+	default:
+		return "", fmt.Errorf("inspect artifact file: %w", err)
+	}
+}
+
+func (l *Local) syncExistingAncestorForAbsent(shardDir string) (ContentDeletionOutcome, error) {
+	ancestor, err := nearestExistingAncestorLstat(shardDir, l.root)
+	if err != nil {
+		return "", err
+	}
+	if err := syncDirectoryChain(ancestor, l.root); err != nil {
+		return "", &DurabilitySyncError{Err: fmt.Errorf("sync directory chain for absent artifact: %w", err)}
+	}
+	return ContentAlreadyAbsent, nil
+}
+
+func nearestExistingAncestorLstat(path, root string) (string, error) {
+	current, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	for {
+		if !within(absRoot, current) && filepath.Clean(current) != filepath.Clean(absRoot) {
+			return "", fmt.Errorf("ancestor search left storage root")
+		}
+		info, statErr := os.Lstat(current)
+		switch {
+		case statErr == nil:
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("%w: ancestor %s is not a regular directory", ErrUnexpectedEntryType, current)
+			}
+			return current, nil
+		case !errors.Is(statErr, os.ErrNotExist):
+			return "", statErr
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("no existing directory ancestor within root")
+		}
+		current = parent
+	}
 }
 
 func (l *Local) pathForKey(key string, id domain.ID) (string, error) {

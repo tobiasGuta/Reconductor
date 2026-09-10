@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
@@ -61,6 +62,111 @@ func TestArtifactStoreInitCLIHasOnlyFrozenFlagsAndRequiresStoreID(t *testing.T) 
 	}
 	if strings.Contains(string(encoded), "nonce") {
 		t.Fatalf("successful output exposed nonce field: %s", encoded)
+	}
+}
+
+func TestArtifactStoreCleanupCLIValidatesBatchSizeAndStoreID(t *testing.T) {
+	cfg := config.Config{ArtifactStorage: config.ArtifactStorage{Driver: "local", Root: t.TempDir()}}
+	if err := artifactStoreCommand(context.Background(), cfg, []string{"cleanup"}); err == nil || !strings.Contains(err.Error(), "ARTIFACT_STORE_ID is required") {
+		t.Fatalf("missing StoreID error=%v", err)
+	}
+	if err := artifactStoreCommand(context.Background(), cfg, []string{"cleanup", "unexpected"}); err == nil || !strings.Contains(err.Error(), "accepts no positional arguments") {
+		t.Fatalf("positional argument error=%v", err)
+	}
+	if err := artifactStoreCommand(context.Background(), cfg, []string{"cleanup", "--batch-size", "0"}); err == nil || !strings.Contains(err.Error(), "between 1 and 1000") {
+		t.Fatalf("zero batch size error=%v", err)
+	}
+	if err := artifactStoreCommand(context.Background(), cfg, []string{"cleanup", "--batch-size", "-5"}); err == nil || !strings.Contains(err.Error(), "between 1 and 1000") {
+		t.Fatalf("negative batch size error=%v", err)
+	}
+	if err := artifactStoreCommand(context.Background(), cfg, []string{"cleanup", "--batch-size", "1001"}); err == nil || !strings.Contains(err.Error(), "between 1 and 1000") {
+		t.Fatalf("oversized batch size error=%v", err)
+	}
+	for _, flag := range []string{"--unfrozen-flag", "--interval", "--once", "--store-id"} {
+		if err := artifactStoreCommand(context.Background(), cfg, []string{"cleanup", flag}); err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+			t.Fatalf("unfrozen cleanup flag %s: %v", flag, err)
+		}
+	}
+
+	result := artifact.CleanupResult{
+		ArtifactStoreID: "00000000-0000-4000-8000-000000000001",
+		Claimed:         3,
+		Removed:         1,
+		AlreadyAbsent:   1,
+		RetryScheduled:  0,
+		LostClaim:       0,
+		Quarantined: []artifact.QuarantinedArtifact{
+			{ArtifactID: "00000000-0000-4000-8000-000000000002", ErrorCode: "unexpected_entry_type"},
+		},
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"storage_key", "path", "sha256", "size", "content"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("cleanup output exposed forbidden field %q: %s", forbidden, encoded)
+		}
+	}
+	emptyResult := artifact.CleanupResult{
+		ArtifactStoreID: "00000000-0000-4000-8000-000000000001",
+		Quarantined:     []artifact.QuarantinedArtifact{},
+	}
+	emptyEncoded, err := json.Marshal(emptyResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(emptyEncoded), `"quarantined": []`) && !strings.Contains(string(emptyEncoded), `"quarantined":[]`) {
+		t.Fatalf("empty quarantined field did not serialize as empty array: %s", emptyEncoded)
+	}
+}
+
+func TestArtifactStoreCleanupCLIOneBatchAndConfiguredAuthority(t *testing.T) {
+	const storeID = "00000000-0000-4000-8000-000000000001"
+	const artifactID = "00000000-0000-4000-8000-000000000002"
+	for _, tc := range []struct {
+		name string
+		args []string
+		batch int
+	}{
+		{"default", []string{"cleanup"}, 100},
+		{"minimum", []string{"cleanup", "--batch-size", "1"}, 1},
+		{"maximum", []string{"cleanup", "--batch-size", "1000"}, 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{ArtifactStorage: config.ArtifactStorage{StoreID: storeID}}
+			calls := 0
+			out, err := captureStdout(func() error {
+				return artifactStoreCommandWithCleanup(context.Background(), cfg, tc.args, func(_ context.Context, gotCfg config.Config, gotID domain.ID, batch int) (artifact.CleanupResult, error) {
+					calls++
+					if calls != 1 || gotID != storeID || gotCfg.ArtifactStorage.StoreID != storeID || batch != tc.batch {
+						t.Fatalf("dispatch calls=%d id=%s batch=%d", calls, gotID, batch)
+					}
+					// A full batch must still return without requesting another batch.
+					return artifact.CleanupResult{ArtifactStoreID: gotID, Claimed: batch, Removed: batch-1, Quarantined: []artifact.QuarantinedArtifact{{ArtifactID: artifactID, ErrorCode: "unexpected_entry_type"}}}, nil
+				})
+			})
+			if err != nil || calls != 1 { t.Fatalf("calls=%d err=%v", calls, err) }
+			var result map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(out), &result); err != nil { t.Fatal(err) }
+			if len(result) != 7 { t.Fatalf("unexpected output fields: %s", out) }
+			for _, key := range []string{"artifact_store_id", "claimed", "removed", "already_absent", "retry_scheduled", "lost_claim", "quarantined"} {
+				if _, ok := result[key]; !ok { t.Fatalf("missing %s: %s", key, out) }
+			}
+			var quarantined []map[string]string
+			if err := json.Unmarshal(result["quarantined"], &quarantined); err != nil { t.Fatal(err) }
+			if len(quarantined) != 1 || len(quarantined[0]) != 2 || quarantined[0]["artifact_id"] != artifactID || quarantined[0]["error_code"] != "unexpected_entry_type" {
+				t.Fatalf("quarantine output: %s", out)
+			}
+		})
+	}
+	for _, invalidID := range []string{"", "not-a-uuid", "00000000-0000-4000-8000-00000000000A"} {
+		cfg := config.Config{ArtifactStorage: config.ArtifactStorage{StoreID: invalidID}}
+		err := artifactStoreCommandWithCleanup(context.Background(), cfg, []string{"cleanup"}, func(context.Context, config.Config, domain.ID, int) (artifact.CleanupResult, error) {
+			t.Fatal("cleanup called with invalid configured identity")
+			return artifact.CleanupResult{}, nil
+		})
+		if err == nil { t.Fatal("invalid configured identity accepted") }
 	}
 }
 
