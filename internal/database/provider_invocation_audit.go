@@ -246,6 +246,8 @@ func providerTerminalEvent(outcome capability.ProviderInvocationOutcome) (string
 		return "provider_invocation_failed", "registered provider invocation returned a failure", nil
 	case capability.ProviderInvocationCancelled:
 		return "provider_invocation_cancelled", "registered provider invocation returned after cancellation", nil
+	case capability.ProviderInvocationTimedOut:
+		return "provider_invocation_timed_out", "registered provider invocation timed out", nil
 	default:
 		return "", "", fmt.Errorf("unsupported provider invocation outcome %q", outcome)
 	}

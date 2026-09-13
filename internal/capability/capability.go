@@ -79,7 +79,17 @@ const (
 	ProviderInvocationSucceeded ProviderInvocationOutcome = "succeeded"
 	ProviderInvocationFailed    ProviderInvocationOutcome = "failed"
 	ProviderInvocationCancelled ProviderInvocationOutcome = "cancelled"
+	ProviderInvocationTimedOut  ProviderInvocationOutcome = "timeout"
 )
+
+func (o ProviderInvocationOutcome) Validate() error {
+	switch o {
+	case ProviderInvocationSucceeded, ProviderInvocationFailed, ProviderInvocationCancelled, ProviderInvocationTimedOut:
+		return nil
+	default:
+		return fmt.Errorf("invalid provider invocation outcome %q", o)
+	}
+}
 
 type ProviderInvocationTerminalRecord struct {
 	ProviderAttemptID domain.ID
