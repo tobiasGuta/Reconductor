@@ -304,6 +304,22 @@ func TestArtifactPublicationTimestampShapesMatchSQL(t *testing.T) {
 	}
 }
 
+func TestArtifactPublicationCleanupDeletionChronologyMatchesSQL(t *testing.T) {
+	equal := validArtifactPublication(PublicationAbandoned)
+	deletedAt := *equal.AbandonedAt
+	equal.ContentDeletedAt = &deletedAt
+	if err := equal.Validate(); err != nil {
+		t.Fatalf("content deletion at abandonment was rejected: %v", err)
+	}
+
+	before := equal
+	deletedBeforeAbandonment := deletedAt.Add(-time.Nanosecond)
+	before.ContentDeletedAt = &deletedBeforeAbandonment
+	if err := before.Validate(); err == nil {
+		t.Fatal("content deletion before abandonment was accepted")
+	}
+}
+
 func TestWaveRenewalPairing(t *testing.T) {
 	renewalID := NewID()
 	base := WorkflowAttemptWave{

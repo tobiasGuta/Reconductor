@@ -834,6 +834,9 @@ func validatePublicationCleanupShape(p ArtifactPublication) error {
 		}
 		return nil
 	}
+	if p.ContentDeletedAt != nil && p.AbandonedAt != nil && p.ContentDeletedAt.Before(*p.AbandonedAt) {
+		return fmt.Errorf("publication content deletion timestamp precedes abandonment")
+	}
 	if (p.CleanupClaimToken == nil) != (p.CleanupClaimedAt == nil) {
 		return fmt.Errorf("publication cleanup claim token and timestamp must be paired")
 	}
