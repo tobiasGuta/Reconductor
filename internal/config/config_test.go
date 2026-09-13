@@ -41,6 +41,41 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+func TestStepAttemptLeaseTimeout(t *testing.T) {
+	base := map[string]string{"DATABASE_URL": "x", "REDIS_ADDR": "localhost:6379"}
+	load := func() (Config, error) {
+		return LoadWith(func(key string) string { return base[key] })
+	}
+
+	cfg, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StepAttemptLeaseTimeout != 2*time.Minute {
+		t.Fatalf("default step attempt lease=%s", cfg.StepAttemptLeaseTimeout)
+	}
+
+	for _, test := range []struct {
+		value string
+		valid bool
+	}{
+		{value: "3s", valid: true},
+		{value: "15m", valid: true},
+		{value: "2999ms", valid: false},
+		{value: "15m1ms", valid: false},
+		{value: "not-a-duration", valid: false},
+	} {
+		base["STEP_ATTEMPT_LEASE_TIMEOUT"] = test.value
+		cfg, err = load()
+		if test.valid && (err != nil || cfg.StepAttemptLeaseTimeout <= 0) {
+			t.Fatalf("lease %q rejected: config=%#v error=%v", test.value, cfg, err)
+		}
+		if !test.valid && err == nil {
+			t.Fatalf("lease %q unexpectedly accepted", test.value)
+		}
+	}
+}
+
 func TestArtifactStoreIDIsCommandScopedAndDockerVariableIsIgnored(t *testing.T) {
 	env := map[string]string{
 		"DATABASE_URL":             "postgres://integration",

@@ -14,17 +14,18 @@ import (
 )
 
 type Config struct {
-	Database        Database
-	Redis           Redis
-	Scope           Scope
-	Tools           Tools
-	Recon           Recon
-	Worker          Worker
-	Scheduler       Scheduler
-	Nuclei          Nuclei
-	ArtifactStorage ArtifactStorage
-	Policy          Policy
-	Logging         Logging
+	Database                Database
+	Redis                   Redis
+	Scope                   Scope
+	Tools                   Tools
+	Recon                   Recon
+	Worker                  Worker
+	Scheduler               Scheduler
+	Nuclei                  Nuclei
+	ArtifactStorage         ArtifactStorage
+	Policy                  Policy
+	Logging                 Logging
+	StepAttemptLeaseTimeout time.Duration
 }
 
 type Database struct{ URL string }
@@ -119,17 +120,18 @@ func LoadWith(get Lookup) (Config, error) {
 
 func loadWith(get Lookup, requireDatabase bool) (Config, error) {
 	c := Config{
-		Database:        Database{URL: get("DATABASE_URL")},
-		Redis:           Redis{Address: value(get, "REDIS_ADDR", "localhost:6379"), Username: get("REDIS_USERNAME"), Password: get("REDIS_PASSWORD"), DB: integer(get, "REDIS_DB", 0), TLS: boolean(get, "REDIS_TLS", false)},
-		Scope:           Scope{Root: strings.TrimSpace(get("SCOPE_ROOT"))},
-		Tools:           Tools{Subfinder: value(get, "SUBFINDER_EXECUTABLE", "subfinder"), Chaos: value(get, "CHAOS_EXECUTABLE", "chaos"), DNSx: value(get, "DNSX_EXECUTABLE", "dnsx"), Naabu: value(get, "NAABU_EXECUTABLE", "naabu"), HTTPX: value(get, "HTTPX_EXECUTABLE", "httpx"), Katana: value(get, "KATANA_EXECUTABLE", "katana"), GAU: value(get, "GAU_EXECUTABLE", "gau"), Nuclei: value(get, "NUCLEI_EXECUTABLE", "nuclei")},
-		Recon:           Recon{Pipeline: value(get, "RECON_PIPELINE", "sdnhkga"), Headless: boolean(get, "RECON_HEADLESS", false), ChaosKey: get("CHAOS_KEY"), Timeout: duration(get, "RECON_TIMEOUT", 15*time.Minute), RateLimit: integer(get, "RECON_RATE_LIMIT", 75), Concurrency: integer(get, "RECON_CONCURRENCY", 20), ProviderUpdate: boolean(get, "RECON_PROVIDER_UPDATE", false)},
-		Worker:          Worker{ConsumerGroup: value(get, "WORKER_CONSUMER_GROUP", "capability-workers"), ConsumerName: value(get, "WORKER_CONSUMER_NAME", hostname()), PoolSize: integer(get, "WORKER_POOL_SIZE", 4), LeaseTimeout: duration(get, "WORKER_LEASE_TIMEOUT", 2*time.Minute), ReadBlock: duration(get, "WORKER_READ_BLOCK", 5*time.Second), MaxRetries: integer(get, "WORKER_MAX_RETRIES", 3), RetryBase: duration(get, "WORKER_RETRY_BASE", 2*time.Second)},
-		Scheduler:       Scheduler{PollInterval: duration(get, "SCHEDULER_POLL_INTERVAL", 15*time.Second), MaxConcurrentRuns: integer(get, "SCHEDULER_MAX_CONCURRENT_RUNS", 1), LeaseTimeout: duration(get, "SCHEDULER_LEASE_TIMEOUT", 2*time.Minute), WorkflowStateRoot: value(get, "WORKFLOW_STATE_ROOT", "state/runs")},
-		Nuclei:          Nuclei{RateLimit: integer(get, "NUCLEI_RATE_LIMIT", 50), HostConcurrency: integer(get, "NUCLEI_HOST_CONCURRENCY", 10), TemplateConcurrency: integer(get, "NUCLEI_TEMPLATE_CONCURRENCY", 10), HeadlessConcurrency: integer(get, "NUCLEI_HEADLESS_CONCURRENCY", 2), Timeout: duration(get, "NUCLEI_TIMEOUT", 10*time.Minute), Severity: csv(get, "NUCLEI_SEVERITY", "low,medium,high,critical"), IncludeTags: csv(get, "NUCLEI_INCLUDE_TAGS", "cve,exposure,misconfig"), ExcludeTags: csv(get, "NUCLEI_EXCLUDE_TAGS", "dos,fuzz,bruteforce,intrusive"), TemplateDirectory: get("NUCLEI_TEMPLATE_DIR"), UpdateTemplates: boolean(get, "NUCLEI_UPDATE_TEMPLATES", false)},
-		ArtifactStorage: ArtifactStorage{Driver: value(get, "ARTIFACT_DRIVER", "local"), Root: value(get, "ARTIFACT_ROOT", "artifacts"), StoreID: strings.TrimSpace(get("ARTIFACT_STORE_ID"))},
-		Policy:          Policy{DefaultRateLimit: integer(get, "POLICY_RATE_LIMIT", 50), DefaultConcurrency: integer(get, "POLICY_CONCURRENCY", 10), DefaultProviderConcurrency: integer(get, "POLICY_PROVIDER_CONCURRENCY", 2), DefaultHostConcurrency: integer(get, "POLICY_HOST_CONCURRENCY", 1), MaxPayloadBytes: int64(integer(get, "POLICY_MAX_PAYLOAD_BYTES", 1048576)), AllowedMethods: csv(get, "POLICY_ALLOWED_METHODS", "GET,HEAD,OPTIONS"), FollowRedirects: boolean(get, "POLICY_FOLLOW_REDIRECTS", false), ScanWindows: csv(get, "POLICY_SCAN_WINDOWS", ""), AuthenticationUsage: boolean(get, "POLICY_AUTHENTICATION_USAGE", false), DirectoryFuzzing: boolean(get, "POLICY_DIRECTORY_FUZZING", false), CrossOrigin: boolean(get, "POLICY_CROSS_ORIGIN", false), IntrusiveChecks: boolean(get, "POLICY_INTRUSIVE_CHECKS", false), ArtifactRetention: duration(get, "POLICY_ARTIFACT_RETENTION", 720*time.Hour)},
-		Logging:         Logging{Level: value(get, "LOG_LEVEL", "info"), SecretNames: csv(get, "REDACT_SECRET_NAMES", "")},
+		Database:                Database{URL: get("DATABASE_URL")},
+		Redis:                   Redis{Address: value(get, "REDIS_ADDR", "localhost:6379"), Username: get("REDIS_USERNAME"), Password: get("REDIS_PASSWORD"), DB: integer(get, "REDIS_DB", 0), TLS: boolean(get, "REDIS_TLS", false)},
+		Scope:                   Scope{Root: strings.TrimSpace(get("SCOPE_ROOT"))},
+		Tools:                   Tools{Subfinder: value(get, "SUBFINDER_EXECUTABLE", "subfinder"), Chaos: value(get, "CHAOS_EXECUTABLE", "chaos"), DNSx: value(get, "DNSX_EXECUTABLE", "dnsx"), Naabu: value(get, "NAABU_EXECUTABLE", "naabu"), HTTPX: value(get, "HTTPX_EXECUTABLE", "httpx"), Katana: value(get, "KATANA_EXECUTABLE", "katana"), GAU: value(get, "GAU_EXECUTABLE", "gau"), Nuclei: value(get, "NUCLEI_EXECUTABLE", "nuclei")},
+		Recon:                   Recon{Pipeline: value(get, "RECON_PIPELINE", "sdnhkga"), Headless: boolean(get, "RECON_HEADLESS", false), ChaosKey: get("CHAOS_KEY"), Timeout: duration(get, "RECON_TIMEOUT", 15*time.Minute), RateLimit: integer(get, "RECON_RATE_LIMIT", 75), Concurrency: integer(get, "RECON_CONCURRENCY", 20), ProviderUpdate: boolean(get, "RECON_PROVIDER_UPDATE", false)},
+		Worker:                  Worker{ConsumerGroup: value(get, "WORKER_CONSUMER_GROUP", "capability-workers"), ConsumerName: value(get, "WORKER_CONSUMER_NAME", hostname()), PoolSize: integer(get, "WORKER_POOL_SIZE", 4), LeaseTimeout: duration(get, "WORKER_LEASE_TIMEOUT", 2*time.Minute), ReadBlock: duration(get, "WORKER_READ_BLOCK", 5*time.Second), MaxRetries: integer(get, "WORKER_MAX_RETRIES", 3), RetryBase: duration(get, "WORKER_RETRY_BASE", 2*time.Second)},
+		Scheduler:               Scheduler{PollInterval: duration(get, "SCHEDULER_POLL_INTERVAL", 15*time.Second), MaxConcurrentRuns: integer(get, "SCHEDULER_MAX_CONCURRENT_RUNS", 1), LeaseTimeout: duration(get, "SCHEDULER_LEASE_TIMEOUT", 2*time.Minute), WorkflowStateRoot: value(get, "WORKFLOW_STATE_ROOT", "state/runs")},
+		Nuclei:                  Nuclei{RateLimit: integer(get, "NUCLEI_RATE_LIMIT", 50), HostConcurrency: integer(get, "NUCLEI_HOST_CONCURRENCY", 10), TemplateConcurrency: integer(get, "NUCLEI_TEMPLATE_CONCURRENCY", 10), HeadlessConcurrency: integer(get, "NUCLEI_HEADLESS_CONCURRENCY", 2), Timeout: duration(get, "NUCLEI_TIMEOUT", 10*time.Minute), Severity: csv(get, "NUCLEI_SEVERITY", "low,medium,high,critical"), IncludeTags: csv(get, "NUCLEI_INCLUDE_TAGS", "cve,exposure,misconfig"), ExcludeTags: csv(get, "NUCLEI_EXCLUDE_TAGS", "dos,fuzz,bruteforce,intrusive"), TemplateDirectory: get("NUCLEI_TEMPLATE_DIR"), UpdateTemplates: boolean(get, "NUCLEI_UPDATE_TEMPLATES", false)},
+		ArtifactStorage:         ArtifactStorage{Driver: value(get, "ARTIFACT_DRIVER", "local"), Root: value(get, "ARTIFACT_ROOT", "artifacts"), StoreID: strings.TrimSpace(get("ARTIFACT_STORE_ID"))},
+		Policy:                  Policy{DefaultRateLimit: integer(get, "POLICY_RATE_LIMIT", 50), DefaultConcurrency: integer(get, "POLICY_CONCURRENCY", 10), DefaultProviderConcurrency: integer(get, "POLICY_PROVIDER_CONCURRENCY", 2), DefaultHostConcurrency: integer(get, "POLICY_HOST_CONCURRENCY", 1), MaxPayloadBytes: int64(integer(get, "POLICY_MAX_PAYLOAD_BYTES", 1048576)), AllowedMethods: csv(get, "POLICY_ALLOWED_METHODS", "GET,HEAD,OPTIONS"), FollowRedirects: boolean(get, "POLICY_FOLLOW_REDIRECTS", false), ScanWindows: csv(get, "POLICY_SCAN_WINDOWS", ""), AuthenticationUsage: boolean(get, "POLICY_AUTHENTICATION_USAGE", false), DirectoryFuzzing: boolean(get, "POLICY_DIRECTORY_FUZZING", false), CrossOrigin: boolean(get, "POLICY_CROSS_ORIGIN", false), IntrusiveChecks: boolean(get, "POLICY_INTRUSIVE_CHECKS", false), ArtifactRetention: duration(get, "POLICY_ARTIFACT_RETENTION", 720*time.Hour)},
+		Logging:                 Logging{Level: value(get, "LOG_LEVEL", "info"), SecretNames: csv(get, "REDACT_SECRET_NAMES", "")},
+		StepAttemptLeaseTimeout: duration(get, "STEP_ATTEMPT_LEASE_TIMEOUT", domain.StepAttemptLeaseDefault),
 	}
 	var parseErrs []error
 	for _, key := range []string{"REDIS_TLS", "RECON_HEADLESS", "RECON_PROVIDER_UPDATE", "NUCLEI_UPDATE_TEMPLATES", "POLICY_FOLLOW_REDIRECTS", "POLICY_AUTHENTICATION_USAGE", "POLICY_DIRECTORY_FUZZING", "POLICY_CROSS_ORIGIN", "POLICY_INTRUSIVE_CHECKS"} {
@@ -139,7 +141,7 @@ func loadWith(get Lookup, requireDatabase bool) (Config, error) {
 			}
 		}
 	}
-	for _, key := range []string{"RECON_TIMEOUT", "WORKER_LEASE_TIMEOUT", "WORKER_READ_BLOCK", "WORKER_RETRY_BASE", "SCHEDULER_POLL_INTERVAL", "SCHEDULER_LEASE_TIMEOUT", "NUCLEI_TIMEOUT", "POLICY_ARTIFACT_RETENTION"} {
+	for _, key := range []string{"RECON_TIMEOUT", "WORKER_LEASE_TIMEOUT", "WORKER_READ_BLOCK", "WORKER_RETRY_BASE", "SCHEDULER_POLL_INTERVAL", "SCHEDULER_LEASE_TIMEOUT", "NUCLEI_TIMEOUT", "POLICY_ARTIFACT_RETENTION", "STEP_ATTEMPT_LEASE_TIMEOUT"} {
 		if v := strings.TrimSpace(get(key)); v != "" {
 			if _, err := time.ParseDuration(v); err != nil {
 				parseErrs = append(parseErrs, fmt.Errorf("%s must be a Go duration", key))
@@ -189,6 +191,9 @@ func (c Config) validate(requireDatabase bool) error {
 	}
 	if c.Scheduler.MaxConcurrentRuns < 1 {
 		errs = append(errs, errors.New("SCHEDULER_MAX_CONCURRENT_RUNS must be positive"))
+	}
+	if c.StepAttemptLeaseTimeout < domain.StepAttemptLeaseMinimum || c.StepAttemptLeaseTimeout > domain.StepAttemptLeaseMaximum {
+		errs = append(errs, fmt.Errorf("STEP_ATTEMPT_LEASE_TIMEOUT must be between %s and %s inclusive", domain.StepAttemptLeaseMinimum, domain.StepAttemptLeaseMaximum))
 	}
 	if strings.TrimSpace(c.Scheduler.WorkflowStateRoot) == "" {
 		errs = append(errs, errors.New("WORKFLOW_STATE_ROOT is required"))

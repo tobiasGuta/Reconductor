@@ -95,10 +95,8 @@ func TestArtifactCleanupMigration(t *testing.T) {
 		}
 	}
 
-	// Step 5: Apply migration 0017
-	if err := Up(ctx, pool); err != nil {
-		t.Fatalf("apply migration 0017: %v", err)
-	}
+	// Step 5: Apply migration 0017 without pulling later independent schema slices into this test.
+	applyMigration(t, ctx, pool, 17, "0017_artifact_store_tombstone_cleanup.sql")
 
 	// Frontier and ordering verification
 	var maxVersion int
