@@ -5,7 +5,26 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tobiasGuta/Reconductor/internal/config"
 )
+
+func TestProviderVersionArgsHonorUpdatePolicy(t *testing.T) {
+	for name, test := range map[string]struct {
+		enabled bool
+		want    string
+	}{
+		"disabled": {want: "-version -duc"},
+		"enabled":  {enabled: true, want: "-version"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := config.Config{Recon: config.Recon{ProviderUpdate: test.enabled}}
+			if got := strings.Join(providerVersionArgs(cfg), " "); got != test.want {
+				t.Fatalf("version args=%q want=%q", got, test.want)
+			}
+		})
+	}
+}
 
 func TestWorkerDockerfilePinsMatchProviderSpecifications(t *testing.T) {
 	dockerfile, err := os.ReadFile(filepath.Join("..", "..", "worker", "Dockerfile"))

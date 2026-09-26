@@ -791,6 +791,8 @@ func watchTaskControlsInterval(ctx context.Context, store taskReader, taskID dom
 				return
 			case domain.TaskPaused:
 				controls.Pause()
+			case domain.TaskRunning:
+				controls.Resume()
 			}
 		}
 	}

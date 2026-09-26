@@ -56,6 +56,7 @@ type harness struct {
 	databaseURL  string
 	redisAddr    string
 	redisPass    string
+	artifactID   domain.ID
 
 	fixture      *localFixture
 	scopeRef     string
@@ -207,6 +208,7 @@ func newHarness(t *testing.T, ctx context.Context) *harness {
 		postgresName: "reconductor-e2e-pg-" + runID,
 		redisName:    "reconductor-e2e-redis-" + runID,
 		redisPass:    "e2e_" + runID,
+		artifactID:   domain.NewID(),
 		schedulerLog: &lockedBuffer{},
 	}
 }
@@ -234,10 +236,10 @@ func (h *harness) preflight() {
 	}
 
 	specs := []providercheck.Spec{
-		{Name: "dnsx", DisplayName: "DNSx", Executable: configuredExecutable("DNSX_EXECUTABLE", "dnsx"), ExecutableEnv: "DNSX_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "1."},
-		{Name: "naabu", DisplayName: "Naabu", Executable: configuredExecutable("NAABU_EXECUTABLE", "naabu"), ExecutableEnv: "NAABU_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "2."},
-		{Name: "httpx", DisplayName: "HTTPX", Executable: configuredExecutable("HTTPX_EXECUTABLE", "httpx"), ExecutableEnv: "HTTPX_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "1."},
-		{Name: "katana", DisplayName: "Katana", Executable: configuredExecutable("KATANA_EXECUTABLE", "katana"), ExecutableEnv: "KATANA_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "1."},
+		{Name: "dnsx", DisplayName: "DNSx", Executable: configuredExecutable("DNSX_EXECUTABLE", "dnsx"), ExecutableEnv: "DNSX_EXECUTABLE", VersionArgs: []string{"-version", "-duc"}, CompatiblePrefix: "1."},
+		{Name: "naabu", DisplayName: "Naabu", Executable: configuredExecutable("NAABU_EXECUTABLE", "naabu"), ExecutableEnv: "NAABU_EXECUTABLE", VersionArgs: []string{"-version", "-duc"}, CompatiblePrefix: "2."},
+		{Name: "httpx", DisplayName: "HTTPX", Executable: configuredExecutable("HTTPX_EXECUTABLE", "httpx"), ExecutableEnv: "HTTPX_EXECUTABLE", VersionArgs: []string{"-version", "-duc"}, CompatiblePrefix: "1."},
+		{Name: "katana", DisplayName: "Katana", Executable: configuredExecutable("KATANA_EXECUTABLE", "katana"), ExecutableEnv: "KATANA_EXECUTABLE", VersionArgs: []string{"-version", "-duc"}, CompatiblePrefix: "1."},
 		{Name: "nuclei", DisplayName: "Nuclei", Executable: configuredExecutable("NUCLEI_EXECUTABLE", "nuclei"), ExecutableEnv: "NUCLEI_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "3."},
 	}
 	for _, spec := range specs {
@@ -532,6 +534,7 @@ func (h *harness) schedulerEnvironment() []string {
 		"SCOPE_ROOT":                               h.root,
 		"WORKFLOW_STATE_ROOT":                      filepath.Join(h.root, "state", "runs"),
 		"ARTIFACT_ROOT":                            filepath.Join(h.root, "artifacts"),
+		"ARTIFACT_STORE_ID":                        string(h.artifactID),
 		"HOME":                                     h.isolatedHome,
 		"USERPROFILE":                              h.isolatedHome,
 		"HOMEDRIVE":                                filepath.VolumeName(h.isolatedHome),
@@ -606,6 +609,12 @@ func (h *harness) migrate() {
 	output, err := h.runCLI("migrate")
 	if err != nil {
 		h.t.Fatalf("run migrations: %v (%s)", err, trimOutput(output))
+	}
+	if output, err = h.runCLI("artifact-store", "init"); err != nil {
+		h.t.Fatalf("initialize artifact store: %v (%s)", err, trimOutput(output))
+	}
+	if output, err = h.runCLI("artifact-store", "prepared-limits", "--max-open-sets", "32", "--max-set-bytes", "1048576", "--max-unresolved-bytes", "33554432"); err != nil {
+		h.t.Fatalf("configure prepared-evidence limits: %v (%s)", err, trimOutput(output))
 	}
 	store, err := database.Open(h.ctx, h.databaseURL)
 	if err != nil {
@@ -806,7 +815,7 @@ func schedulerReadyFrom(log *lockedBuffer, offset int) bool {
 	}
 	for _, line := range strings.Split(value[:lastNewline], "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
-		if len(fields) == 8 &&
+		if len(fields) >= 8 &&
 			fields[2] == "INFO" &&
 			fields[3] == "Reconductor" &&
 			fields[4] == "scheduler" &&
@@ -997,7 +1006,16 @@ func (h *harness) assertPreApproval(s scenario) {
 	var probeOutput commandprovider.ProviderOutput
 	decodeJSON(h.t, probe.Run.Output, &probeOutput, "probe-http output")
 	if len(probeOutput.AuthorizedRecords) != 1 {
-		h.t.Fatalf("%s HTTPX authorized records=%#v, want exactly one", s.name, probeOutput.AuthorizedRecords)
+		var sanitized json.RawMessage
+		if snapshot, err := h.store.ConsoleSnapshot(h.ctx, s.program.ID); err == nil {
+			for _, tool := range snapshot.Tools {
+				if tool.StepDefinitionID == "probe-http" {
+					sanitized = tool.SanitizedArguments
+					break
+				}
+			}
+		}
+		h.t.Fatalf("%s HTTPX output=%#v fixture_requests=%#v sanitized_arguments=%s, want exactly one authorized record", s.name, probeOutput, h.fixture.Counts(), sanitized)
 	}
 	record := probeOutput.AuthorizedRecords[0]
 	if record.Target != target || record.StatusCode != http.StatusOK {

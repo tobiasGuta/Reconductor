@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -356,6 +357,10 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (returned 
 		if compiled.Envelope.Error != nil && compiled.Envelope.Error.Code == "result_contract_limit" {
 			result.Action.Error = &domain.StructuredError{Classification: compiled.Envelope.Error.Code, Message: compiled.Envelope.Error.Message, Retryable: compiled.Envelope.Error.Retryable}
 		}
+		if executionErr == nil && closeErr != nil {
+			slog.Warn("publisher guard release failed after durable result adoption", "program_id", s.ProgramID, "workflow_run_id", req.Action.WorkflowRunID, "step_run_id", req.Action.StepRunID, "result_occurrence_id", compiled.ResultOccurrenceID, "error", closeErr)
+			return result, nil
+		}
 		return result, errors.Join(executionErr, closeErr)
 	}
 	if domain.PersistenceUnresolved(executionErr) {
@@ -469,7 +474,7 @@ func (s Service) publishAndAdopt(ctx context.Context, store boundedResultStore, 
 	}
 	for ordinal, item := range compiled.Artifacts {
 		if err := store.MarkCompiledArtifactPublishing(ctx, *compiled, ordinal); err != nil {
-			return knownFailure(fmt.Errorf("mark artifact %d publishing: %w", ordinal, err))
+			return &domain.UnresolvedPersistenceError{Err: fmt.Errorf("mark artifact %d publishing: %w", ordinal, err)}
 		}
 		reader, err := item.Source.Open()
 		if err != nil {
@@ -495,7 +500,7 @@ func (s Service) publishAndAdopt(ctx context.Context, store boundedResultStore, 
 			return knownFailure(&artifact.PublicationUnverifiableError{Err: fmt.Errorf("publish artifact %d returned unverifiable receipt", ordinal)})
 		}
 		if err := store.SealCompiledArtifact(ctx, *compiled, ordinal); err != nil {
-			return knownFailure(fmt.Errorf("seal artifact %d: %w", ordinal, err))
+			return &domain.UnresolvedPersistenceError{Err: fmt.Errorf("seal artifact %d: %w", ordinal, err)}
 		}
 	}
 	if err := store.AdoptCompiledResult(ctx, s.ProgramID, step, *compiled, admission, req.Policy.ArtifactRetention); err != nil {

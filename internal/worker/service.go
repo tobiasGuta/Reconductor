@@ -21,8 +21,21 @@ type ResultStore interface {
 	execution.ResultStore
 	AlreadySucceeded(context.Context, string) (bool, error)
 }
+
+type WorkQueue interface {
+	EnsureGroup(context.Context) error
+	PumpRetries(context.Context, int64) (int, error)
+	ClaimStale(context.Context, time.Duration, int64) ([]queue.Delivery, error)
+	Read(context.Context, time.Duration, int64) ([]queue.Delivery, error)
+	Touch(context.Context, string) error
+	Ack(context.Context, string, any) error
+	Fail(context.Context, string, queue.Job, string, bool) error
+}
+
+var ErrDeliveryLeaseLost = errors.New("queue delivery lease lost")
+
 type Service struct {
-	Queue                   *queue.Streams
+	Queue                   WorkQueue
 	Registry                *capability.Registry
 	Artifacts               artifact.Storage
 	Results                 ResultStore
@@ -115,9 +128,14 @@ func (s *Service) consume(ctx context.Context) error {
 	}
 }
 func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
-	leaseCtx, stopLease := context.WithCancel(ctx)
-	defer stopLease()
+	logger := s.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	jobCtx, cancelJob := context.WithCancelCause(ctx)
+	leaseDone := make(chan struct{})
 	go func() {
+		defer close(leaseDone)
 		interval := s.LeaseTimeout / 3
 		if interval <= 0 {
 			interval = time.Second
@@ -126,41 +144,51 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-leaseCtx.Done():
+			case <-jobCtx.Done():
 				return
 			case <-ticker.C:
-				if err := s.Queue.Touch(leaseCtx, d.MessageID); err != nil {
-					s.Logger.Warn("job lease refresh failed", "message_id", d.MessageID, "error", err)
+				if err := s.Queue.Touch(jobCtx, d.MessageID); err != nil {
+					if jobCtx.Err() != nil {
+						return
+					}
+					logger.Warn("job lease refresh failed", "message_id", d.MessageID, "error", err)
+					cancelJob(fmt.Errorf("%w: %v", ErrDeliveryLeaseLost, err))
+					return
 				}
 			}
 		}
 	}()
-	done, err := s.Results.AlreadySucceeded(ctx, d.Job.Action.IdempotencyKey)
+	defer func() {
+		cancelJob(context.Canceled)
+		<-leaseDone
+	}()
+	done, err := s.Results.AlreadySucceeded(jobCtx, d.Job.Action.IdempotencyKey)
 	if err != nil {
+		if leaseErr := deliveryLeaseError(jobCtx); leaseErr != nil {
+			return leaseErr
+		}
+		return err
+	}
+	if err := deliveryLeaseError(jobCtx); err != nil {
 		return err
 	}
 	if done {
-		return s.Queue.Ack(ctx, d.MessageID, domain.QueueResultV1{Version: "queue-result/v1", ActionRequestID: d.Job.Action.ID, Status: "succeeded", Summary: "duplicate delivery already completed"})
+		return s.Queue.Ack(jobCtx, d.MessageID, domain.QueueResultV1{Version: "queue-result/v1", ActionRequestID: d.Job.Action.ID, Status: "succeeded", Summary: "duplicate delivery already completed"})
 	}
 	sc, err := platformscope.Compile(d.Job.ScopeIncludes, d.Job.ScopeExcludes)
 	if err != nil {
-		return s.Queue.Fail(ctx, d.MessageID, d.Job, "invalid_scope: "+err.Error(), false)
-	}
-	provider := d.Job.Provider
-	if provider == "" {
-		if implementation, ok := s.Registry.Get(d.Job.Action.Capability); ok {
-			manifest := implementation.Manifest()
-			if len(manifest.SupportedProviders) > 0 {
-				provider = manifest.SupportedProviders[0]
-			}
+		if leaseErr := deliveryLeaseError(jobCtx); leaseErr != nil {
+			return leaseErr
 		}
+		return s.Queue.Fail(jobCtx, d.MessageID, d.Job, "invalid_scope: "+err.Error(), false)
 	}
-	if provider == "" {
-		provider = d.Job.Action.Capability
-	}
+	provider := s.resolveProvider(d.Job)
 	if s.Budget != nil {
-		release, acquireErr := s.Budget.Acquire(ctx, budget.Request{ProgramID: d.Job.ProgramID, Provider: provider, Hosts: budget.HostsFromInput(d.Job.Action.Input)})
+		release, acquireErr := s.Budget.Acquire(jobCtx, budget.Request{ProgramID: d.Job.ProgramID, Provider: provider, Hosts: budget.HostsFromInput(d.Job.Action.Input)})
 		if acquireErr != nil {
+			if leaseErr := deliveryLeaseError(jobCtx); leaseErr != nil {
+				return leaseErr
+			}
 			return acquireErr
 		}
 		defer release()
@@ -171,7 +199,13 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 			auditor = recorder
 		}
 	}
-	result, runErr := s.executeJob(ctx, d, provider, sc, auditor)
+	result, runErr := s.executeJob(jobCtx, d, provider, sc, auditor)
+	if leaseErr := deliveryLeaseError(jobCtx); leaseErr != nil {
+		// A delivery whose ownership can no longer be proven must remain pending.
+		// A subsequent owner will either observe the durable result or resume the
+		// prepared-result lifecycle without replaying an unknown provider outcome.
+		return leaseErr
+	}
 	if domain.PersistenceUnresolved(runErr) {
 		// Leave the delivery pending. Neither retry nor dead-letter is a known
 		// outcome while the original result may still be committed.
@@ -179,12 +213,24 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 	}
 	if runErr != nil {
 		retryable := result.Action.Error != nil && result.Action.Error.Retryable
-		return s.Queue.Fail(ctx, d.MessageID, d.Job, runErr.Error(), retryable)
+		return s.Queue.Fail(jobCtx, d.MessageID, d.Job, runErr.Error(), retryable)
 	}
 	if result.Envelope == nil {
 		return fmt.Errorf("worker result has no admitted bounded envelope")
 	}
-	return s.Queue.Ack(ctx, d.MessageID, *result.Envelope)
+	return s.Queue.Ack(jobCtx, d.MessageID, *result.Envelope)
+}
+
+func deliveryLeaseError(ctx context.Context) error {
+	cause := context.Cause(ctx)
+	if errors.Is(cause, ErrDeliveryLeaseLost) {
+		return cause
+	}
+	return nil
+}
+
+func (s *Service) resolveProvider(job queue.Job) string {
+	return s.Registry.ProviderName(job.Action.Capability, job.Provider)
 }
 
 func (s *Service) executeJob(ctx context.Context, d queue.Delivery, provider string, sc capability.Scope, auditor capability.PolicyDecisionRecorder) (capability.Result, error) {

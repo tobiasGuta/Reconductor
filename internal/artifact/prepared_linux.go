@@ -297,7 +297,9 @@ func writePreparedExclusive(rootFD int, key string, source io.Reader, expectedSi
 	var digest [32]byte
 	copy(digest[:], hash.Sum(nil))
 	if copyErr != nil || syncErr != nil || closeErr != nil || written != expectedSize || digest != expectedDigest {
-		return written, errors.Join(copyErr, syncErr, closeErr, fmt.Errorf("prepared object verification failed"))
+		cause := errors.Join(copyErr, syncErr, closeErr, fmt.Errorf("prepared object verification failed"))
+		cleanupErr := unlinkCreatedPublication(parentFD, name)
+		return written, errors.Join(cause, cleanupErr)
 	}
 	return written, storeFsync(parentFD)
 }

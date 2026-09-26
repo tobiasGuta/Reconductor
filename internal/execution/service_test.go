@@ -22,6 +22,7 @@ import (
 	commandprovider "github.com/tobiasGuta/Reconductor/internal/providers/command"
 	"github.com/tobiasGuta/Reconductor/internal/redaction"
 	"github.com/tobiasGuta/Reconductor/internal/resultadmission"
+	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
 var errFakeExit = errors.New("exit status 1")
@@ -1058,21 +1059,22 @@ func TestPreparedRecoveryRetainsQuarantine(t *testing.T) {
 func TestPublicationPipelineFailureInjectionPreservesAtomicVisibility(t *testing.T) {
 	failure := errors.New("injected failure")
 	tests := []struct {
-		name         string
-		configure    func(*capturedStore, *capturedArtifacts)
-		stdout       []byte
-		wantPhysical int
-		wantTerminal domain.PublicationState
+		name           string
+		configure      func(*capturedStore, *capturedArtifacts)
+		stdout         []byte
+		wantPhysical   int
+		wantTerminal   domain.PublicationState
+		wantUnresolved bool
 	}{
-		{"reservation transaction", func(store *capturedStore, _ *capturedArtifacts) { store.err = failure }, nil, 0, ""},
-		{"publishing transition", func(store *capturedStore, _ *capturedArtifacts) { store.publishingErr = failure }, nil, 0, domain.PublicationAbandoned},
-		{"physical write", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.err = failure }, nil, 1, domain.PublicationQuarantined},
-		{"size mismatch", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.sizeDelta = 1 }, nil, 1, domain.PublicationQuarantined},
-		{"digest mismatch", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.badDigest = true }, nil, 1, domain.PublicationQuarantined},
-		{"durability failure", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.undurable = true }, nil, 1, domain.PublicationQuarantined},
-		{"seal transition", func(store *capturedStore, _ *capturedArtifacts) { store.sealErr = failure }, nil, 1, domain.PublicationAbandoned},
-		{"partial multi artifact", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.failAfter = 2 }, []byte("stdout"), 2, domain.PublicationQuarantined},
-		{"adoption precommit", func(store *capturedStore, _ *capturedArtifacts) { store.adoptErrors = []error{failure} }, nil, 1, ""},
+		{"reservation transaction", func(store *capturedStore, _ *capturedArtifacts) { store.err = failure }, nil, 0, "", true},
+		{"publishing transition", func(store *capturedStore, _ *capturedArtifacts) { store.publishingErr = failure }, nil, 0, "", true},
+		{"physical write", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.err = failure }, nil, 1, domain.PublicationQuarantined, true},
+		{"size mismatch", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.sizeDelta = 1 }, nil, 1, domain.PublicationQuarantined, true},
+		{"digest mismatch", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.badDigest = true }, nil, 1, domain.PublicationQuarantined, true},
+		{"durability failure", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.undurable = true }, nil, 1, domain.PublicationQuarantined, true},
+		{"seal transition", func(store *capturedStore, _ *capturedArtifacts) { store.sealErr = failure }, nil, 1, "", true},
+		{"partial multi artifact", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.failAfter = 2 }, []byte("stdout"), 2, domain.PublicationQuarantined, true},
+		{"adoption precommit", func(store *capturedStore, _ *capturedArtifacts) { store.adoptErrors = []error{failure} }, nil, 1, "", true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1081,6 +1083,9 @@ func TestPublicationPipelineFailureInjectionPreservesAtomicVisibility(t *testing
 			_, err := executePublicationPipeline(t, store, artifacts, test.stdout)
 			if err == nil {
 				t.Fatal("injected failure was not returned")
+			}
+			if domain.PersistenceUnresolved(err) != test.wantUnresolved {
+				t.Fatalf("unresolved=%v want=%v error=%v", domain.PersistenceUnresolved(err), test.wantUnresolved, err)
 			}
 			if len(artifacts.requests) != test.wantPhysical || store.persisted || store.tool != nil || len(store.artifacts) != 0 {
 				t.Fatalf("physical=%d persisted=%v tool=%#v artifacts=%d", len(artifacts.requests), store.persisted, store.tool, len(store.artifacts))
@@ -1160,9 +1165,27 @@ func TestPublisherCloseFailureIsSecondaryAfterCommittedAdoption(t *testing.T) {
 	closeCause := errors.New("injected lock release failure")
 	store := &capturedStore{}
 	result, err := executePublicationPipeline(t, store, &capturedArtifacts{closeErr: closeCause}, nil)
-	var release *artifact.PublisherReleaseError
-	if !errors.Is(err, closeCause) || !errors.As(err, &release) || !store.persisted || store.terminalized != 0 || result.Envelope == nil || result.Envelope.Status != domain.ResultStatusSucceeded {
+	if err != nil || !store.persisted || store.terminalized != 0 || result.Envelope == nil || result.Envelope.Status != domain.ResultStatusSucceeded {
 		t.Fatalf("error=%v persisted=%v terminalized=%d envelope=%#v", err, store.persisted, store.terminalized, result.Envelope)
+	}
+}
+
+func TestPublisherCloseFailureDoesNotReverseWorkflowSuccess(t *testing.T) {
+	registry := capability.NewRegistry()
+	if err := registry.Register(publicationPipelineCapability{}); err != nil {
+		t.Fatal(err)
+	}
+	store := &capturedStore{}
+	artifacts := &capturedArtifacts{closeErr: errors.New("injected lock release failure")}
+	executor := Service{Registry: registry, Store: store, Artifacts: artifacts, ProgramID: domain.NewID()}
+	engine := workflow.Engine{Registry: registry, Executor: executor, Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}}, Scope: allowedScope{}}
+	definition := workflow.Definition{ID: domain.NewID(), Name: "publisher-close", Version: "1", Steps: []workflow.Step{{ID: "step", Capability: "compare.assets", Input: json.RawMessage(`{}`)}}}
+	state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), ProgramID: domain.NewID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Run.Status != domain.RunCompleted || state.Steps["step"].Run.Status != domain.StepSucceeded || !store.persisted {
+		t.Fatalf("committed success was reversed: state=%#v persisted=%v", state, store.persisted)
 	}
 }
 

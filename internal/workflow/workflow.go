@@ -26,6 +26,7 @@ type Definition struct {
 	Name                      string          `json:"name"`
 	Version                   string          `json:"version"`
 	Materializer              string          `json:"materializer"`
+	BindingSemantics          string          `json:"binding_semantics,omitempty"`
 	Description               string          `json:"description"`
 	Steps                     []Step          `json:"steps"`
 	DefaultPolicyRequirements json.RawMessage `json:"default_policy_requirements"`
@@ -43,6 +44,7 @@ type Step struct {
 	Timeout            time.Duration     `json:"timeout"`
 	ApprovalRequired   bool              `json:"approval_required,omitempty"`
 	RerunOnInputChange bool              `json:"rerun_on_input_change,omitempty"`
+	OptionalBindings   map[string]bool   `json:"optional_bindings,omitempty"`
 }
 type RetryPolicy struct {
 	MaxAttempts int           `json:"max_attempts"`
@@ -79,6 +81,11 @@ type SemanticBindingResolver interface {
 	ResolveSemanticBinding(context.Context, domain.SemanticBindingResolutionV1) (io.ReadCloser, error)
 }
 type ApprovalFunc func(context.Context, Step, policy.Risk) (bool, error)
+
+var ErrApprovalRequired = errors.New("approval is required")
+
+const BindingSemanticsRequiredV1 = "required-by-default/v1"
+
 type Controls struct {
 	mu                sync.RWMutex
 	paused, cancelled bool
@@ -132,11 +139,16 @@ type Engine struct {
 	// MaxParallel is the maximum number of ready steps in one deterministic
 	// execution wave. Zero preserves the legacy single-step behavior.
 	MaxParallel int
+
+	allowLegacySkippedBindings bool
 }
 
 func Validate(d Definition, r *capability.Registry) error {
 	if d.Name == "" || d.Version == "" {
 		return fmt.Errorf("workflow name and version are required")
+	}
+	if d.BindingSemantics != "" && d.BindingSemantics != BindingSemanticsRequiredV1 {
+		return fmt.Errorf("unsupported binding semantics %q", d.BindingSemantics)
 	}
 	byID := map[string]Step{}
 	for _, s := range d.Steps {
@@ -161,6 +173,17 @@ func Validate(d Definition, r *capability.Registry) error {
 		byID[s.ID] = s
 	}
 	for _, s := range d.Steps {
+		if d.BindingSemantics != BindingSemanticsRequiredV1 && len(s.OptionalBindings) > 0 {
+			return fmt.Errorf("step %s declares optional bindings without required-by-default semantics", s.ID)
+		}
+		for field, optional := range s.OptionalBindings {
+			if !optional {
+				return fmt.Errorf("step %s optional binding %s must be true", s.ID, field)
+			}
+			if _, ok := s.Bindings[field]; !ok {
+				return fmt.Errorf("step %s optional binding %s is not declared", s.ID, field)
+			}
+		}
 		for _, dep := range s.DependsOn {
 			if _, ok := byID[dep]; !ok {
 				return fmt.Errorf("step %s depends on unknown step %s", s.ID, dep)
@@ -390,6 +413,7 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 		cancelRun()
 	}()
 
+	e.allowLegacySkippedBindings = d.BindingSemantics != BindingSemanticsRequiredV1
 	now := time.Now().UTC()
 	resuming := state != nil
 	if state == nil {
@@ -473,6 +497,17 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 			}
 			input, err := resolveInput(runCtx, e, task.ProgramID, state.Run.ID, step, state)
 			if err != nil {
+				var skippedBinding *requiredBindingSourceSkippedError
+				if errors.As(err, &skippedBinding) {
+					ss := transitionStep(state, step, step.Input, inputHash(step.Input), domain.StepSkipped)
+					done := time.Now().UTC()
+					ss.Run.CompletedAt = &done
+					state.Steps[step.ID] = ss
+					finished[step.ID] = true
+					e.event(state, "step_skipped", step.ID, err.Error())
+					stateChanged = true
+					continue
+				}
 				persistPreProviderFailure(state, step, err)
 				_ = e.save(runCtx, state)
 				return e.fail(runCtx, state, step.ID, "input_resolution", err)
@@ -513,9 +548,19 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 					stateChanged = true
 					continue
 				}
-				approved, err = e.Approval(runCtx, step, manifest.Risk)
-				if err != nil {
-					return e.fail(runCtx, state, step.ID, "approval", err)
+				var approvalErr error
+				approved, approvalErr = e.Approval(runCtx, step, manifest.Risk)
+				if errors.Is(approvalErr, ErrApprovalRequired) {
+					ss := transitionStep(state, step, input, hash, domain.StepAwaitingApproval)
+					ss.Run.ApprovalState = "pending"
+					state.Steps[step.ID] = ss
+					blockedApprovals[step.ID] = true
+					e.event(state, "approval_required", step.ID, "approval is required before execution")
+					stateChanged = true
+					continue
+				}
+				if approvalErr != nil {
+					return e.fail(runCtx, state, step.ID, "approval", approvalErr)
 				}
 				if !approved {
 					return e.fail(runCtx, state, step.ID, "approval_rejected", errors.New("approval rejected"))
@@ -530,13 +575,7 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 			state.Steps[step.ID] = ss
 			e.event(state, "step_started", step.ID, "capability execution started")
 			stateChanged = true
-			provider := step.Provider
-			if provider == "" && len(manifest.SupportedProviders) > 0 {
-				provider = manifest.SupportedProviders[0]
-			}
-			if provider == "" {
-				provider = step.Capability
-			}
+			provider := e.Registry.ProviderName(step.Capability, step.Provider)
 			plans = append(plans, stepPlan{Definition: step, State: *ss, Input: append(json.RawMessage(nil), ss.Run.Input...), Approved: approved, Provider: provider})
 		}
 		if stateChanged {
@@ -897,8 +936,11 @@ func resolveInput(ctx context.Context, engine *Engine, programID, workflowRunID 
 		if source == nil {
 			return nil, fmt.Errorf("binding source %s has no state", parts[0])
 		}
-		if len(source.Run.Output) == 0 && source.Run.Status == domain.StepSkipped {
-			continue
+		if source.Run.Status == domain.StepSkipped {
+			if (engine != nil && engine.allowLegacySkippedBindings) || s.OptionalBindings[field] {
+				continue
+			}
+			return nil, &requiredBindingSourceSkippedError{ConsumerStepID: s.ID, SourceStepID: parts[0], Field: field}
 		}
 		selector := strings.Join(parts[2:], ".")
 		if err := domain.ValidateSelector(selector); err != nil {
@@ -934,6 +976,16 @@ func resolveInput(ctx context.Context, engine *Engine, programID, workflowRunID 
 		return nil, fmt.Errorf("result_contract_limit: effective binding input exceeds %d bytes", domain.ResultEnvelopeMaxBytes)
 	}
 	return encoded, nil
+}
+
+type requiredBindingSourceSkippedError struct {
+	ConsumerStepID string
+	SourceStepID   string
+	Field          string
+}
+
+func (e *requiredBindingSourceSkippedError) Error() string {
+	return fmt.Sprintf("required binding %s for step %s is unavailable because source step %s was skipped", e.Field, e.ConsumerStepID, e.SourceStepID)
 }
 
 func admittedEnvelopeJSON(result capability.Result) json.RawMessage {

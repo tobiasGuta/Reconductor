@@ -123,7 +123,7 @@ func TestWorkflowTemplateUpgradePreservesHistoricalReleaseIdentities(t *testing.
 		oldBaselineID   = domain.ID("c9479711-b203-4fe1-8528-718888e5a5d2")
 		oldContinuousID = domain.ID("d0e5e6a3-bd8a-4b4b-a76b-f6452c30179a")
 	)
-	if workflows.BaselineTemplateID == oldBaselineID || workflows.ContinuousTemplateID == oldContinuousID || workflows.BaselineVersion != "1.4.0" || workflows.ContinuousVersion != "2.4.0" {
+	if workflows.BaselineTemplateID == oldBaselineID || workflows.ContinuousTemplateID == oldContinuousID || workflows.BaselineVersion != "1.5.0" || workflows.ContinuousVersion != "2.5.0" {
 		t.Fatalf("current release tuples baseline=(%s,%s) continuous=(%s,%s)", workflows.BaselineTemplateID, workflows.BaselineVersion, workflows.ContinuousTemplateID, workflows.ContinuousVersion)
 	}
 	for _, test := range []struct {

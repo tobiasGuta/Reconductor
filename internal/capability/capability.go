@@ -422,7 +422,16 @@ func (r *Registry) providerName(capabilityName, requested string) string {
 	if multi, ok := implementation.(*Multi); ok && multi.defaultProvider != "" {
 		return multi.defaultProvider
 	}
+	if supported := implementation.Manifest().SupportedProviders; len(supported) > 0 {
+		return supported[0]
+	}
 	return capabilityName
+}
+
+// ProviderName resolves an omitted provider through the registry's configured
+// default while preserving an explicit provider selection.
+func (r *Registry) ProviderName(capabilityName, requested string) string {
+	return r.providerName(capabilityName, requested)
 }
 
 // Validate authorizes and validates an action without executing its provider.

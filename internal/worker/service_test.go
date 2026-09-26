@@ -46,6 +46,92 @@ func (c *workerCaptureCapability) Execute(_ context.Context, req capability.Requ
 	}, nil
 }
 
+func TestWorkerUsesMultiConfiguredDefaultProvider(t *testing.T) {
+	multi, err := capability.NewMulti("z-default", map[string]capability.Capability{
+		"a-alphabetical": workerProviderStub{name: "multi.worker"},
+		"z-default":      workerProviderStub{name: "multi.worker"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := capability.NewRegistry()
+	if err := registry.Register(multi); err != nil {
+		t.Fatal(err)
+	}
+	service := Service{Registry: registry}
+	job := queue.Job{Action: domain.ActionRequest{Capability: "multi.worker"}}
+	if provider := service.resolveProvider(job); provider != "z-default" {
+		t.Fatalf("omitted provider resolved to %q", provider)
+	}
+	job.Provider = "a-alphabetical"
+	if provider := service.resolveProvider(job); provider != "a-alphabetical" {
+		t.Fatalf("explicit provider resolved to %q", provider)
+	}
+}
+
+type leaseFailureQueue struct {
+	touches atomic.Int32
+	acks    atomic.Int32
+	fails   atomic.Int32
+}
+
+func (*leaseFailureQueue) EnsureGroup(context.Context) error { return nil }
+func (*leaseFailureQueue) PumpRetries(context.Context, int64) (int, error) {
+	return 0, nil
+}
+func (*leaseFailureQueue) ClaimStale(context.Context, time.Duration, int64) ([]queue.Delivery, error) {
+	return nil, nil
+}
+func (*leaseFailureQueue) Read(context.Context, time.Duration, int64) ([]queue.Delivery, error) {
+	return nil, nil
+}
+func (q *leaseFailureQueue) Touch(context.Context, string) error {
+	q.touches.Add(1)
+	return errors.New("synthetic lease refresh failure")
+}
+func (q *leaseFailureQueue) Ack(context.Context, string, any) error {
+	q.acks.Add(1)
+	return nil
+}
+func (q *leaseFailureQueue) Fail(context.Context, string, queue.Job, string, bool) error {
+	q.fails.Add(1)
+	return nil
+}
+
+type leaseBlockingStore struct{ *workerStore }
+
+func (*leaseBlockingStore) AlreadySucceeded(ctx context.Context, _ string) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func TestWorkerLeaseRefreshFailureCancelsWorkWithoutQueueFinalization(t *testing.T) {
+	workQueue := &leaseFailureQueue{}
+	service := Service{
+		Queue:        workQueue,
+		Results:      &leaseBlockingStore{workerStore: &workerStore{}},
+		LeaseTimeout: 3 * time.Millisecond,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	err := service.handle(context.Background(), queue.Delivery{MessageID: "lease-loss", Job: queue.Job{Action: domain.ActionRequest{IdempotencyKey: "lease-loss"}}})
+	if !errors.Is(err, ErrDeliveryLeaseLost) {
+		t.Fatalf("error=%v want delivery lease loss", err)
+	}
+	if workQueue.touches.Load() != 1 || workQueue.acks.Load() != 0 || workQueue.fails.Load() != 0 {
+		t.Fatalf("touches=%d acks=%d fails=%d", workQueue.touches.Load(), workQueue.acks.Load(), workQueue.fails.Load())
+	}
+}
+
+type workerProviderStub struct{ name string }
+
+func (c workerProviderStub) Manifest() capability.Manifest {
+	return capability.Manifest{Name: c.name, Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true}
+}
+func (workerProviderStub) Validate(context.Context, capability.Request) error { return nil }
+func (workerProviderStub) Execute(context.Context, capability.Request) (capability.Result, error) {
+	return capability.Result{}, nil
+}
+
 type workerStore struct {
 	previous          []string
 	loadedFor         string
@@ -555,7 +641,7 @@ func TestWorkerPeriodicRetryLifecycleNeedsNoRetentionMaintenance(t *testing.T) {
 	result := make(chan error, 1)
 	go func() { result <- service.Run(ctx) }()
 	spy.waitFor(t, "XREADGROUP", time.Second)
-	spy.waitFor(t, "ZRANGEBYSCORE", 2*time.Second)
+	spy.waitFor(t, "EVAL", 2*time.Second)
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("worker shutdown error=%v", err)
@@ -612,6 +698,8 @@ func (s *redisCommandSpy) serve(connection net.Conn) {
 			response = "*-1\r\n"
 		case "ZRANGEBYSCORE":
 			response = "*0\r\n"
+		case "EVAL":
+			response = ":0\r\n"
 		default:
 			response = "+OK\r\n"
 		}

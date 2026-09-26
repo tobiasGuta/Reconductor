@@ -89,6 +89,17 @@ func (e *PublicationUnverifiableError) Error() string {
 }
 func (e *PublicationUnverifiableError) Unwrap() error { return e.Err }
 
+// PublicationRecoveryRequiredError means the final publication was not sealed,
+// but its durable prepared source remains authoritative and recovery may safely
+// verify or recreate the final object without replaying the provider.
+type PublicationRecoveryRequiredError struct{ Err error }
+
+func (e *PublicationRecoveryRequiredError) Error() string {
+	return "publication requires recovery: " + e.Err.Error()
+}
+func (e *PublicationRecoveryRequiredError) Unwrap() error               { return e.Err }
+func (e *PublicationRecoveryRequiredError) PersistenceUnresolved() bool { return true }
+
 var ErrPublisherLockUnsupported = fmt.Errorf("publisher lock is unsupported on this platform or filesystem")
 
 func DigestString(sum [32]byte) string { return hex.EncodeToString(sum[:]) }

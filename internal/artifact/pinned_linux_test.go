@@ -124,6 +124,72 @@ func TestPreparedPhysicalWriteCeilingAndPartialFailure(t *testing.T) {
 	}
 }
 
+func TestFailedExclusiveWritesRemoveOnlyUnverifiedNewFiles(t *testing.T) {
+	_, g := linuxGuard(t)
+	for _, test := range []struct {
+		name, first string
+	}{{"truncated", "bad"}, {"digest_mismatch", "exacz"}} {
+		t.Run(test.name, func(t *testing.T) {
+			expected := "exact"
+			reserved := reservedFixture(g.identity.ArtifactStoreID, expected)
+			if _, err := g.PublishReserved(context.Background(), reserved, strings.NewReader(test.first)); !domain.PersistenceUnresolved(err) {
+				t.Fatalf("first publication error=%v", err)
+			}
+			if receipt, err := g.PublishReserved(context.Background(), reserved, strings.NewReader(expected)); err != nil || !receipt.Durable {
+				t.Fatalf("retry receipt=%#v error=%v", receipt, err)
+			}
+
+			setID := domain.NewID()
+			key, _ := domain.PreparedMemberKey(setID, 0)
+			if _, err := writePreparedExclusive(g.rootFD, key, strings.NewReader(test.first), int64(len(expected)), DigestBytes([]byte(expected)), 1024); err == nil {
+				t.Fatal("invalid prepared write succeeded")
+			}
+			if _, err := writePreparedExclusive(g.rootFD, key, strings.NewReader(expected), int64(len(expected)), DigestBytes([]byte(expected)), 1024); err != nil {
+				t.Fatalf("prepared retry failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestPublicationDirectorySyncFailureRetainsExactFileForRecovery(t *testing.T) {
+	local, g := linuxGuard(t)
+	reserved := reservedFixture(g.identity.ArtifactStoreID, "exact")
+	injected := errors.New("injected directory sync failure")
+	original := storeFsync
+	fileSynced := false
+	storeFsync = func(fd int) error {
+		var stat unix.Stat_t
+		if err := unix.Fstat(fd, &stat); err != nil {
+			return err
+		}
+		kind := stat.Mode & unix.S_IFMT
+		if kind == unix.S_IFREG {
+			fileSynced = true
+		}
+		if fileSynced && kind == unix.S_IFDIR {
+			return injected
+		}
+		return unix.Fsync(fd)
+	}
+	_, publishErr := g.PublishReserved(context.Background(), reserved, strings.NewReader("exact"))
+	storeFsync = original
+	if !domain.PersistenceUnresolved(publishErr) || !errors.Is(publishErr, injected) {
+		t.Fatalf("publication error=%v", publishErr)
+	}
+	if err := g.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := local.AcquirePreparedRecovery(context.Background(), local.Identity())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovery.Close()
+	receipt, present, err := recovery.VerifyReserved(context.Background(), reserved)
+	if err != nil || !present || !receipt.Durable {
+		t.Fatalf("recovery receipt=%#v present=%v error=%v", receipt, present, err)
+	}
+}
+
 func TestResolvedCleanupResumesAfterEveryUnlink(t *testing.T) {
 	for stopped := 0; stopped <= 3; stopped++ {
 		t.Run(string(rune('0'+stopped)), func(t *testing.T) {

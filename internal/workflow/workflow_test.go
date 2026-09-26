@@ -444,6 +444,83 @@ func TestApprovalPause(t *testing.T) {
 		t.Fatalf("unexpected state: %#v", state)
 	}
 }
+
+func TestApprovalResumeDoesNotAuthorizeSubsequentGate(t *testing.T) {
+	calls := 0
+	registry := registryFor(t, testCap{"x", &calls, false})
+	executor := &testRegistryExecutor{registry: registry}
+	engine := Engine{Registry: registry, Executor: executor, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
+	definition := Definition{ID: domain.NewID(), Name: "approval-isolation", Version: "1", Steps: []Step{
+		{ID: "first", Capability: "x", ApprovalRequired: true, Input: json.RawMessage(`{}`)},
+		{ID: "second", Capability: "x", DependsOn: []string{"first"}, ApprovalRequired: true, Input: json.RawMessage(`{}`)},
+	}}
+	task := domain.Task{ID: domain.NewID()}
+	state, err := engine.Run(context.Background(), definition, nil, task, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Run.Status != domain.RunPaused || state.Steps["first"].Run.Status != domain.StepAwaitingApproval || calls != 0 {
+		t.Fatalf("initial approval state=%#v calls=%d", state, calls)
+	}
+	engine.Approval = func(_ context.Context, step Step, _ policy.Risk) (bool, error) {
+		if step.ID == "first" {
+			return true, nil
+		}
+		return false, ErrApprovalRequired
+	}
+	state, err = engine.Run(context.Background(), definition, state, task, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Run.Status != domain.RunPaused || state.Steps["first"].Run.Status != domain.StepSucceeded || state.Steps["second"].Run.Status != domain.StepAwaitingApproval || calls != 1 {
+		t.Fatalf("second gate inherited approval: calls=%d state=%#v", calls, state)
+	}
+}
+
+type emptyLinesCap struct{ calls *int }
+
+func (emptyLinesCap) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "empty.lines", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true}
+}
+func (emptyLinesCap) Validate(context.Context, capability.Request) error { return nil }
+func (c emptyLinesCap) Execute(_ context.Context, request capability.Request) (capability.Result, error) {
+	*c.calls++
+	return capability.Result{Action: domain.ActionResult{RequestID: request.Action.ID, Status: "succeeded", Summary: "empty", Output: json.RawMessage(`{"lines":[]}`)}}, nil
+}
+
+func TestSkippedBindingRequiresExplicitOptionalDeclaration(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		optional  bool
+		wantSink  domain.StepStatus
+		wantCalls int
+	}{
+		{name: "required", wantSink: domain.StepSkipped, wantCalls: 1},
+		{name: "optional", optional: true, wantSink: domain.StepSucceeded, wantCalls: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			registry := registryFor(t, emptyLinesCap{calls: &calls})
+			optional := map[string]bool(nil)
+			if test.optional {
+				optional = map[string]bool{"targets": true}
+			}
+			definition := Definition{ID: domain.NewID(), Name: "skip-binding", Version: "1", BindingSemantics: BindingSemanticsRequiredV1, Steps: []Step{
+				{ID: "root", Capability: "empty.lines", Input: json.RawMessage(`{}`)},
+				{ID: "source", Capability: "empty.lines", DependsOn: []string{"root"}, Condition: "nonempty:root.output.lines", Input: json.RawMessage(`{}`)},
+				{ID: "sink", Capability: "empty.lines", DependsOn: []string{"source"}, Input: json.RawMessage(`{"targets":[]}`), Bindings: map[string]string{"targets": "source.output.lines"}, OptionalBindings: optional},
+			}}
+			engine := Engine{Registry: registry, Executor: &testRegistryExecutor{registry: registry}, Policy: policy.Policy{AllowedCapabilities: []string{"empty.lines"}}, Scope: allScope{}}
+			state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID()}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Steps["source"].Run.Status != domain.StepSkipped || state.Steps["sink"].Run.Status != test.wantSink || calls != test.wantCalls {
+				t.Fatalf("calls=%d state=%#v", calls, state)
+			}
+		})
+	}
+}
 func TestResumeAfterFileBackedRestart(t *testing.T) {
 	calls := 0
 	r := registryFor(t, testCap{"x", &calls, false})
@@ -781,6 +858,45 @@ func TestExecuteStepUsesResolvedDefaultProvider(t *testing.T) {
 	}
 	if executor.provider != "default-provider" {
 		t.Fatalf("provider=%q", executor.provider)
+	}
+}
+
+type multiProviderCap struct{ capabilityName string }
+
+func (c multiProviderCap) Manifest() capability.Manifest {
+	return capability.Manifest{Name: c.capabilityName, Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true}
+}
+func (multiProviderCap) Validate(context.Context, capability.Request) error { return nil }
+func (multiProviderCap) Execute(context.Context, capability.Request) (capability.Result, error) {
+	return capability.Result{}, nil
+}
+
+func TestExecuteStepUsesMultiConfiguredDefaultProvider(t *testing.T) {
+	multi, err := capability.NewMulti("z-default", map[string]capability.Capability{
+		"a-alphabetical": multiProviderCap{capabilityName: "multi.provider"},
+		"z-default":      multiProviderCap{capabilityName: "multi.provider"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := capability.NewRegistry()
+	if err := registry.Register(multi); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, requested, want string
+	}{{"omitted", "", "z-default"}, {"explicit", "a-alphabetical", "a-alphabetical"}} {
+		t.Run(test.name, func(t *testing.T) {
+			executor := &providerCaptureExecutor{}
+			engine := Engine{Registry: registry, Executor: executor, Policy: policy.Policy{AllowedCapabilities: []string{"multi.provider"}}, Scope: allScope{}}
+			definition := Definition{ID: domain.NewID(), Name: "provider", Version: "1", Steps: []Step{{ID: "step", Capability: "multi.provider", Provider: test.requested, Input: json.RawMessage(`{}`)}}}
+			if _, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), ProgramID: domain.NewID()}, nil); err != nil {
+				t.Fatal(err)
+			}
+			if executor.provider != test.want {
+				t.Fatalf("provider=%q want=%q", executor.provider, test.want)
+			}
+		})
 	}
 }
 

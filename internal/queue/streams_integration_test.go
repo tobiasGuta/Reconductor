@@ -2,13 +2,89 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 )
+
+func TestPumpRetriesIsAtomicAcrossConcurrentWorkers(t *testing.T) {
+	addr := os.Getenv("TEST_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("TEST_REDIS_ADDR is not set")
+	}
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: addr, Username: os.Getenv("TEST_REDIS_USERNAME"), Password: os.Getenv("TEST_REDIS_PASSWORD"), DB: 0})
+	defer client.Close()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	suffix := string(domain.NewID())
+	names := Names{Jobs: "test.concurrent.jobs." + suffix, Results: "test.concurrent.results." + suffix, Events: "test.concurrent.events." + suffix, DeadLetter: "test.concurrent.dead." + suffix, Retry: "test.concurrent.retry." + suffix}
+	defer client.Del(ctx, names.Jobs, names.Results, names.Events, names.DeadLetter, names.Retry)
+	const jobs = 10
+	entries := make([]redis.Z, 0, jobs)
+	for i := 0; i < jobs; i++ {
+		job := Job{ID: domain.NewID(), Action: domain.ActionRequest{ID: domain.NewID(), IdempotencyKey: "concurrent-" + string(rune('a'+i))}, AvailableAt: time.Now().Add(-time.Second)}
+		raw, err := json.Marshal(job)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, redis.Z{Score: float64(job.AvailableAt.UnixMilli()), Member: string(raw)})
+	}
+	if err := client.ZAdd(ctx, names.Retry, entries...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errCh := make(chan error, 5)
+	var moved atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			<-start
+			stream := NewWithNames(client, "concurrent", "worker-"+string(rune('a'+worker)), 1, time.Millisecond, names)
+			count, err := stream.PumpRetries(ctx, jobs)
+			moved.Add(int64(count))
+			errCh <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if moved.Load() != jobs {
+		t.Fatalf("moved=%d want=%d", moved.Load(), jobs)
+	}
+	if length, err := client.XLen(ctx, names.Jobs).Result(); err != nil || length != jobs {
+		t.Fatalf("jobs stream length=%d err=%v", length, err)
+	}
+	if remaining, err := client.ZCard(ctx, names.Retry).Result(); err != nil || remaining != 0 {
+		t.Fatalf("retry set remaining=%d err=%v", remaining, err)
+	}
+	messages, err := client.XRange(ctx, names.Jobs, "-", "+").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, message := range messages {
+		id, ok := message.Values["job_id"].(string)
+		if !ok || seen[id] {
+			t.Fatalf("duplicate or invalid job identity %q in %#v", id, message.Values)
+		}
+		seen[id] = true
+	}
+}
 
 func TestRedisStreamsDeliveryRecoveryAndDeadLetter(t *testing.T) {
 	addr := os.Getenv("TEST_REDIS_ADDR")
@@ -64,6 +140,12 @@ func TestRedisStreamsDeliveryRecoveryAndDeadLetter(t *testing.T) {
 	if claimed[0].MessageID != messageID || claimed[0].Job.ID != job.ID || claimed[0].Job.Action.ID != job.Action.ID {
 		t.Fatalf("redelivery identity changed: %#v", claimed[0])
 	}
+	if err := first.Touch(ctx, claimed[0].MessageID); err == nil {
+		t.Fatal("previous consumer refreshed a delivery after ownership transfer")
+	}
+	if err := second.Touch(ctx, claimed[0].MessageID); err != nil {
+		t.Fatalf("refresh owned delivery: %v", err)
+	}
 	if err := second.Fail(ctx, claimed[0].MessageID, claimed[0].Job, "temporary", true); err != nil {
 		t.Fatal(err)
 	}
@@ -105,6 +187,9 @@ func TestRedisStreamsDeliveryRecoveryAndDeadLetter(t *testing.T) {
 	}
 	if length, err := client.XLen(ctx, names.Jobs).Result(); err != nil || length != 0 {
 		t.Fatalf("job stream after repeated acknowledgement: length=%d err=%v", length, err)
+	}
+	if err := second.Touch(ctx, requeued[0].MessageID); err == nil {
+		t.Fatal("refresh of removed delivery unexpectedly proved ownership")
 	}
 }
 

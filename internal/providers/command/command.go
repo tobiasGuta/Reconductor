@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -234,7 +235,7 @@ func (p *Provider) Execute(ctx context.Context, req capability.Request) (capabil
 	if in.Domain != "" {
 		domains = append(domains, in.Domain)
 	}
-	safeArgs, _ := json.Marshal(map[string]any{"provider": p.def.Provider, "target_count": len(in.Targets), "discovery_root_count": len(domains), "stdin_bytes": len(invocation.Stdin), "headless": in.Headless, "target_plan_digest": in.PlanDigest})
+	safeArgs, _ := json.Marshal(map[string]any{"provider": p.def.Provider, "target_count": len(in.Targets), "discovery_root_count": len(domains), "stdin_bytes": len(invocation.Stdin), "headless": in.Headless, "target_plan_digest": in.PlanDigest, "update_check_disabled": slices.Contains(invocation.Args, "-duc")})
 	safeStdout := p.redactor.Text(string(stdout))
 	safeStderr := p.redactor.Text(string(stderr))
 	if int64(len(safeStdout)) > budget || int64(len(safeStderr)) > budget-int64(len(safeStdout)) {
@@ -298,7 +299,7 @@ func (p *Provider) versionFailure(req capability.Request, in Input, invocation I
 	if in.Domain != "" {
 		domains = append(domains, in.Domain)
 	}
-	safeArgs, _ := json.Marshal(map[string]any{"provider": p.def.Provider, "target_count": len(in.Targets), "discovery_root_count": len(domains), "stdin_bytes": len(invocation.Stdin), "headless": in.Headless, "target_plan_digest": in.PlanDigest})
+	safeArgs, _ := json.Marshal(map[string]any{"provider": p.def.Provider, "target_count": len(in.Targets), "discovery_root_count": len(domains), "stdin_bytes": len(invocation.Stdin), "headless": in.Headless, "target_plan_digest": in.PlanDigest, "update_check_disabled": slices.Contains(invocation.Args, "-duc")})
 	detail := diagnosticSnippet(p.redactor.Text(check.Details), 1024)
 	message := fmt.Sprintf("%s executable verification failed (%s): expected %s; configure %s with its full path", p.def.Provider, check.Status, check.ExpectedVersion, p.def.Probe.ExecutableEnv)
 	if detail != "" {

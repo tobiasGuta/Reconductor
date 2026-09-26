@@ -19,15 +19,19 @@ const (
 
 func ExternalProviderSpecs(cfg config.Config) []providercheck.Spec {
 	return []providercheck.Spec{
-		{Name: "subfinder", DisplayName: "Subfinder", Executable: cfg.Tools.Subfinder, ExecutableEnv: "SUBFINDER_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "2.", PinnedVersion: SubfinderPinnedVersion, Required: true},
+		{Name: "subfinder", DisplayName: "Subfinder", Executable: cfg.Tools.Subfinder, ExecutableEnv: "SUBFINDER_EXECUTABLE", VersionArgs: providerVersionArgs(cfg), CompatiblePrefix: "2.", PinnedVersion: SubfinderPinnedVersion, Required: true},
 		{Name: "chaos", DisplayName: "Chaos", Executable: cfg.Tools.Chaos, ExecutableEnv: "CHAOS_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "0.5.", PinnedVersion: ChaosPinnedVersion, Required: false},
-		{Name: "dnsx", DisplayName: "DNSx", Executable: cfg.Tools.DNSx, ExecutableEnv: "DNSX_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "1.", PinnedVersion: DNSxPinnedVersion, Required: true},
-		{Name: "naabu", DisplayName: "Naabu", Executable: cfg.Tools.Naabu, ExecutableEnv: "NAABU_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "2.", PinnedVersion: NaabuPinnedVersion, Required: true},
-		{Name: "httpx", DisplayName: "HTTPX", Executable: cfg.Tools.HTTPX, ExecutableEnv: "HTTPX_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "1.", PinnedVersion: HTTPXPinnedVersion, Required: true},
-		{Name: "katana", DisplayName: "Katana", Executable: cfg.Tools.Katana, ExecutableEnv: "KATANA_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "1.", PinnedVersion: KatanaPinnedVersion, Required: true},
+		{Name: "dnsx", DisplayName: "DNSx", Executable: cfg.Tools.DNSx, ExecutableEnv: "DNSX_EXECUTABLE", VersionArgs: providerVersionArgs(cfg), CompatiblePrefix: "1.", PinnedVersion: DNSxPinnedVersion, Required: true},
+		{Name: "naabu", DisplayName: "Naabu", Executable: cfg.Tools.Naabu, ExecutableEnv: "NAABU_EXECUTABLE", VersionArgs: providerVersionArgs(cfg), CompatiblePrefix: "2.", PinnedVersion: NaabuPinnedVersion, Required: true},
+		{Name: "httpx", DisplayName: "HTTPX", Executable: cfg.Tools.HTTPX, ExecutableEnv: "HTTPX_EXECUTABLE", VersionArgs: providerVersionArgs(cfg), CompatiblePrefix: "1.", PinnedVersion: HTTPXPinnedVersion, Required: true},
+		{Name: "katana", DisplayName: "Katana", Executable: cfg.Tools.Katana, ExecutableEnv: "KATANA_EXECUTABLE", VersionArgs: providerVersionArgs(cfg), CompatiblePrefix: "1.", PinnedVersion: KatanaPinnedVersion, Required: true},
 		{Name: "gau", DisplayName: "GAU", Executable: cfg.Tools.GAU, ExecutableEnv: "GAU_EXECUTABLE", VersionArgs: []string{"--version"}, CompatiblePrefix: "2.", PinnedVersion: GAUPinnedVersion, Required: true},
 		{Name: "nuclei", DisplayName: "Nuclei", Executable: cfg.Tools.Nuclei, ExecutableEnv: "NUCLEI_EXECUTABLE", VersionArgs: []string{"-version"}, CompatiblePrefix: "3.", PinnedVersion: NucleiPinnedVersion, Required: true},
 	}
+}
+
+func providerVersionArgs(cfg config.Config) []string {
+	return providerUpdateArgs([]string{"-version"}, cfg.Recon.ProviderUpdate)
 }
 
 func providerSpecsByName(cfg config.Config) map[string]providercheck.Spec {

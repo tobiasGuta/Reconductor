@@ -570,6 +570,18 @@ func TestAuditedProviderFlagMatrix(t *testing.T) {
 	}
 }
 
+func TestProviderUpdateArgs(t *testing.T) {
+	original := []string{"-silent"}
+	disabled := providerUpdateArgs(append([]string(nil), original...), false)
+	if got := strings.Join(disabled, " "); got != "-silent -duc" {
+		t.Fatalf("disabled provider updates args=%q", got)
+	}
+	enabled := providerUpdateArgs(append([]string(nil), original...), true)
+	if got := strings.Join(enabled, " "); got != "-silent" {
+		t.Fatalf("enabled provider updates args=%q", got)
+	}
+}
+
 func TestHTTPXInvocationUsesNewlineDelimitedTargetStdin(t *testing.T) {
 	targets := []string{
 		"https://app.example.test/path?view=full",

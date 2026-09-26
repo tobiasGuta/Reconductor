@@ -76,15 +76,26 @@ func (g *localPublisherGuard) PublishReserved(ctx context.Context, r ReservedArt
 	var sum [32]byte
 	copy(sum[:], hash.Sum(nil))
 	if copyErr != nil || syncErr != nil || closeErr != nil || written != r.ExpectedSize || sum != r.ExpectedSHA256 {
-		return PublishedArtifactV1{SizeBytes: written, SHA256: sum}, &PublicationUnverifiableError{Err: errors.Join(copyErr, syncErr, closeErr, fmt.Errorf("publication content mismatch or durability failure"))}
+		cause := errors.Join(copyErr, syncErr, closeErr, fmt.Errorf("publication content mismatch or durability failure"))
+		if cleanupErr := unlinkCreatedPublication(parent, name); cleanupErr != nil {
+			return PublishedArtifactV1{SizeBytes: written, SHA256: sum}, &PublicationUnverifiableError{Err: errors.Join(cause, fmt.Errorf("remove unverified publication: %w", cleanupErr))}
+		}
+		return PublishedArtifactV1{SizeBytes: written, SHA256: sum}, &PublicationRecoveryRequiredError{Err: cause}
 	}
 	if err := storeFsync(parent); err != nil {
-		return PublishedArtifactV1{}, &PublicationUnverifiableError{Err: err}
+		return PublishedArtifactV1{SizeBytes: written, SHA256: sum}, &PublicationRecoveryRequiredError{Err: fmt.Errorf("synchronize publication directory: %w", err)}
 	}
 	if err := validatePinnedMarker(g.rootFD, g.marker); err != nil {
 		return PublishedArtifactV1{}, &PublicationUnverifiableError{Err: err}
 	}
 	return PublishedArtifactV1{SizeBytes: written, SHA256: sum, Durable: true}, nil
+}
+
+func unlinkCreatedPublication(parent int, name string) error {
+	if err := unix.Unlinkat(parent, name, 0); err != nil {
+		return err
+	}
+	return storeFsync(parent)
 }
 
 func (g *localPublisherGuard) Close() error {

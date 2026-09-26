@@ -116,7 +116,7 @@ func TestOwnedContainerLabelsRequireExactRunIdentity(t *testing.T) {
 
 func TestSchedulerGenerationReadinessIsLogIsolated(t *testing.T) {
 	var log lockedBuffer
-	readyLine := "2026/08/01 12:00:00 INFO Reconductor scheduler ready poll_interval=100ms max_concurrent_runs=1"
+	readyLine := "2026/08/01 12:00:00 INFO Reconductor scheduler ready poll_interval=100ms max_concurrent_runs=1 prepared_open_sets=0 prepared_max_open_sets=32"
 	_, _ = log.Write([]byte(readyLine + "\n"))
 	offset := log.Len()
 	if schedulerReadyFrom(&log, offset) {
