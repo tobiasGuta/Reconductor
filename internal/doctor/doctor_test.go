@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/providercheck"
 	"github.com/tobiasGuta/Reconductor/internal/providers"
 )
@@ -91,5 +92,16 @@ func TestFailuresAndTableOutput(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "COMPONENT") || !strings.Contains(out.String(), "Subfinder") {
 		t.Fatalf("table=%q", out.String())
+	}
+}
+
+func TestPreparedEvidenceCheckRequiresDatabaseAndStoreIdentity(t *testing.T) {
+	got := checkPreparedEvidence(context.Background(), config.Config{})
+	if got.Status != providercheck.Status("not_configured") || !strings.Contains(got.Details, "DATABASE_URL") {
+		t.Fatalf("missing database result=%+v", got)
+	}
+	got = checkPreparedEvidence(context.Background(), config.Config{Database: config.Database{URL: "postgres://unused"}})
+	if got.Status != providercheck.Status("not_configured") || !strings.Contains(got.Details, "ARTIFACT_STORE_ID") {
+		t.Fatalf("missing store result=%+v", got)
 	}
 }

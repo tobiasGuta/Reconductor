@@ -9,9 +9,53 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 )
+
+type failingPreparedAllocator struct {
+	capturedInvocations
+	err error
+}
+
+type unresolvedAllocationError struct{}
+
+func (*unresolvedAllocationError) Error() string              { return "allocation acknowledgement unresolved" }
+func (*unresolvedAllocationError) CommitOutcomeUnknown() bool { return true }
+
+func (f *failingPreparedAllocator) AllocateProviderInvocation(_ context.Context, record ProviderInvocationStartRecord, _ artifact.StoreIdentity) (ProviderInvocationAdmission, error) {
+	f.starts = append(f.starts, record)
+	return ProviderInvocationAdmission{}, f.err
+}
+
+type executionProbeCapability struct{ executed bool }
+
+func (*executionProbeCapability) Manifest() Manifest {
+	return Manifest{Name: "prepared.probe", Version: "1", Risk: policy.Low}
+}
+func (*executionProbeCapability) Validate(context.Context, Request) error { return nil }
+func (c *executionProbeCapability) Execute(context.Context, Request) (Result, error) {
+	c.executed = true
+	return Result{Action: domain.ActionResult{Status: "succeeded"}}, nil
+}
+
+func TestPreparedAllocationFailurePreventsProviderInvocation(t *testing.T) {
+	implementation := &executionProbeCapability{}
+	registry := NewRegistry()
+	if err := registry.Register(implementation); err != nil {
+		t.Fatal(err)
+	}
+	cause := &unresolvedAllocationError{}
+	allocator := &failingPreparedAllocator{err: cause}
+	identity := artifact.StoreIdentity{ArtifactStoreID: domain.NewID(), IncarnationNonce: domain.NewID(), BackendKind: artifact.BackendKind, MarkerFormat: artifact.MarkerFormat, MarkerVersion: artifact.MarkerVersion}
+	request := Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "prepared.probe", StepAttempt: 1}, ProgramID: domain.NewID(), Policy: policy.Policy{AllowedCapabilities: []string{"prepared.probe"}}, Scope: allowAllScope{}, DecisionRecorder: &capturedDecision{}, InvocationRecorder: allocator, PreparedStoreIdentity: &identity, RequirePreparedEvidence: true}
+	_, err := registry.Execute(context.Background(), request)
+	var unknown interface{ CommitOutcomeUnknown() bool }
+	if !errors.Is(err, cause) || !errors.As(err, &unknown) || !unknown.CommitOutcomeUnknown() || implementation.executed || len(allocator.starts) != 1 {
+		t.Fatalf("error=%v executed=%v allocations=%d", err, implementation.executed, len(allocator.starts))
+	}
+}
 
 type guardedCapability struct {
 	manifest Manifest
@@ -234,7 +278,7 @@ func TestProviderInvocationBoundaryGatesAndPropagatesExactIDs(t *testing.T) {
 	}
 }
 
-func TestMalformedProbeSourceHasNoResultAdmissionProvenance(t *testing.T) {
+func TestMalformedProbeSourcePreservesResultAdmissionProvenanceAndDiagnostic(t *testing.T) {
 	registry := NewRegistry()
 	if err := registry.Register(malformedProbeCapability{}); err != nil {
 		t.Fatal(err)
@@ -250,8 +294,11 @@ func TestMalformedProbeSourceHasNoResultAdmissionProvenance(t *testing.T) {
 	if err == nil || result.Action.Error == nil || result.Action.Error.Classification != "source_contract" {
 		t.Fatalf("result=%#v error=%v", result, err)
 	}
-	if result.ProviderAttemptID != nil || result.AdmissionProvenance != nil {
-		t.Fatalf("source contract failure exposed result admission provenance: %#v", result)
+	if result.ProviderAttemptID == nil || result.AdmissionProvenance == nil || *result.ProviderAttemptID != invocations.startIDs[0] || result.AdmissionProvenance.ProviderAttemptID != invocations.startIDs[0] {
+		t.Fatalf("source contract failure lost result admission provenance: %#v", result)
+	}
+	if len(result.RawDiagnostic) == 0 {
+		t.Fatalf("source contract failure lost its complete diagnostic: %#v", result)
 	}
 	if len(invocations.starts) != 1 || len(invocations.terminals) != 1 || invocations.terminals[0].Outcome != ProviderInvocationFailed {
 		t.Fatalf("provider audit=%#v", invocations)
@@ -436,10 +483,10 @@ func TestProviderTerminalClassificationPrecedence(t *testing.T) {
 		}, want: ProviderInvocationCancelled},
 		{name: "wrapped deadline", execute: func(context.Context) (Result, error) {
 			return Result{}, fmt.Errorf("provider stopped: %w", context.DeadlineExceeded)
-		}, want: ProviderInvocationCancelled},
+		}, want: ProviderInvocationTimedOut},
 		{name: "provider local timeout", execute: func(context.Context) (Result, error) {
 			return Result{Action: domain.ActionResult{Status: "failed", Error: &domain.StructuredError{Classification: "timeout", Message: "process exited"}}, ToolRun: &domain.ToolRun{TimedOut: true}}, errors.New("exit status 1")
-		}, want: ProviderInvocationCancelled},
+		}, want: ProviderInvocationTimedOut},
 		{name: "explicit cancellation status", execute: func(context.Context) (Result, error) {
 			return Result{Action: domain.ActionResult{Status: "cancelled"}}, nil
 		}, want: ProviderInvocationCancelled},
@@ -448,7 +495,7 @@ func TestProviderTerminalClassificationPrecedence(t *testing.T) {
 		}, want: ProviderInvocationCancelled},
 		{name: "explicit timeout status", execute: func(context.Context) (Result, error) {
 			return Result{Action: domain.ActionResult{Status: "timeout"}}, nil
-		}, want: ProviderInvocationCancelled},
+		}, want: ProviderInvocationTimedOut},
 		{name: "late cancellation after ordinary failure", execute: func(ctx context.Context) (Result, error) {
 			ctx.(interface{ cancel() }).cancel()
 			return Result{Action: domain.ActionResult{Status: "failed", Error: &domain.StructuredError{Classification: "provider_error"}}}, errors.New("ordinary provider failure")

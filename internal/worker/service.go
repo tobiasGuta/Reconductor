@@ -140,7 +140,7 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 		return err
 	}
 	if done {
-		return s.Queue.Ack(ctx, d.MessageID, domain.ActionResult{RequestID: d.Job.Action.ID, Status: "succeeded", Summary: "duplicate delivery already completed"})
+		return s.Queue.Ack(ctx, d.MessageID, domain.QueueResultV1{Version: "queue-result/v1", ActionRequestID: d.Job.Action.ID, Status: "succeeded", Summary: "duplicate delivery already completed"})
 	}
 	sc, err := platformscope.Compile(d.Job.ScopeIncludes, d.Job.ScopeExcludes)
 	if err != nil {
@@ -172,22 +172,19 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 		}
 	}
 	result, runErr := s.executeJob(ctx, d, provider, sc, auditor)
-	if result.TerminalAuditError != nil {
-		logger := s.Logger
-		if logger == nil {
-			logger = slog.Default()
-		}
-		var providerAttemptID domain.ID
-		if result.ProviderAttemptID != nil {
-			providerAttemptID = *result.ProviderAttemptID
-		}
-		logger.Warn("provider invocation terminal audit failed", "provider_attempt_id", providerAttemptID)
+	if domain.PersistenceUnresolved(runErr) {
+		// Leave the delivery pending. Neither retry nor dead-letter is a known
+		// outcome while the original result may still be committed.
+		return runErr
 	}
 	if runErr != nil {
 		retryable := result.Action.Error != nil && result.Action.Error.Retryable
 		return s.Queue.Fail(ctx, d.MessageID, d.Job, runErr.Error(), retryable)
 	}
-	return s.Queue.Ack(ctx, d.MessageID, result.Action)
+	if result.Envelope == nil {
+		return fmt.Errorf("worker result has no admitted bounded envelope")
+	}
+	return s.Queue.Ack(ctx, d.MessageID, *result.Envelope)
 }
 
 func (s *Service) executeJob(ctx context.Context, d queue.Delivery, provider string, sc capability.Scope, auditor capability.PolicyDecisionRecorder) (capability.Result, error) {

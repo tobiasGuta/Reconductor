@@ -12,6 +12,8 @@ Capability manifests also declare authentication, directory-fuzzing, cross-origi
 
 Internal capabilities use the same contract discipline as command providers: concrete typed inputs and outputs, closed JSON Schemas, strict unknown-field rejection, and semantic validation during workflow-definition loading and immediately before execution.
 
+Large semantic results use durable prepared evidence and artifact-backed result envelopes. Workflow bindings authorize the exact adopted artifact through immutable run topology and materialize only a bounded selected value; full provider evidence remains in retained artifacts rather than being copied into every downstream step input.
+
 Endpoint intelligence is deterministic and evidence-based. Scope-authorized HTTPX, Katana, and GAU records are classified using request shape, response metadata, JavaScript relationships, authentication indicators, technologies, API-schema evidence, history, and source confidence. Every promoted endpoint carries its labels, weighted signals, score, confidence, and provenance into the normalized result and changes report.
 
 Burp-compatible scope JSON is the targeting source of truth. Exact active seeds stay separate from passive discovery roots: `*.dev.example.test` may derive the passive root `dev.example.test`, but that root is never probed unless a complete protocol/host/port/path evaluation independently authorizes it. Exclusions always win.
@@ -196,10 +198,11 @@ docker compose up -d postgres redis
 go run ./cmd/platform migrate
 $env:ARTIFACT_STORE_ID = '<native-store-uuid>'
 go run ./cmd/platform artifact-store init
+go run ./cmd/platform artifact-store prepared-limits --max-open-sets 128 --max-set-bytes 1048576 --max-unresolved-bytes 134217728
 go run ./cmd/platform capabilities
 ```
 
-Artifact-producing commands require a pre-initialized store. Native and Docker roots are separate physical stores and require different IDs; see [artifact storage ownership](docs/artifact-storage.md).
+Artifact-producing commands require a pre-initialized store and explicit prepared-evidence limits. The values above are a conservative local example: one MiB per provider result, at most 128 unresolved sets, and 128 MiB of unresolved reservations. Choose deployment values deliberately. Native and Docker roots are separate physical stores and require different IDs; see [artifact storage ownership](docs/artifact-storage.md).
 
 Set an optional project/data root for portable logical scope references, then
 start the persistent scheduler. Relative references resolve beneath
@@ -259,6 +262,7 @@ docker compose build worker
 docker compose up -d postgres redis
 docker compose run --rm --entrypoint /usr/local/bin/platform worker migrate
 docker compose run --rm --entrypoint /usr/local/bin/platform worker artifact-store init
+docker compose run --rm --entrypoint /usr/local/bin/platform worker artifact-store prepared-limits --max-open-sets 128 --max-set-bytes 1048576 --max-unresolved-bytes 134217728
 docker compose up -d worker
 ```
 
@@ -347,7 +351,7 @@ The platform records sanitized tool details rather than full raw command lines w
 
 ### Local Go run
 
-If you have PostgreSQL, Redis, and the required provider tools installed locally, you can use the same workflow without Docker:
+Native artifact publication requires Linux on ext, XFS, or Btrfs. On that supported host, if PostgreSQL, Redis, and the required provider tools are installed locally, you can use the same workflow without Docker. On Windows and other operating systems, use the Docker workflow above instead:
 
 ```powershell
 Copy-Item .env.example .env
@@ -355,6 +359,7 @@ docker compose up -d postgres redis
 $env:ARTIFACT_STORE_ID = '<native-store-uuid>'
 go run ./cmd/platform migrate
 go run ./cmd/platform artifact-store init
+go run ./cmd/platform artifact-store prepared-limits --max-open-sets 128 --max-set-bytes 1048576 --max-unresolved-bytes 134217728
 go run ./cmd/platform doctor
 go run ./cmd/platform capabilities
 go run ./cmd/platform program create --name acme --platform private --scope .\scope\acme.json
@@ -392,6 +397,9 @@ platform capabilities
 platform doctor [--format table|json]
 platform migrate
 platform artifact-store init [--allow-nonempty-root] [--resume-registration]
+platform artifact-store cleanup [--batch-size N]
+platform artifact-store prepared-limits --max-open-sets N --max-set-bytes N --max-unresolved-bytes N
+platform artifact-store prepared-recover [--batch-size N]
 ```
 
 `run retry <run-id>` accepts the same `--program-id`, `--domain`, `--scope`, and approval flags as `workflow run`; successful unchanged steps are retained. Queue inspection uses the single Redis consumer group and dead-letter stream.
@@ -416,7 +424,18 @@ Run migrations and explicitly initialize the matching physical store before star
 ```powershell
 docker compose run --rm --entrypoint /usr/local/bin/platform worker migrate
 docker compose run --rm --entrypoint /usr/local/bin/platform worker artifact-store init
+docker compose run --rm --entrypoint /usr/local/bin/platform worker artifact-store prepared-limits --max-open-sets 128 --max-set-bytes 1048576 --max-unresolved-bytes 134217728
 ```
+
+Prepared evidence is durable staging for provider results that have not yet completed publication and database adoption. Resolved sets continue to consume their configured reservation until recovery removes their staged copies and records them as cleaned. During a maintenance window, stop new workflow admission, drain artifact-producing processes, and run bounded recovery. Repeat bounded batches while occupancy decreases. If occupancy stops decreasing, investigate the retained unresolved or quarantined sets; quarantined sets require separate operator disposition and intentionally remain charged:
+
+```powershell
+docker compose stop worker
+docker compose run --rm --entrypoint /usr/local/bin/platform worker artifact-store prepared-recover --batch-size 100
+docker compose up -d worker
+```
+
+For native execution, stop the scheduler and active `platform workflow run` processes, then run the equivalent `go run ./cmd/platform artifact-store prepared-recover --batch-size 100`. Recovery never invokes a provider or allocates replacement execution identities. Run `platform doctor` afterward; it reports prepared-evidence occupancy and fails when another result cannot be admitted.
 
 There are two worker scaling knobs:
 
@@ -477,6 +496,7 @@ More detail: [architecture](docs/architecture.md), [operator console](docs/conso
 
 ## Current limitations
 
+- Durable result publication and prepared-evidence recovery are supported only on Linux over ext, XFS, or Btrfs filesystems. Native Windows and other operating systems fail closed before provider execution; use the Linux worker container there.
 - Local workflow execution requires compatible external tools; `platform doctor` reports missing, wrong, or incompatible binaries before a workflow starts. The versioned worker image bundles all registered external providers and the pinned Nuclei template snapshot.
 - Ambiguous host/protocol/port regexes remain enforceable by the full scope evaluator, but produce warnings and no invented active targets or ports.
 - The first successful workflow run necessarily treats all observed HTTP assets as new; later runs load the previous successful HTTP observation snapshot and compare stable status/technology fields.

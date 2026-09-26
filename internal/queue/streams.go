@@ -113,20 +113,42 @@ func (s *Streams) Touch(ctx context.Context, messageID string) error {
 	_, err := s.client.XClaim(ctx, &redis.XClaimArgs{Stream: s.names.Jobs, Group: s.group, Consumer: s.consumer, MinIdle: 0, Messages: []string{messageID}}).Result()
 	return err
 }
-func (s *Streams) Ack(ctx context.Context, messageID string, result domain.ActionResult) error {
+func (s *Streams) Ack(ctx context.Context, messageID string, result any) error {
+	requestID := domain.ID("")
+	switch value := result.(type) {
+	case domain.ResultEnvelopeV1:
+		if err := value.Validate(); err != nil {
+			return err
+		}
+		requestID = value.ActionRequestID
+	case domain.QueueResultV1:
+		if value.Version != "queue-result/v1" || (value.Status != "succeeded" && value.Status != "failed" && value.Status != "retryable" && value.Status != "cancelled") {
+			return fmt.Errorf("invalid bounded queue result")
+		}
+		if _, err := domain.ParseID(string(value.ActionRequestID)); err != nil {
+			return fmt.Errorf("invalid bounded queue result")
+		}
+		if err := domain.ValidateUTF8Bytes("queue result summary", value.Summary, domain.SafeMessageMaxBytes); err != nil {
+			return fmt.Errorf("invalid bounded queue result")
+		}
+		requestID = value.ActionRequestID
+	default:
+		return fmt.Errorf("queue acknowledgement requires a bounded result envelope or projection")
+	}
 	b, err := json.Marshal(result)
 	if err != nil {
 		return err
 	}
 	pipe := s.client.TxPipeline()
-	pipe.XAdd(ctx, &redis.XAddArgs{Stream: s.names.Results, Values: map[string]any{"payload": string(b), "request_id": string(result.RequestID)}})
+	pipe.XAdd(ctx, &redis.XAddArgs{Stream: s.names.Results, Values: map[string]any{"payload": string(b), "request_id": string(requestID)}})
 	pipe.XAck(ctx, s.names.Jobs, s.group, messageID)
 	pipe.XDel(ctx, s.names.Jobs, messageID)
-	pipe.XAdd(ctx, &redis.XAddArgs{Stream: s.names.Events, Values: map[string]any{"event": "job_completed", "request_id": string(result.RequestID), "message_id": messageID}})
+	pipe.XAdd(ctx, &redis.XAddArgs{Stream: s.names.Events, Values: map[string]any{"event": "job_completed", "request_id": string(requestID), "message_id": messageID}})
 	_, err = pipe.Exec(ctx)
 	return err
 }
 func (s *Streams) Fail(ctx context.Context, messageID string, j Job, classified string, retryable bool) error {
+	classified = domain.BoundUTF8(classified, domain.SafeMessageMaxBytes)
 	j.Attempt++
 	if retryable && j.Attempt <= s.maxRetries {
 		delay := s.retryBase * time.Duration(1<<min(j.Attempt-1, 10))

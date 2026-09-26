@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/providers"
 	commandprovider "github.com/tobiasGuta/Reconductor/internal/providers/command"
 	"github.com/tobiasGuta/Reconductor/internal/redaction"
+	"github.com/tobiasGuta/Reconductor/internal/resultadmission"
 )
 
 var errFakeExit = errors.New("exit status 1")
@@ -32,29 +34,104 @@ func (failingRunner) Run(context.Context, string, []string, []byte) ([]byte, []b
 func (failingRunner) Version(context.Context, string, []string) (string, error) { return "test-1", nil }
 
 type capturedStore struct {
-	called         bool
-	persisted      bool
-	publications   int
-	step           domain.StepRun
-	tool           *domain.ToolRun
-	artifacts      []domain.Artifact
-	result         domain.ActionResult
-	admission      *capability.ResultAdmissionProvenance
-	err            error
-	previous       []string
-	loadedFor      string
-	historyLoads   int
-	effective      json.RawMessage
-	effectiveFound bool
-	effectiveErr   error
-	effectiveLoads int
-	effectiveSaves int
-	policyID       domain.ID
-	startID        domain.ID
-	start          capability.ProviderInvocationStartRecord
-	terminal       capability.ProviderInvocationTerminalRecord
-	startErr       error
-	terminalErr    error
+	reservedCapacity   int64
+	rejections         int
+	rejectionErr       error
+	rejectedOccurrence domain.ID
+	called             bool
+	persisted          bool
+	publications       int
+	step               domain.StepRun
+	tool               *domain.ToolRun
+	artifacts          []domain.Artifact
+	result             domain.ActionResult
+	admission          *capability.ResultAdmissionProvenance
+	err                error
+	previous           []string
+	loadedFor          string
+	historyLoads       int
+	effective          json.RawMessage
+	effectiveFound     bool
+	effectiveErr       error
+	effectiveLoads     int
+	effectiveSaves     int
+	policyID           domain.ID
+	startID            domain.ID
+	start              capability.ProviderInvocationStartRecord
+	terminal           capability.ProviderInvocationTerminalRecord
+	startErr           error
+	terminalErr        error
+	publishingErr      error
+	publishingAt       int
+	sealErr            error
+	sealAt             int
+	adoptErrors        []error
+	adoptCalls         int
+	terminalized       int
+	terminalState      domain.PublicationState
+	terminalizeErr     error
+	recoveryRecords    []domain.PreparedSetRecord
+	recoveryStates     []domain.PublicationState
+	cleanedSets        []domain.ID
+	cleanErrors        []error
+}
+
+func (s *capturedStore) AllocateProviderInvocation(_ context.Context, record capability.ProviderInvocationStartRecord, _ artifact.StoreIdentity) (capability.ProviderInvocationAdmission, error) {
+	s.start = record
+	if s.startErr != nil {
+		return capability.ProviderInvocationAdmission{}, s.startErr
+	}
+	if s.startID == "" {
+		s.startID = domain.NewID()
+	}
+	capacity := s.reservedCapacity
+	if capacity == 0 {
+		capacity = 1 << 30
+	}
+	return capability.ProviderInvocationAdmission{ProviderAttemptID: s.startID, PreparedSetID: domain.NewID(), ManifestID: domain.NewID(), ReservedCapacityBytes: capacity}, nil
+}
+
+func (s *capturedStore) RejectPreparedEvidence(_ context.Context, _ domain.ID, _ domain.StepRun, compiled resultadmission.CompiledResult, admission capability.ResultAdmissionProvenance, request artifact.PreparedStageRequest, limit domain.ResultContractLimitV1) error {
+	s.rejections++
+	s.rejectedOccurrence = compiled.ResultOccurrenceID
+	if compiled.PreparedSetID != admission.PreparedSetID || request.SetID != compiled.PreparedSetID || limit.Limit != uint64(admission.ReservedCapacityBytes) {
+		return errors.New("rejection identity contradiction")
+	}
+	return s.rejectionErr
+}
+
+func TestOversizedEvidenceIsKnownNonadmissionBeforeStaging(t *testing.T) {
+	store, artifacts := &capturedStore{reservedCapacity: 1024}, &capturedArtifacts{}
+	result, err := executePublicationPipeline(t, store, artifacts, bytes.Repeat([]byte("x"), 8192))
+	var capacity *artifact.PreparedCapacityError
+	if !errors.As(err, &capacity) || domain.PersistenceUnresolved(err) {
+		t.Fatalf("classification=%v", err)
+	}
+	if store.rejections != 1 || store.rejectedOccurrence != artifacts.compiled.ResultOccurrenceID || result.Envelope != nil || result.Action.Error == nil || result.Action.Error.Classification != "result_contract_limit" || result.Action.Error.Retryable {
+		t.Fatalf("rejections=%d result=%#v", store.rejections, result.Action)
+	}
+	if len(artifacts.prepared) != 0 || len(artifacts.requests) != 0 || store.persisted || store.adoptCalls != 0 || store.publications != 0 {
+		t.Fatal("oversized result staged or published")
+	}
+}
+
+func TestOversizedRejectionFailureRemainsUnresolvedWithSameIdentity(t *testing.T) {
+	for _, failure := range []error{errors.New("database unavailable"), &injectedCommitUnknown{operation: "nonadmission"}} {
+		store, artifacts := &capturedStore{reservedCapacity: 1024, rejectionErr: failure}, &capturedArtifacts{}
+		_, err := executePublicationPipeline(t, store, artifacts, bytes.Repeat([]byte("x"), 8192))
+		if !domain.PersistenceUnresolved(err) || !errors.Is(err, failure) || store.rejections != 1 || store.rejectedOccurrence != artifacts.compiled.ResultOccurrenceID || artifacts.deleteCalls != 0 || store.adoptCalls != 0 {
+			t.Fatalf("error=%v rejections=%d", err, store.rejections)
+		}
+	}
+}
+
+func (s *capturedStore) SealPreparedEvidence(_ context.Context, record resultadmission.PreparedSealRecord) error {
+	s.terminal = capability.ProviderInvocationTerminalRecord{ProviderAttemptID: record.Admission.ProviderAttemptID, Outcome: record.Outcome}
+	return s.terminalErr
+}
+
+func (s *capturedStore) QuarantinePreparedEvidence(context.Context, domain.ID, string) error {
+	return nil
 }
 
 func (s *capturedStore) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
@@ -530,6 +607,75 @@ func (s *capturedStore) PersistResultWithArtifactPublication(ctx context.Context
 	return nil
 }
 
+func (s *capturedStore) PersistPreProviderFailure(_ context.Context, _ domain.ID, step domain.StepRun, summary string) error {
+	s.called = true
+	if s.err != nil {
+		return s.err
+	}
+	s.persisted, s.step, s.tool = true, step, nil
+	s.result = domain.ActionResult{Status: string(step.Status), Summary: summary, Error: &domain.StructuredError{Classification: step.ErrorClassification, Message: step.ErrorDetails}}
+	return nil
+}
+
+func (s *capturedStore) ReserveCompiledResult(_ context.Context, _ domain.ID, _ domain.StepRun, _ resultadmission.CompiledResult, _ *capability.ResultAdmissionProvenance, _ artifact.StoreIdentity) error {
+	s.called = true
+	if s.err != nil {
+		return s.err
+	}
+	s.publications++
+	return nil
+}
+
+func (s *capturedStore) MarkCompiledArtifactPublishing(_ context.Context, _ resultadmission.CompiledResult, ordinal int) error {
+	if s.publishingErr != nil && ordinal == s.publishingAt {
+		return s.publishingErr
+	}
+	return nil
+}
+func (s *capturedStore) SealCompiledArtifact(_ context.Context, _ resultadmission.CompiledResult, ordinal int) error {
+	if s.sealErr != nil && ordinal == s.sealAt {
+		return s.sealErr
+	}
+	return nil
+}
+func (s *capturedStore) TerminalizeCompiledResult(_ context.Context, _ resultadmission.CompiledResult, state domain.PublicationState, _ string) error {
+	s.terminalized++
+	s.terminalState = state
+	return s.terminalizeErr
+}
+func (s *capturedStore) AdoptCompiledResult(_ context.Context, _ domain.ID, step domain.StepRun, compiled resultadmission.CompiledResult, admission *capability.ResultAdmissionProvenance, _ time.Duration) error {
+	s.adoptCalls++
+	if len(s.adoptErrors) >= s.adoptCalls && s.adoptErrors[s.adoptCalls-1] != nil {
+		return s.adoptErrors[s.adoptCalls-1]
+	}
+	step.Output = append(json.RawMessage(nil), compiled.EnvelopeJSON...)
+	artifacts := make([]domain.Artifact, 0, len(compiled.Artifacts))
+	for _, item := range compiled.Artifacts {
+		storeID, key := item.Reference.ArtifactStoreID, item.Reference.StorageKey
+		artifacts = append(artifacts, domain.Artifact{ID: item.Reference.ArtifactID, TaskID: s.start.TaskID, WorkflowRunID: step.WorkflowRunID, StepRunID: step.ID, ToolRunID: compiled.ToolRun.ID, Type: item.ArtifactType, ContentType: item.Reference.ContentType, Size: item.Reference.ContentSizeBytes, SHA256: item.Reference.ContentSHA256, AddressingVersion: 1, ArtifactStoreID: &storeID, StorageKey: &key})
+	}
+	semanticIDs := []domain.ID{compiled.Envelope.SemanticOutput.ArtifactID}
+	s.persisted, s.step, s.artifacts, s.result = true, step, artifacts, domain.ActionResult{RequestID: compiled.Envelope.ActionRequestID, Status: string(compiled.Envelope.Status), Summary: compiled.Envelope.Summary, Output: compiled.EnvelopeJSON, ArtifactIDs: semanticIDs}
+	tool := compiled.ToolRun
+	s.tool = &tool
+	s.admission = admission
+	return nil
+}
+
+func (s *capturedStore) ListPreparedEvidence(context.Context, domain.ID, domain.ID, int) ([]domain.PreparedSetRecord, error) {
+	return append([]domain.PreparedSetRecord(nil), s.recoveryRecords...), nil
+}
+func (s *capturedStore) MarkPreparedEvidenceCleaned(_ context.Context, setID domain.ID) error {
+	s.cleanedSets = append(s.cleanedSets, setID)
+	if len(s.cleanErrors) >= len(s.cleanedSets) {
+		return s.cleanErrors[len(s.cleanedSets)-1]
+	}
+	return nil
+}
+func (s *capturedStore) CompiledPublicationStates(context.Context, resultadmission.CompiledResult) ([]domain.PublicationState, error) {
+	return append([]domain.PublicationState(nil), s.recoveryStates...), nil
+}
+
 func TestFailedProviderAndPersistenceErrorsAreBothPreserved(t *testing.T) {
 	registry := capability.NewRegistry()
 	provider := commandprovider.New(commandprovider.Definition{Name: "probe.http", Provider: "fake-httpx", Executable: "fake-httpx", Version: "1", Risk: policy.Low, BuildArgs: func(i commandprovider.Input, _ policy.Policy) ([]string, error) {
@@ -575,9 +721,129 @@ func TestArtifactPublicationFailurePreventsResultAcceptance(t *testing.T) {
 }
 
 type capturedArtifacts struct {
-	requests []artifact.PutRequest
-	err      error
+	requests    []artifact.PutRequest
+	err         error
+	req         capability.Request
+	compiled    resultadmission.CompiledResult
+	undurable   bool
+	sizeDelta   int64
+	badDigest   bool
+	closeErr    error
+	failAfter   int
+	prepared    map[string][]byte
+	deleteCalls int
 }
+
+var capturedPublisherIdentity = artifact.StoreIdentity{ArtifactStoreID: "00000000-0000-4000-8000-000000009002", IncarnationNonce: "00000000-0000-4000-8000-000000009003", BackendKind: artifact.BackendKind, MarkerFormat: artifact.MarkerFormat, MarkerVersion: artifact.MarkerVersion}
+
+func (s *capturedArtifacts) Identity() artifact.StoreIdentity { return capturedPublisherIdentity }
+func (s *capturedArtifacts) CaptureCompiledPublication(req capability.Request, compiled resultadmission.CompiledResult) {
+	s.req, s.compiled = req, compiled
+}
+func (s *capturedArtifacts) AcquirePublisher(_ context.Context, expected artifact.StoreIdentity) (artifact.PublisherGuard, error) {
+	if expected != capturedPublisherIdentity {
+		return nil, errors.New("identity mismatch")
+	}
+	return &capturedPublisherGuard{owner: s}, nil
+}
+func (s *capturedArtifacts) AcquirePreparedRecovery(_ context.Context, expected artifact.StoreIdentity) (artifact.PreparedRecoveryGuard, error) {
+	if expected != capturedPublisherIdentity {
+		return nil, errors.New("identity mismatch")
+	}
+	return &capturedRecoveryGuard{capturedPublisherGuard: capturedPublisherGuard{owner: s}}, nil
+}
+
+type capturedRecoveryGuard struct{ capturedPublisherGuard }
+
+func (g *capturedRecoveryGuard) InspectPrepared(_ context.Context, setID domain.ID) (artifact.PreparedInspection, error) {
+	manifestKey, _ := domain.PreparedManifestKey(setID)
+	manifestJSON, ok := g.owner.prepared[manifestKey]
+	if !ok {
+		return artifact.PreparedInspection{}, os.ErrNotExist
+	}
+	manifest, err := domain.DecodePreparedManifestV1(manifestJSON)
+	if err != nil {
+		return artifact.PreparedInspection{}, err
+	}
+	controlJSON := g.owner.prepared[manifest.Control.StorageKey]
+	control, err := domain.DecodePreparedControlV1(controlJSON)
+	if err != nil {
+		return artifact.PreparedInspection{}, err
+	}
+	return artifact.PreparedInspection{Manifest: manifest, ManifestJSON: append([]byte(nil), manifestJSON...), Control: control, ControlJSON: append([]byte(nil), controlJSON...), Durable: true}, nil
+}
+func (*capturedRecoveryGuard) VerifyReserved(context.Context, artifact.ReservedArtifactV1) (artifact.PublishedArtifactV1, bool, error) {
+	return artifact.PublishedArtifactV1{}, false, nil
+}
+func (g *capturedRecoveryGuard) DeleteResolvedPrepared(context.Context, domain.PreparedSetRecord) (artifact.PreparedDeletionOutcome, error) {
+	g.owner.deleteCalls++
+	if g.owner.deleteCalls > 1 {
+		return artifact.PreparedContentAlreadyAbsent, nil
+	}
+	return artifact.PreparedContentRemoved, nil
+}
+
+type capturedPublisherGuard struct {
+	owner  *capturedArtifacts
+	closed bool
+}
+
+func (g *capturedPublisherGuard) Identity() artifact.StoreIdentity { return capturedPublisherIdentity }
+func (g *capturedPublisherGuard) StagePrepared(_ context.Context, request artifact.PreparedStageRequest) (artifact.PreparedStageReceipt, error) {
+	if g.owner.prepared == nil {
+		g.owner.prepared = map[string][]byte{}
+	}
+	contentBytes := int64(0)
+	for _, object := range append([]artifact.PreparedStageObject{request.Control}, request.Members...) {
+		reader, err := object.Source.Open()
+		if err != nil {
+			return artifact.PreparedStageReceipt{}, err
+		}
+		data, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil || closeErr != nil || int64(len(data)) != object.ExpectedSize || artifact.DigestBytes(data) != object.ExpectedSHA256 {
+			return artifact.PreparedStageReceipt{}, errors.Join(readErr, closeErr, errors.New("invalid prepared stage object"))
+		}
+		g.owner.prepared[object.StorageKey] = data
+		contentBytes += int64(len(data))
+	}
+	g.owner.prepared[request.ManifestKey] = append([]byte(nil), request.ManifestJSON...)
+	return artifact.PreparedStageReceipt{ManifestSize: int64(len(request.ManifestJSON)), ManifestSHA256: artifact.DigestBytes(request.ManifestJSON), MemberCount: len(request.Members), ContentBytes: contentBytes, Durable: true}, nil
+}
+func (g *capturedPublisherGuard) OpenPrepared(_ context.Context, key string, size int64, digest [32]byte) (io.ReadCloser, error) {
+	data, ok := g.owner.prepared[key]
+	if !ok || int64(len(data)) != size || artifact.DigestBytes(data) != digest {
+		return nil, errors.New("prepared object unavailable")
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+func (g *capturedPublisherGuard) PublishReserved(_ context.Context, reserved artifact.ReservedArtifactV1, reader io.Reader) (artifact.PublishedArtifactV1, error) {
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return artifact.PublishedArtifactV1{}, err
+	}
+	var item resultadmission.PreparedArtifact
+	for _, candidate := range g.owner.compiled.Artifacts {
+		if candidate.Reference.ArtifactID == reserved.ArtifactID {
+			item = candidate
+			break
+		}
+	}
+	name := map[domain.ResultArtifactRoleV1]string{domain.ArtifactRoleProviderStdout: "stdout.jsonl", domain.ArtifactRoleProviderStderr: "stderr.txt", domain.ArtifactRoleProviderDiagnostic: "diagnostic.bin", domain.ArtifactRoleSemanticResult: "result.json"}[item.Reference.Role]
+	g.owner.requests = append(g.owner.requests, artifact.PutRequest{ProgramID: g.owner.req.ProgramID, TaskID: g.owner.req.Action.TaskID, WorkflowRunID: g.owner.req.Action.WorkflowRunID, StepRunID: g.owner.req.Action.StepRunID, ToolRunID: g.owner.compiled.ToolRun.ID, Type: item.ArtifactType, ContentType: item.Reference.ContentType, Name: name, Retention: g.owner.req.Policy.ArtifactRetention, Data: data})
+	if g.owner.err != nil {
+		return artifact.PublishedArtifactV1{}, g.owner.err
+	}
+	if g.owner.failAfter > 0 && len(g.owner.requests) >= g.owner.failAfter {
+		return artifact.PublishedArtifactV1{}, errors.New("injected physical write failure")
+	}
+	digest := reserved.ExpectedSHA256
+	if g.owner.badDigest {
+		digest[0] ^= 1
+	}
+	return artifact.PublishedArtifactV1{SizeBytes: int64(len(data)) + g.owner.sizeDelta, SHA256: digest, Durable: !g.owner.undurable}, nil
+}
+func (g *capturedPublisherGuard) Close() error { g.closed = true; return g.owner.closeErr }
 
 func (s *capturedArtifacts) Put(_ context.Context, req artifact.PutRequest) (domain.Artifact, error) {
 	s.requests = append(s.requests, req)
@@ -596,6 +862,309 @@ func (s *capturedArtifacts) Put(_ context.Context, req artifact.PutRequest) (dom
 type allowedScope struct{}
 
 func (allowedScope) Allows(string) bool { return true }
+
+type publicationPipelineCapability struct {
+	stdout []byte
+	output json.RawMessage
+}
+
+func (c publicationPipelineCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "compare.assets", Version: "2", Risk: policy.Low, RetrySafe: true, Idempotent: true, OutputSchema: json.RawMessage(`{"type":"object"}`)}
+}
+func (publicationPipelineCapability) Validate(context.Context, capability.Request) error { return nil }
+func (c publicationPipelineCapability) Execute(_ context.Context, request capability.Request) (capability.Result, error) {
+	output := c.output
+	if len(output) == 0 {
+		output = json.RawMessage(`{}`)
+	}
+	return capability.Result{Action: domain.ActionResult{RequestID: request.Action.ID, Status: "succeeded", Summary: "pipeline", Output: append(json.RawMessage(nil), output...)}, RawStdout: append([]byte(nil), c.stdout...)}, nil
+}
+
+type injectedProjectionLimit struct{ limit domain.ResultContractLimitV1 }
+
+func (e *injectedProjectionLimit) Error() string { return "injected projection limit" }
+func (e *injectedProjectionLimit) ResultContractLimit() domain.ResultContractLimitV1 {
+	return e.limit
+}
+
+type injectedCommitUnknown struct{ operation string }
+
+func (e *injectedCommitUnknown) Error() string              { return e.operation + " commit failed" }
+func (e *injectedCommitUnknown) CommitOutcomeUnknown() bool { return true }
+
+func executePublicationPipeline(t *testing.T, store *capturedStore, artifacts *capturedArtifacts, stdout []byte) (capability.Result, error) {
+	return executePublicationPipelineResult(t, store, artifacts, stdout, nil)
+}
+
+func executePublicationPipelineResult(t *testing.T, store *capturedStore, artifacts *capturedArtifacts, stdout []byte, output json.RawMessage) (capability.Result, error) {
+	t.Helper()
+	registry := capability.NewRegistry()
+	if err := registry.Register(publicationPipelineCapability{stdout: stdout, output: output}); err != nil {
+		t.Fatal(err)
+	}
+	request := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "compare.assets", Input: json.RawMessage(`{}`), IdempotencyKey: "publication-pipeline", StepAttempt: 1}, Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}}, Scope: allowedScope{}}
+	return (Service{Registry: registry, Store: store, Artifacts: artifacts, ProgramID: domain.NewID()}).Execute(context.Background(), request)
+}
+
+func TestLargePublicationPipelineKeepsEveryControlProjectionBounded(t *testing.T) {
+	stdout := []byte(strings.Repeat("stdout evidence\n", 20_000))
+	semantic := json.RawMessage(`{"value":"` + strings.Repeat("x", 300_000) + `"}`)
+	store, artifacts := &capturedStore{}, &capturedArtifacts{}
+	result, err := executePublicationPipelineResult(t, store, artifacts, stdout, semantic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Envelope == nil || result.Envelope.SemanticOutput.Mode != domain.SemanticModeArtifactJSON || !store.persisted || store.tool == nil {
+		t.Fatalf("envelope=%#v persisted=%v tool=%#v", result.Envelope, store.persisted, store.tool)
+	}
+	if len(store.step.Output) > domain.ResultEnvelopeMaxBytes || bytes.Contains(store.step.Output, semantic[10:110]) || bytes.Contains(store.step.Output, stdout[:100]) {
+		t.Fatalf("StepRun.Output bytes=%d scaled with evidence", len(store.step.Output))
+	}
+	audit, err := json.Marshal(domain.ResultAuditProjectionV1{Version: 1, ActionRequestID: result.Envelope.ActionRequestID, ResultOccurrenceID: result.Envelope.ResultOccurrenceID, ProviderAttemptID: result.Envelope.ProviderAttemptID, Status: result.Envelope.Status, SemanticMode: result.Envelope.SemanticOutput.Mode, SemanticArtifactID: result.Envelope.SemanticOutput.ArtifactID, ArtifactCount: len(result.Envelope.Artifacts), EnvelopeSHA256: artifacts.compiled.EnvelopeSHA256})
+	if err != nil || len(audit) > domain.DiagnosticMaxBytes || bytes.Contains(audit, semantic[10:110]) {
+		t.Fatalf("audit bytes=%d error=%v", len(audit), err)
+	}
+	if len(artifacts.requests) != 2 {
+		t.Fatalf("physical artifacts=%d", len(artifacts.requests))
+	}
+	if len(artifacts.requests[0].Data) != len(stdout) || len(artifacts.requests[1].Data) != len(semantic) {
+		t.Fatalf("physical stdout=%d semantic=%d", len(artifacts.requests[0].Data), len(artifacts.requests[1].Data))
+	}
+	if len(store.tool.ArtifactIDs) != 2 || store.result.Output == nil || len(store.result.Output) > domain.ResultEnvelopeMaxBytes {
+		t.Fatalf("tool artifacts=%d bounded result=%d", len(store.tool.ArtifactIDs), len(store.result.Output))
+	}
+	t.Logf("stdout_evidence=%d semantic_evidence=%d envelope=%d audit=%d artifacts=%d", len(stdout), len(semantic), len(store.step.Output), len(audit), len(store.tool.ArtifactIDs))
+}
+
+func TestPublicationStagesSmallMemoryBackedMemberBeforeReservation(t *testing.T) {
+	store, artifacts := &capturedStore{}, &capturedArtifacts{}
+	result, err := executePublicationPipeline(t, store, artifacts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Envelope == nil || len(artifacts.compiled.Artifacts) != 1 {
+		t.Fatalf("compiled result=%#v members=%d", result.Envelope, len(artifacts.compiled.Artifacts))
+	}
+	memberKey, _ := domain.PreparedMemberKey(artifacts.compiled.PreparedSetID, 0)
+	member, ok := artifacts.prepared[memberKey]
+	if !ok || len(member) > 64*1024 || string(member) != "{}" {
+		t.Fatalf("small prepared member present=%v bytes=%d value=%q", ok, len(member), member)
+	}
+	manifestKey, _ := domain.PreparedManifestKey(artifacts.compiled.PreparedSetID)
+	if _, ok := artifacts.prepared[manifestKey]; !ok {
+		t.Fatal("prepared manifest was not staged")
+	}
+	if !store.persisted {
+		t.Fatal("small prepared member was not adopted")
+	}
+}
+
+func TestPreparedRecoveryReusesExactIdentitiesWithoutProviderReplay(t *testing.T) {
+	store, artifacts := &capturedStore{}, &capturedArtifacts{}
+	if _, err := executePublicationPipeline(t, store, artifacts, []byte("durable evidence\n")); err != nil {
+		t.Fatal(err)
+	}
+	compiled := artifacts.compiled
+	manifestKey, _ := domain.PreparedManifestKey(compiled.PreparedSetID)
+	manifestJSON := artifacts.prepared[manifestKey]
+	manifest, err := domain.DecodePreparedManifestV1(manifestJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlJSON := artifacts.prepared[manifest.Control.StorageKey]
+	contentBytes := int64(len(manifestJSON) + len(controlJSON))
+	for _, member := range manifest.Members {
+		contentBytes += member.ContentSizeBytes
+	}
+	manifestSize, manifestDigest, memberCount, occurrence := int64(len(manifestJSON)), artifact.DigestString(artifact.DigestBytes(manifestJSON)), len(manifest.Members), manifest.ResultOccurrenceID
+	store.recoveryRecords = []domain.PreparedSetRecord{{ID: manifest.SetID, ManifestID: manifest.ManifestID, ProviderAttemptID: manifest.ProviderAttemptID, ProgramID: artifacts.req.ProgramID, TaskID: artifacts.req.Action.TaskID, WorkflowRunID: artifacts.req.Action.WorkflowRunID, StepRunID: artifacts.req.Action.StepRunID, ActionRequestID: artifacts.req.Action.ID, StepAttempt: artifacts.req.Action.StepAttempt, ArtifactStoreID: capturedPublisherIdentity.ArtifactStoreID, StoreIncarnationNonce: capturedPublisherIdentity.IncarnationNonce, State: domain.PreparedSealed, ReservedCapacityBytes: contentBytes, ResultOccurrenceID: &occurrence, ProviderTerminalEventID: &compiled.ProviderTerminalEventID, ManifestStorageKey: &manifestKey, ManifestSizeBytes: &manifestSize, ManifestSHA256: &manifestDigest, MemberCount: &memberCount, ContentSizeBytes: &contentBytes}}
+	store.recoveryStates = make([]domain.PublicationState, len(compiled.Artifacts))
+	for index := range store.recoveryStates {
+		store.recoveryStates[index] = domain.PublicationSealed
+	}
+	beforeAdopts := store.adoptCalls
+	store.persisted = false
+	if err := (Service{Store: store, Artifacts: artifacts}).RecoverPreparedEvidence(context.Background(), 10); err != nil {
+		t.Fatal(err)
+	}
+	if store.adoptCalls != beforeAdopts+1 || !store.persisted || store.admission == nil || store.admission.PreparedSetID != compiled.PreparedSetID || store.admission.ProviderAttemptID != compiled.Envelope.ProviderAttemptID || store.result.RequestID != compiled.Envelope.ActionRequestID {
+		t.Fatalf("recovery adopts=%d persisted=%v admission=%#v result=%#v", store.adoptCalls, store.persisted, store.admission, store.result)
+	}
+	for _, boundary := range []string{"before prepared seal", "before reservation", "reserved", "publishing", "sealed", "adoption acknowledgement", "authority unavailable"} {
+		t.Run(boundary, func(t *testing.T) {
+			record := store.recoveryRecords[0]
+			candidate := &capturedStore{recoveryRecords: []domain.PreparedSetRecord{record}}
+			state := domain.PublicationSealed
+			switch boundary {
+			case "before prepared seal":
+				candidate.recoveryRecords[0].State = domain.PreparedAllocated
+			case "reserved":
+				state = domain.PublicationReserved
+			case "publishing":
+				state = domain.PublicationPublishing
+			case "adoption acknowledgement":
+				candidate.adoptErrors = []error{&injectedCommitUnknown{operation: "recovery adoption"}}
+			case "authority unavailable":
+				candidate.adoptErrors = []error{errors.New("exact recovery authority unavailable")}
+			}
+			if boundary != "before prepared seal" && boundary != "before reservation" {
+				candidate.recoveryStates = make([]domain.PublicationState, len(compiled.Artifacts))
+				for i := range candidate.recoveryStates {
+					candidate.recoveryStates[i] = state
+				}
+			}
+			err := (Service{Store: candidate, Artifacts: artifacts}).RecoverPreparedEvidence(context.Background(), 10)
+			unresolved := boundary == "adoption acknowledgement" || boundary == "authority unavailable"
+			if unresolved != domain.PersistenceUnresolved(err) || (!unresolved && err != nil) {
+				t.Fatalf("recovery error=%v", err)
+			}
+			if candidate.terminalized != 0 || len(candidate.cleanedSets) != 0 || candidate.startID != "" {
+				t.Fatal("recovery abandoned, cleaned or invoked provider")
+			}
+			if !unresolved && (candidate.admission == nil || candidate.admission.ProviderAttemptID != compiled.Envelope.ProviderAttemptID || candidate.admission.PreparedSetID != compiled.PreparedSetID || candidate.result.RequestID != compiled.Envelope.ActionRequestID) {
+				t.Fatal("recovery replaced result identities")
+			}
+		})
+	}
+}
+
+func TestResolvedPreparedCleanupRetriesAfterPhysicalDeletion(t *testing.T) {
+	setID := domain.NewID()
+	store := &capturedStore{recoveryRecords: []domain.PreparedSetRecord{{ID: setID, ArtifactStoreID: capturedPublisherIdentity.ArtifactStoreID, StoreIncarnationNonce: capturedPublisherIdentity.IncarnationNonce, State: domain.PreparedResolvedAdopted}}, cleanErrors: []error{&injectedCommitUnknown{operation: "cleanup"}, nil}}
+	artifacts := &capturedArtifacts{}
+	service := Service{Store: store, Artifacts: artifacts}
+	if err := service.RecoverPreparedEvidence(context.Background(), 10); !commitOutcomeUnknown(err) {
+		t.Fatalf("first cleanup error=%v", err)
+	}
+	if err := service.RecoverPreparedEvidence(context.Background(), 10); err != nil {
+		t.Fatal(err)
+	}
+	if artifacts.deleteCalls != 2 || len(store.cleanedSets) != 2 {
+		t.Fatalf("delete calls=%d cleaned transitions=%d", artifacts.deleteCalls, len(store.cleanedSets))
+	}
+}
+
+func TestPreparedRecoveryRetainsQuarantine(t *testing.T) {
+	record := domain.PreparedSetRecord{ID: domain.NewID(), ArtifactStoreID: capturedPublisherIdentity.ArtifactStoreID, StoreIncarnationNonce: capturedPublisherIdentity.IncarnationNonce, State: domain.PreparedQuarantined}
+	store, artifacts := &capturedStore{recoveryRecords: []domain.PreparedSetRecord{record}}, &capturedArtifacts{}
+	if err := (Service{Store: store, Artifacts: artifacts}).RecoverPreparedEvidence(context.Background(), 10); err != nil {
+		t.Fatal(err)
+	}
+	if artifacts.deleteCalls != 0 || len(store.cleanedSets) != 0 {
+		t.Fatalf("quarantine delete calls=%d cleaned=%d", artifacts.deleteCalls, len(store.cleanedSets))
+	}
+}
+
+func TestPublicationPipelineFailureInjectionPreservesAtomicVisibility(t *testing.T) {
+	failure := errors.New("injected failure")
+	tests := []struct {
+		name         string
+		configure    func(*capturedStore, *capturedArtifacts)
+		stdout       []byte
+		wantPhysical int
+		wantTerminal domain.PublicationState
+	}{
+		{"reservation transaction", func(store *capturedStore, _ *capturedArtifacts) { store.err = failure }, nil, 0, ""},
+		{"publishing transition", func(store *capturedStore, _ *capturedArtifacts) { store.publishingErr = failure }, nil, 0, domain.PublicationAbandoned},
+		{"physical write", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.err = failure }, nil, 1, domain.PublicationQuarantined},
+		{"size mismatch", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.sizeDelta = 1 }, nil, 1, domain.PublicationQuarantined},
+		{"digest mismatch", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.badDigest = true }, nil, 1, domain.PublicationQuarantined},
+		{"durability failure", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.undurable = true }, nil, 1, domain.PublicationQuarantined},
+		{"seal transition", func(store *capturedStore, _ *capturedArtifacts) { store.sealErr = failure }, nil, 1, domain.PublicationAbandoned},
+		{"partial multi artifact", func(_ *capturedStore, artifacts *capturedArtifacts) { artifacts.failAfter = 2 }, []byte("stdout"), 2, domain.PublicationQuarantined},
+		{"adoption precommit", func(store *capturedStore, _ *capturedArtifacts) { store.adoptErrors = []error{failure} }, nil, 1, ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, artifacts := &capturedStore{}, &capturedArtifacts{}
+			test.configure(store, artifacts)
+			_, err := executePublicationPipeline(t, store, artifacts, test.stdout)
+			if err == nil {
+				t.Fatal("injected failure was not returned")
+			}
+			if len(artifacts.requests) != test.wantPhysical || store.persisted || store.tool != nil || len(store.artifacts) != 0 {
+				t.Fatalf("physical=%d persisted=%v tool=%#v artifacts=%d", len(artifacts.requests), store.persisted, store.tool, len(store.artifacts))
+			}
+			if (store.terminalized > 0) != (test.wantTerminal != "") {
+				t.Fatalf("terminalized=%d want=%s", store.terminalized, test.wantTerminal)
+			}
+			if store.terminalized > 0 && store.terminalState != test.wantTerminal {
+				t.Fatalf("terminal state=%s want=%s", store.terminalState, test.wantTerminal)
+			}
+		})
+	}
+}
+
+func TestProjectionLimitRollsBackThenAdoptsFailedEnvelopeAgainstSealedSet(t *testing.T) {
+	limit := domain.ResultContractLimitV1{Subject: domain.LimitProjectionItem, Unit: domain.LimitBytes, Limit: domain.ResultEnvelopeMaxBytes, Observed: domain.ResultEnvelopeMaxBytes + 1}
+	store := &capturedStore{adoptErrors: []error{&injectedProjectionLimit{limit: limit}, nil}}
+	result, err := executePublicationPipeline(t, store, &capturedArtifacts{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "result_contract_limit") {
+		t.Fatalf("failed-result admission error=%v", err)
+	}
+	if store.adoptCalls != 2 || !store.persisted || store.terminalized != 0 || result.Envelope == nil || result.Envelope.Status != domain.ResultStatusFailed || result.Envelope.ProviderOutcome != domain.ResultProviderSucceeded || result.Envelope.Error == nil || result.Envelope.Error.Code != "result_contract_limit" || result.Envelope.SemanticOutput.ProjectionState != domain.ProjectionRejected {
+		t.Fatalf("adopts=%d persisted=%v terminalized=%d envelope=%#v", store.adoptCalls, store.persisted, store.terminalized, result.Envelope)
+	}
+}
+
+func TestCommitUnknownNeverTerminalizesOrReplays(t *testing.T) {
+	t.Run("reservation", func(t *testing.T) {
+		store := &capturedStore{err: &injectedCommitUnknown{operation: "reservation"}}
+		_, err := executePublicationPipeline(t, store, &capturedArtifacts{}, nil)
+		if err == nil || store.terminalized != 0 || store.adoptCalls != 0 {
+			t.Fatalf("error=%v terminalized=%d adopts=%d", err, store.terminalized, store.adoptCalls)
+		}
+	})
+	t.Run("adoption", func(t *testing.T) {
+		store := &capturedStore{adoptErrors: []error{&injectedCommitUnknown{operation: "adoption"}}}
+		_, err := executePublicationPipeline(t, store, &capturedArtifacts{}, nil)
+		if err == nil || store.terminalized != 0 || store.adoptCalls != 1 || store.persisted {
+			t.Fatalf("error=%v terminalized=%d adopts=%d persisted=%v", err, store.terminalized, store.adoptCalls, store.persisted)
+		}
+	})
+}
+
+func TestCommitUnknownAtEveryPreparedPublicationBoundaryRetainsEvidence(t *testing.T) {
+	unknown := &injectedCommitUnknown{operation: "injected"}
+	tests := []struct {
+		name      string
+		configure func(*capturedStore, *capturedArtifacts)
+	}{
+		{"prepared sealing", func(store *capturedStore, _ *capturedArtifacts) { store.terminalErr = unknown }},
+		{"publishing transition", func(store *capturedStore, _ *capturedArtifacts) { store.publishingErr = unknown }},
+		{"final sealing transition", func(store *capturedStore, _ *capturedArtifacts) { store.sealErr = unknown }},
+		{"terminalization", func(store *capturedStore, artifacts *capturedArtifacts) {
+			artifacts.err = errors.New("known publication failure")
+			store.terminalizeErr = unknown
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, artifacts := &capturedStore{}, &capturedArtifacts{}
+			test.configure(store, artifacts)
+			_, err := executePublicationPipeline(t, store, artifacts, []byte("evidence\n"))
+			if !commitOutcomeUnknown(err) {
+				t.Fatalf("error=%v does not retain unresolved commit outcome", err)
+			}
+			if len(artifacts.prepared) == 0 || store.persisted {
+				t.Fatalf("prepared=%d persisted=%v", len(artifacts.prepared), store.persisted)
+			}
+			if test.name != "terminalization" && store.terminalized != 0 {
+				t.Fatalf("unresolved %s was terminalized", test.name)
+			}
+		})
+	}
+}
+
+func TestPublisherCloseFailureIsSecondaryAfterCommittedAdoption(t *testing.T) {
+	closeCause := errors.New("injected lock release failure")
+	store := &capturedStore{}
+	result, err := executePublicationPipeline(t, store, &capturedArtifacts{closeErr: closeCause}, nil)
+	var release *artifact.PublisherReleaseError
+	if !errors.Is(err, closeCause) || !errors.As(err, &release) || !store.persisted || store.terminalized != 0 || result.Envelope == nil || result.Envelope.Status != domain.ResultStatusSucceeded {
+		t.Fatalf("error=%v persisted=%v terminalized=%d envelope=%#v", err, store.persisted, store.terminalized, result.Envelope)
+	}
+}
 
 func TestFailedProviderAttemptPersistsToolStepArtifactsAndOriginalError(t *testing.T) {
 	registry := capability.NewRegistry()
@@ -730,8 +1299,8 @@ func TestOwningContextCancellationPersistsCancelledResult(t *testing.T) {
 	if store.terminal.Outcome != capability.ProviderInvocationCancelled || store.admission == nil || store.admission.StepAttempt != 1 || store.admission.ProviderAttemptID != store.startID || store.tool == nil || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != store.startID {
 		t.Fatalf("terminal=%#v admission=%#v tool=%#v start=%s", store.terminal, store.admission, store.tool, store.startID)
 	}
-	if len(artifacts.requests) != 0 || store.publications != 0 {
-		t.Fatalf("cancelled execution published artifacts: puts=%d publications=%d", len(artifacts.requests), store.publications)
+	if len(artifacts.requests) != 3 || store.publications != 1 {
+		t.Fatalf("cancelled execution did not preserve stdout, diagnostic, and canonical-null evidence: puts=%d publications=%d", len(artifacts.requests), store.publications)
 	}
 }
 
@@ -743,11 +1312,11 @@ func TestProviderOriginatedContextCanceledWithActiveCallerRemainsFailure(t *test
 	}
 	store := &capturedStore{}
 	ctx := context.Background()
-	result, err := (Service{Registry: registry, Store: store, ProgramID: domain.NewID()}).Execute(ctx, executionContextErrorRequest())
+	result, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(ctx, executionContextErrorRequest())
 	if !errors.Is(err, context.Canceled) || ctx.Err() != nil {
 		t.Fatalf("provider error=%v caller error=%v", err, ctx.Err())
 	}
-	if provider.calls != 1 || store.step.Status != domain.StepFailed || store.step.CompletedAt == nil || result.Action.Status != "failed" || result.Action.Error == nil || result.Action.Error.Classification != "execution" {
+	if provider.calls != 1 || store.step.Status != domain.StepCancelled || store.step.CompletedAt == nil || result.Action.Status != "failed" || result.Action.Error == nil || result.Action.Error.Classification != "execution" {
 		t.Fatalf("provider calls=%d result=%#v step=%#v", provider.calls, result.Action, store.step)
 	}
 	if store.terminal.Outcome != capability.ProviderInvocationCancelled {
@@ -764,7 +1333,7 @@ func TestExecutionDeadlineExceededRemainsFailure(t *testing.T) {
 	store := &capturedStore{}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	result, err := (Service{Registry: registry, Store: store, ProgramID: domain.NewID()}).Execute(ctx, executionContextErrorRequest())
+	result, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(ctx, executionContextErrorRequest())
 	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("execution error=%v context error=%v", err, ctx.Err())
 	}
@@ -810,7 +1379,7 @@ func TestRetryableServiceResultIsNotCompleted(t *testing.T) {
 		Policy: policy.Policy{AllowedCapabilities: []string{"retryable.result"}},
 		Scope:  allowedScope{},
 	}
-	if _, err := (Service{Registry: registry, Store: store, ProgramID: domain.NewID()}).Execute(context.Background(), req); err == nil {
+	if _, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req); err == nil {
 		t.Fatal("retryable provider failure was not returned")
 	}
 	if !store.called || store.step.Status != domain.StepRetryable || store.step.CompletedAt != nil {
@@ -837,12 +1406,12 @@ func TestNoProviderStartFailurePersistsPlatformToolWithoutAttempt(t *testing.T) 
 	if provider.input != nil {
 		t.Fatalf("provider callback ran with input %s", provider.input)
 	}
-	if result.ProviderAttemptID != nil || result.AdmissionProvenance != nil || store.admission != nil || store.tool == nil || store.tool.ProviderAttemptID != nil || store.tool.Provider != "platform" || store.step.Status != domain.StepFailed {
+	if result.ProviderAttemptID != nil || result.AdmissionProvenance != nil || store.admission != nil || store.tool != nil || store.step.Status != domain.StepFailed || len(store.step.Output) != 0 {
 		t.Fatalf("no-provider persistence result=%#v tool=%#v step=%#v", result, store.tool, store.step)
 	}
 }
 
-func TestTerminalAuditDegradationDoesNotChangePersistedProviderSuccess(t *testing.T) {
+func TestPreparedSealFailurePreventsProviderSuccessAdoption(t *testing.T) {
 	registry := capability.NewRegistry()
 	provider := &inputCaptureCapability{}
 	if err := registry.Register(provider); err != nil {
@@ -852,11 +1421,11 @@ func TestTerminalAuditDegradationDoesNotChangePersistedProviderSuccess(t *testin
 	store := &capturedStore{terminalErr: terminalCause}
 	req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "classify.endpoint", Input: json.RawMessage(`{"historical_observations":[]}`)}, Policy: policy.Policy{AllowedCapabilities: []string{"classify.endpoint"}}, Scope: allowedScope{}}
 	result, err := (Service{Registry: registry, Store: store, Artifacts: &capturedArtifacts{}, ProgramID: domain.NewID()}).Execute(context.Background(), req)
-	if err != nil {
-		t.Fatalf("terminal audit degradation changed provider success: %v", err)
+	if !errors.Is(err, terminalCause) {
+		t.Fatalf("prepared seal failure was not returned: %v", err)
 	}
-	if !errors.Is(result.TerminalAuditError, terminalCause) || result.ProviderAttemptID == nil || result.AdmissionProvenance == nil || store.admission == nil || store.admission.ProviderAttemptID != *result.ProviderAttemptID || store.step.Status != domain.StepSucceeded || store.result.Status != "succeeded" || store.tool.ProviderAttemptID == nil || *store.tool.ProviderAttemptID != *result.ProviderAttemptID {
-		t.Fatalf("degraded result=%#v step=%#v persisted=%#v tool=%#v", result, store.step, store.result, store.tool)
+	if result.ProviderAttemptID == nil || result.AdmissionProvenance == nil || store.persisted || store.admission != nil {
+		t.Fatalf("seal failure result=%#v persisted=%v admission=%#v", result, store.persisted, store.admission)
 	}
 }
 
@@ -901,7 +1470,7 @@ func TestOSRunnerAcceptanceDeliversDNSHostsAndPersistsFailedStderr(t *testing.T)
 		t.Fatalf("expected fake executable failure diagnostic, got %v", err)
 	}
 	if store.tool == nil || store.tool.ExitCode == nil || *store.tool.ExitCode != 9 {
-		t.Fatalf("fake executable exit was not persisted: %#v", store.tool)
+		t.Fatalf("fake executable exit was not persisted: tool=%#v error=%v", store.tool, err)
 	}
 
 	for _, put := range artifacts.requests {

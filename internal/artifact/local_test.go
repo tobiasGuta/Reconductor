@@ -3,8 +3,10 @@ package artifact
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -168,12 +170,53 @@ func initializedLocal(t *testing.T) (string, *Local) {
 	return abs, store
 }
 
+func TestOpenVerifiedStreamsExactArtifactAndDetectsIntegrityMismatch(t *testing.T) {
+	_, store := initializedLocal(t)
+	published, err := store.Put(context.Background(), completePutRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := domain.ResultArtifactRefV1{ArtifactID: published.ID, ArtifactStoreID: *published.ArtifactStoreID, StorageKey: *published.StorageKey, Role: domain.ArtifactRoleSemanticResult, ContentType: published.ContentType, ContentSizeBytes: published.Size, ContentSHA256: published.SHA256}
+	reader, err := store.OpenVerified(context.Background(), reference)
+	if runtime.GOOS != "linux" {
+		if !errors.Is(err, ErrPreparedStoreUnsupported) || reader != nil {
+			t.Fatalf("unsupported authoritative read did not fail closed: %v", err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || string(data) != "ok" {
+		t.Fatalf("data=%q read=%v close=%v", data, readErr, closeErr)
+	}
+	reference.ContentSHA256 = strings.Repeat("0", 64)
+	reader, err = store.OpenVerified(context.Background(), reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, reader); err == nil {
+		t.Fatal("digest mismatch was not detected while streaming")
+	}
+	_ = reader.Close()
+}
+
 func completePutRequest() PutRequest {
 	return PutRequest{ProgramID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), ToolRunID: domain.NewID(), Type: "log", ContentType: "text/plain", Name: "ignored.log", Data: []byte("ok")}
 }
 
 func TestLocalDeleteContent(t *testing.T) {
 	_, store := initializedLocal(t)
+	if runtime.GOOS != "linux" {
+		id := domain.NewID()
+		key, _ := StorageKeyFor(id)
+		if _, err := store.DeleteContent(context.Background(), id, key); !errors.Is(err, ErrPreparedStoreUnsupported) {
+			t.Fatalf("unsupported cleanup=%v", err)
+		}
+		return
+	}
 
 	// 1. Publish an artifact and successfully delete it
 	published, err := store.Put(context.Background(), completePutRequest())

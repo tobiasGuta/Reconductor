@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/budget"
+	"github.com/tobiasGuta/Reconductor/internal/canonicaljson"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
@@ -74,6 +75,9 @@ type Executor interface {
 type Persister interface {
 	Save(context.Context, *State) error
 }
+type SemanticBindingResolver interface {
+	ResolveSemanticBinding(context.Context, domain.SemanticBindingResolutionV1) (io.ReadCloser, error)
+}
 type ApprovalFunc func(context.Context, Step, policy.Risk) (bool, error)
 type Controls struct {
 	mu                sync.RWMutex
@@ -121,6 +125,10 @@ type Engine struct {
 	Scope                  capability.Scope
 	Budget                 budget.Limiter
 	OriginalScopeVersionID domain.ID
+	BindingResolver        SemanticBindingResolver
+	// OperatorAttemptCeiling is an optional runtime safety ceiling. When set,
+	// it can only reduce a step's workflow-authorized retry attempts.
+	OperatorAttemptCeiling int
 	// MaxParallel is the maximum number of ready steps in one deterministic
 	// execution wave. Zero preserves the legacy single-step behavior.
 	MaxParallel int
@@ -162,6 +170,9 @@ func Validate(d Definition, r *capability.Registry) error {
 			parts := strings.Split(binding, ".")
 			if len(parts) < 3 || parts[1] != "output" {
 				return fmt.Errorf("step %s has unsupported binding %q", s.ID, binding)
+			}
+			if err := domain.ValidateSelector(strings.Join(parts[2:], ".")); err != nil {
+				return fmt.Errorf("step %s has invalid binding selector %q: %w", s.ID, binding, err)
 			}
 			if _, ok := byID[parts[0]]; !ok {
 				return fmt.Errorf("step %s binding references unknown step %s", s.ID, parts[0])
@@ -460,8 +471,10 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 			if len(plans) >= maxParallel {
 				break
 			}
-			input, err := resolveInput(step, state)
+			input, err := resolveInput(runCtx, e, task.ProgramID, state.Run.ID, step, state)
 			if err != nil {
+				persistPreProviderFailure(state, step, err)
+				_ = e.save(runCtx, state)
 				return e.fail(runCtx, state, step.ID, "input_resolution", err)
 			}
 			hash := inputHash(input)
@@ -471,7 +484,13 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 				stateChanged = true
 				continue
 			}
-			if !condition(step.Condition, state) {
+			matches, conditionErr := condition(runCtx, e, task.ProgramID, state.Run.ID, step, state)
+			if conditionErr != nil {
+				persistPreProviderFailure(state, step, conditionErr)
+				_ = e.save(runCtx, state)
+				return e.fail(runCtx, state, step.ID, "input_resolution", conditionErr)
+			}
+			if !matches {
 				ss := transitionStep(state, step, input, hash, domain.StepSkipped)
 				done := time.Now().UTC()
 				ss.Run.CompletedAt = &done
@@ -534,7 +553,7 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 
 		outcomes := e.executeWave(runCtx, task, state.Run.ID, plans)
 		for _, outcome := range outcomes {
-			if errors.Is(outcome.Err, ErrStepAttemptOwnershipLost) {
+			if errors.Is(outcome.Err, ErrStepAttemptOwnershipLost) || domain.PersistenceUnresolved(outcome.Err) {
 				return state, outcome.Err
 			}
 		}
@@ -549,11 +568,12 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 			}
 			if outcome.Err == nil {
 				ss.Run.Status = domain.StepSucceeded
-				ss.Run.Output = outcome.Result.Action.Output
+				ss.Run.Output = admittedEnvelopeJSON(outcome.Result)
 				state.Steps[outcome.Definition.ID] = &ss
 				finished[outcome.Definition.ID] = true
-				if outcome.Definition.Capability == "report.changes" && len(outcome.Result.Action.Output) > 0 {
-					state.Run.Summary = append(json.RawMessage(nil), outcome.Result.Action.Output...)
+				if outcome.Definition.Capability == "report.changes" && outcome.Result.Envelope != nil {
+					reference := domain.ResultSummaryReferenceV1{Version: domain.ResultSummaryReferenceVersionV1, SourceStepRunID: ss.Run.ID, ActionRequestID: outcome.Result.Envelope.ActionRequestID, ResultOccurrenceID: outcome.Result.Envelope.ResultOccurrenceID, SemanticArtifactID: outcome.Result.Envelope.SemanticOutput.ArtifactID, SemanticSHA256: outcome.Result.Envelope.SemanticOutput.ContentSHA256, SemanticSizeBytes: outcome.Result.Envelope.SemanticOutput.ContentSizeBytes, SafeSummary: outcome.Result.Envelope.Summary}
+					state.Run.Summary, _ = json.Marshal(reference)
 				}
 				e.event(state, "step_succeeded", outcome.Definition.ID, outcome.Result.Action.Summary)
 			} else if outcome.PrimaryFailure {
@@ -642,10 +662,7 @@ func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain
 		}
 		defer release()
 	}
-	maxAttempts := plan.Definition.Retry.MaxAttempts
-	if maxAttempts < 1 {
-		maxAttempts = 1
-	}
+	maxAttempts := effectiveMaxAttempts(plan.Definition.Retry.MaxAttempts, e.OperatorAttemptCeiling)
 	firstAttempt := outcome.State.Run.AttemptCount + 1
 	if firstAttempt > maxAttempts {
 		outcome.Err = fmt.Errorf("retry attempts exhausted after %d durable attempts", outcome.State.Run.AttemptCount)
@@ -662,7 +679,10 @@ func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain
 		}
 		outcome.Result, outcome.Err = e.Executor.Execute(attemptCtx, capability.Request{Action: action, Provider: plan.Provider, Approved: plan.Approved, Policy: policy.ParallelShare(e.Policy, plan.ParallelShare), Scope: e.Scope})
 		cancelAttempt()
-		outcome.State.Run.Output = append(json.RawMessage(nil), outcome.Result.Action.Output...)
+		if domain.PersistenceUnresolved(outcome.Err) {
+			return outcome
+		}
+		outcome.State.Run.Output = admittedEnvelopeJSON(outcome.Result)
 		if outcome.Result.Action.Error != nil {
 			outcome.State.Run.ErrorClassification = outcome.Result.Action.Error.Classification
 			outcome.State.Run.ErrorDetails = outcome.Result.Action.Error.Message
@@ -707,6 +727,16 @@ func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain
 	return outcome
 }
 
+func effectiveMaxAttempts(authorized, operatorCeiling int) int {
+	if authorized < 1 {
+		authorized = 1
+	}
+	if operatorCeiling > 0 && operatorCeiling < authorized {
+		return operatorCeiling
+	}
+	return authorized
+}
+
 func completeStep(state *StepState) {
 	done := time.Now().UTC()
 	state.Run.CompletedAt = &done
@@ -749,6 +779,8 @@ func (e *Engine) terminal(ctx context.Context, s *State, status domain.RunStatus
 }
 func (e *Engine) fail(ctx context.Context, s *State, step, class string, err error) (*State, error) {
 	s.Run.Status = domain.RunFailed
+	now := time.Now().UTC()
+	s.Run.CompletedAt = &now
 	e.event(s, "workflow_failed", step, class+": "+err.Error())
 	_ = e.save(ctx, s)
 	return s, err
@@ -793,58 +825,71 @@ func dependenciesSucceeded(s Step, state *State) bool {
 	}
 	return true
 }
-func condition(expr string, state *State) bool {
+func condition(ctx context.Context, engine *Engine, programID, workflowRunID domain.ID, consumer Step, state *State) (bool, error) {
+	expr := consumer.Condition
 	if expr == "" {
-		return true
+		return true, nil
 	}
 	kind, reference, _ := strings.Cut(expr, ":")
-	id := strings.Split(reference, ".")[0]
+	parts := strings.Split(reference, ".")
+	id := parts[0]
 	s := state.Steps[id]
 	if s == nil {
-		return false
+		return false, nil
 	}
 	if kind == "success" {
-		return s.Run.Status == domain.StepSucceeded
+		return s.Run.Status == domain.StepSucceeded, nil
+	}
+	selector := "changes"
+	if len(parts) >= 3 && parts[1] == "output" {
+		selector = strings.Join(parts[2:], ".")
+	}
+	value, _, err := resolveBindingValue(ctx, engine, programID, workflowRunID, consumer.ID, id, s.Run, selector)
+	if err != nil {
+		return false, err
 	}
 	if kind == "changed" {
-		var v map[string]any
-		if json.Unmarshal(s.Run.Output, &v) != nil {
-			return false
-		}
-		changes, ok := v["changes"].([]any)
-		return ok && len(changes) > 0
+		changes, ok := value.([]any)
+		return ok && len(changes) > 0, nil
 	}
 	if kind == "nonempty" {
-		parts := strings.Split(reference, ".")
-		var value any
-		if json.Unmarshal(s.Run.Output, &value) != nil {
-			return false
-		}
-		for _, part := range parts[2:] {
-			m, ok := value.(map[string]any)
-			if !ok {
-				return false
-			}
-			value, ok = m[part]
-			if !ok {
-				return false
-			}
-		}
 		switch v := value.(type) {
 		case []any:
-			return len(v) > 0
+			return len(v) > 0, nil
 		case string:
-			return v != ""
+			return v != "", nil
 		default:
-			return v != nil
+			return v != nil, nil
 		}
 	}
-	return false
+	return false, nil
 }
-func resolveInput(s Step, state *State) (json.RawMessage, error) {
+
+func persistPreProviderFailure(state *State, step Step, cause error) {
+	classification := "input_resolution"
+	for _, code := range []string{"result_contract_limit", "result_contract_legacy_unavailable", "result_contract_version_unsupported", "semantic_output_unavailable"} {
+		if strings.Contains(cause.Error(), code) {
+			classification = code
+			break
+		}
+	}
+	failed := transitionStep(state, step, nil, inputHash(nil), domain.StepFailed)
+	failed.Run.Output = nil
+	failed.Run.ErrorClassification = classification
+	failed.Run.ErrorDetails = domain.BoundUTF8(cause.Error(), domain.SafeMessageMaxBytes)
+	completeStep(failed)
+	state.Steps[step.ID] = failed
+}
+func resolveInput(ctx context.Context, engine *Engine, programID, workflowRunID domain.ID, s Step, state *State) (json.RawMessage, error) {
 	var target map[string]any
 	if err := decodeBindingJSON(s.Input, &target); err != nil {
 		return nil, err
+	}
+	var consumerManifest capability.Manifest
+	if engine != nil && engine.Registry != nil {
+		if consumer, ok := engine.Registry.Get(s.Capability); ok {
+			consumerManifest = consumer.Manifest()
+		}
 	}
 	for field, binding := range s.Bindings {
 		parts := strings.Split(binding, ".")
@@ -855,57 +900,61 @@ func resolveInput(s Step, state *State) (json.RawMessage, error) {
 		if len(source.Run.Output) == 0 && source.Run.Status == domain.StepSkipped {
 			continue
 		}
-		var value any
-		if err := decodeBindingJSON(source.Run.Output, &value); err != nil {
+		selector := strings.Join(parts[2:], ".")
+		if err := domain.ValidateSelector(selector); err != nil {
+			return nil, fmt.Errorf("binding %s: %w", binding, err)
+		}
+		value, reference, err := resolveBindingValue(ctx, engine, programID, workflowRunID, s.ID, parts[0], source.Run, selector)
+		if err != nil {
+			var limitErr *bindingMaterializationLimitError
+			if errors.As(err, &limitErr) && reference != nil && supportsSemanticBindingReferences(consumerManifest) {
+				target[field] = *reference
+				continue
+			}
 			return nil, err
 		}
-		for _, part := range parts[2:] {
-			if strings.HasSuffix(part, "[]") {
-				part = strings.TrimSuffix(part, "[]")
-				m, ok := value.(map[string]any)
-				if !ok {
-					return nil, fmt.Errorf("binding %s is not an object", binding)
-				}
-				arr, ok := m[part].([]any)
-				if !ok {
-					return nil, fmt.Errorf("binding %s is not an array", binding)
-				}
-				value = arr
-				continue
-			}
-			if arr, ok := value.([]any); ok {
-				extracted := make([]any, 0, len(arr))
-				for _, item := range arr {
-					if raw, ok := item.(string); ok {
-						var parsed map[string]any
-						if decodeBindingJSON([]byte(raw), &parsed) == nil {
-							if v, ok := parsed[part]; ok {
-								extracted = append(extracted, v)
-								continue
-							}
-						}
-					}
-					if m, ok := item.(map[string]any); ok {
-						if v, ok := m[part]; ok {
-							extracted = append(extracted, v)
-						}
-					}
-				}
-				value = extracted
-				continue
-			}
-			m, ok := value.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("binding %s is not an object", binding)
-			}
-			value, ok = m[part]
-			if !ok {
-				return nil, fmt.Errorf("binding %s not found", binding)
-			}
+		canonical, err := canonicaljson.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		_, _, nodes, _, err := canonicaljson.ParseStrict(canonical)
+		if err != nil {
+			return nil, err
+		}
+		if len(canonical) > domain.InlineSemanticJSONMaxBytes || nodes > domain.InlineSemanticJSONMaxNodes {
+			return nil, fmt.Errorf("result_contract_limit: selected binding value exceeds materialization contract")
 		}
 		target[field] = value
 	}
-	return json.Marshal(target)
+	encoded, err := canonicaljson.Marshal(target)
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded) > domain.ResultEnvelopeMaxBytes {
+		return nil, fmt.Errorf("result_contract_limit: effective binding input exceeds %d bytes", domain.ResultEnvelopeMaxBytes)
+	}
+	return encoded, nil
+}
+
+func admittedEnvelopeJSON(result capability.Result) json.RawMessage {
+	if result.Envelope == nil {
+		// Legacy executors can still return a bounded JSONB semantic value. New
+		// production provider results pass through execution.Service and always
+		// carry an admitted envelope.
+		if len(result.Action.Output) == 0 {
+			return nil
+		}
+		_, canonical, _, _, err := canonicaljson.ParseStrict(result.Action.Output)
+		if err != nil || len(canonical) > domain.InlineSemanticJSONMaxBytes {
+			return nil
+		}
+		return append(json.RawMessage(nil), canonical...)
+	}
+	raw, err := result.Envelope.CanonicalJSON()
+	if err != nil {
+		return nil
+	}
+	return append(json.RawMessage(nil), raw...)
 }
 
 func decodeBindingJSON(raw []byte, destination any) error {

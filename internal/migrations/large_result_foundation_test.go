@@ -20,7 +20,7 @@ func TestLargeResultFoundationMigrationsAreOrderedAndClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) < 2 || versions[len(versions)-2] != "0018_large_result_publication_journal.sql" || versions[len(versions)-1] != "0019_large_result_recovery_foundation.sql" {
+	if len(versions) < 3 || versions[len(versions)-3] != "0018_large_result_publication_journal.sql" || versions[len(versions)-2] != "0019_large_result_recovery_foundation.sql" || versions[len(versions)-1] != "0020_prepared_evidence_ownership.sql" {
 		t.Fatalf("large-result migration order=%v", versions)
 	}
 
@@ -93,6 +93,30 @@ func TestLargeResultFoundationMigrationsAreOrderedAndClosed(t *testing.T) {
 	for _, futureID := range []string{"provider_terminal_event_id uuid references", "provider_result_accepted_event_id uuid references", "tool_run_id uuid references"} {
 		if strings.Contains(recovery, futureID) {
 			t.Fatalf("preallocated future identity received a premature foreign key: %q", futureID)
+		}
+	}
+	preparedBody, err := files.ReadFile("sql/0020_prepared_evidence_ownership.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := strings.ToLower(string(preparedBody))
+	for _, required := range []string{
+		"create table artifact_store_prepared_limits",
+		"create table prepared_evidence_sets",
+		"'allocated','sealed','resolved_adopted','resolved_abandoned','quarantined','cleaned'",
+		"prepared_evidence_sets_owner_shape_ck",
+		"prepared_evidence_sets_state_shape_ck",
+		"prepared_evidence_sets_manifest_key_ck",
+		"enforce_prepared_evidence_set_transition",
+		"old.lifecycle_state in ('resolved_adopted','resolved_abandoned') and new.lifecycle_state='cleaned'",
+	} {
+		if !strings.Contains(prepared, required) {
+			t.Fatalf("0020 missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"create table prepared_evidence_members", "insert into prepared_evidence_sets", "update artifact_publications"} {
+		if strings.Contains(prepared, forbidden) {
+			t.Fatalf("0020 contains prohibited historical/member mutation %q", forbidden)
 		}
 	}
 }

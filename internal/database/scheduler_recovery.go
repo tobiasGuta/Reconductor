@@ -107,6 +107,9 @@ func (s *Store) reconcileStaleScheduledExecutions(ctx context.Context, limit int
 	if limit < 1 {
 		return nil
 	}
+	if err := s.ReconcileDeferredApprovalRejections(ctx, limit); err != nil {
+		return err
+	}
 	excluded := make([]domain.ID, 0, limit)
 	for attempts := 0; attempts < limit; attempts++ {
 		tx, err := s.Pool.Begin(ctx)
@@ -142,6 +145,15 @@ func (s *Store) reconcileStaleScheduledExecutions(ctx context.Context, limit int
 			continue
 		}
 		plan := classifyStaleLineage(entry, &lineage)
+		pending, err := hasUnresolvedScheduledPrepared(ctx, tx, entry.item.ID, entry.item.AttemptCount)
+		if err != nil {
+			tx.Rollback(ctx)
+			return err
+		}
+		if pending {
+			tx.Rollback(ctx)
+			continue
+		}
 		if err := applyStaleLineageReconciliation(ctx, tx, entry, lineage, plan); err != nil {
 			tx.Rollback(ctx)
 			return err
@@ -164,6 +176,8 @@ func lockNextStaleScheduledExecution(ctx context.Context, tx pgx.Tx, excluded []
 		JOIN schedules s ON s.id=se.schedule_id
 		WHERE se.status IN ('claimed','running')
 		  AND se.lease_expires_at<=clock_timestamp()
+		  AND NOT EXISTS (SELECT 1 FROM prepared_evidence_sets p JOIN step_runs sr ON sr.id=p.step_run_id JOIN audit_events provider ON provider.id=p.provider_attempt_id
+		    WHERE provider.scheduled_execution_id=se.id AND provider.scheduler_attempt=se.attempt_count AND p.step_attempt=sr.attempt_count AND p.lifecycle_state IN ('ALLOCATED','SEALED','QUARANTINED'))
 		  AND NOT (se.id=ANY($1::uuid[]))
 		ORDER BY se.lease_expires_at,se.id
 		LIMIT 1

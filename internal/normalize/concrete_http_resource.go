@@ -154,6 +154,18 @@ func ProbeRequestSemantics(raw json.RawMessage) (RequestSemantics, error) {
 // with one generated exclusively from the normalized provider records and the
 // durable platform provider-attempt identity.
 func AttachProbeHTTPSourceRecords(output json.RawMessage, programID, providerAttemptID string, input json.RawMessage) (json.RawMessage, error) {
+	return attachProbeHTTPSourceRecords(output, programID, providerAttemptID, input, 0)
+}
+
+// The registry supplies the existing reservation before this whole-value decode.
+func AttachProbeHTTPSourceRecordsBounded(output json.RawMessage, programID, providerAttemptID string, input json.RawMessage, maxBytes int) (json.RawMessage, error) {
+	if maxBytes < 1 || len(output) > maxBytes {
+		return nil, &canonicaljson.EncodingLimitError{Limit: maxBytes}
+	}
+	return attachProbeHTTPSourceRecords(output, programID, providerAttemptID, input, maxBytes)
+}
+
+func attachProbeHTTPSourceRecords(output json.RawMessage, programID, providerAttemptID string, input json.RawMessage, maxBytes int) (json.RawMessage, error) {
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(output, &envelope); err != nil || envelope == nil {
 		return nil, sourceContractError("probe output must be a JSON object")
@@ -170,7 +182,7 @@ func AttachProbeHTTPSourceRecords(output json.RawMessage, programID, providerAtt
 	if err != nil {
 		return nil, err
 	}
-	sources, err := BuildProbeHTTPSourceRecords(programID, providerAttemptID, records, semantics)
+	sources, err := buildProbeHTTPSourceRecordsBounded(programID, providerAttemptID, records, semantics, SourceLocator, maxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -180,6 +192,13 @@ func AttachProbeHTTPSourceRecords(output json.RawMessage, programID, providerAtt
 	}
 	// Never preserve a provider-controlled or caller-supplied lineage value.
 	envelope["authorized_source_records"] = encoded
+	if maxBytes > 0 {
+		members := make(map[string]any, len(envelope))
+		for key, value := range envelope {
+			members[key] = value
+		}
+		return canonicaljson.MarshalBounded(members, maxBytes)
+	}
 	result, err := json.Marshal(envelope)
 	if err != nil {
 		return nil, sourceContractError("encode decorated probe output")
@@ -242,13 +261,18 @@ func BuildProbeHTTPSourceRecords(programID, providerAttemptID string, records []
 }
 
 func buildProbeHTTPSourceRecords(programID, providerAttemptID string, records []provideroutput.Record, semantics RequestSemantics, locatorFor func(string, string, string, []byte, RequestSemantics) (string, error)) ([]AuthorizedSourceRecord, error) {
+	return buildProbeHTTPSourceRecordsBounded(programID, providerAttemptID, records, semantics, locatorFor, 0)
+}
+
+func buildProbeHTTPSourceRecordsBounded(programID, providerAttemptID string, records []provideroutput.Record, semantics RequestSemantics, locatorFor func(string, string, string, []byte, RequestSemantics) (string, error), maxBytes int) ([]AuthorizedSourceRecord, error) {
 	if strings.TrimSpace(programID) == "" || strings.TrimSpace(providerAttemptID) == "" {
 		return nil, sourceContractError("trusted program and provider-attempt identities are required")
 	}
 	if err := validateRequestSemantics(semantics, false); err != nil {
 		return nil, err
 	}
-	out := make([]AuthorizedSourceRecord, 0, len(records))
+	out := make([]AuthorizedSourceRecord, 0)
+	encodedSize := 2
 	seen := make(map[string][]byte, len(records))
 	for index, record := range records {
 		if record.Kind != provideroutput.URLRecord {
@@ -273,7 +297,7 @@ func buildProbeHTTPSourceRecords(programID, providerAttemptID string, records []
 			return nil, sourceContractError("distinct source records produced the same source locator")
 		}
 		seen[locator] = append([]byte(nil), material...)
-		out = append(out, AuthorizedSourceRecord{
+		source := AuthorizedSourceRecord{
 			AuthorizedRecordIndex: index,
 			RecordDigest:          recordDigest,
 			SourceLocator:         locator,
@@ -282,7 +306,22 @@ func buildProbeHTTPSourceRecords(programID, providerAttemptID string, records []
 			ProviderAttemptID:     providerAttemptID,
 			RequestMethod:         semantics.Method,
 			RequestContentType:    semantics.ContentType,
-		})
+		}
+		if maxBytes > 0 {
+			raw, err := json.Marshal(source)
+			if err != nil {
+				return nil, err
+			}
+			n := len(raw)
+			if len(out) > 0 {
+				n++
+			}
+			if n > maxBytes-encodedSize {
+				return nil, &canonicaljson.EncodingLimitError{Limit: maxBytes}
+			}
+			encodedSize += n
+		}
+		out = append(out, source)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].SourceLocator < out[j].SourceLocator

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
+	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
@@ -259,6 +260,49 @@ func TestWorkflowRunScopeDoesNotRequireDomain(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "--domain") {
 		t.Fatalf("domain is still required: %v", err)
+	}
+}
+
+func TestWorkflowRunMaxStepAttemptsRejectsInvalidCeilingsBeforeRuntimeSetup(t *testing.T) {
+	for _, invalid := range []string{"0", "-1", "not-a-number"} {
+		err := workflowRun(context.Background(), config.Config{}, capability.NewRegistry(), []string{"--max-step-attempts", invalid})
+		if err == nil || !strings.Contains(err.Error(), "must be a positive integer") {
+			t.Fatalf("invalid ceiling %q error=%v", invalid, err)
+		}
+	}
+}
+
+func TestLife360S2002RegressionScopePlanIsNarrow(t *testing.T) {
+	cfg, err := config.LoadPlanning()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Scope.Root = filepath.Join("..", "..")
+	out, err := captureStdout(func() error {
+		return scopeCommand(context.Background(), cfg, []string{"plan", "--scope", "scope/life360-s2-002-regression.json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		ExactActiveSeeds []struct {
+			Host string `json:"host"`
+		} `json:"exact_active_seeds"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, seed := range payload.ExactActiveSeeds {
+		got[seed.Host] = true
+	}
+	if len(got) != 2 || !got["www.life360.com"] || !got["intl.life360.com"] {
+		t.Fatalf("unexpected regression scope hosts: %s", out)
+	}
+	for _, forbidden := range []string{"api.life360.com", "api-cloudfront.life360.com", "tile.com", "thetileapp.com", "production.tile-api.com", "backend.jiobit.com", "api.nativo.com"} {
+		if got[forbidden] {
+			t.Fatalf("forbidden host %q appeared in regression scope: %s", forbidden, out)
+		}
 	}
 }
 

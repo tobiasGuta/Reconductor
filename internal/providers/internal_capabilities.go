@@ -361,9 +361,9 @@ func executeCompareAssets(raw json.RawMessage) (CompareAssetsOutput, string, err
 			var previousValue json.RawMessage
 			if exists {
 				reasons = comparisonReasons(old.raw, value)
-				previousValue = structuredObservation(old.raw)
+				previousValue = changeObservation(old.raw, target)
 			}
-			changes = append(changes, AssetChange{Kind: "new_or_changed", Value: target, Previous: previousValue, Current: structuredObservation(value), Reasons: reasons})
+			changes = append(changes, AssetChange{Kind: "new_or_changed", Value: target, Previous: previousValue, Current: changeObservation(value, target), Reasons: reasons})
 			switch status := extractStatus(value); {
 			case status >= 200 && status <= 299:
 				routes.Active = append(routes.Active, target)
@@ -386,7 +386,7 @@ func executeCompareAssets(raw json.RawMessage) (CompareAssetsOutput, string, err
 			if !current[extractURL(value)] {
 				target := extractURL(value)
 				removed = append(removed, target)
-				changes = append(changes, AssetChange{Kind: "removed", Value: target, Previous: structuredObservation(value), Reasons: []string{"asset was absent from a complete current comparison"}})
+				changes = append(changes, AssetChange{Kind: "removed", Value: target, Previous: changeObservation(value, target), Reasons: []string{"asset was absent from a complete current comparison"}})
 			}
 		}
 	}
@@ -633,6 +633,15 @@ func structuredObservation(raw string) json.RawMessage {
 		return value
 	}
 	value, _ := json.Marshal(map[string]string{"value": raw})
+	return value
+}
+
+func changeObservation(raw, target string) json.RawMessage {
+	evidence := map[string]any{"target": target}
+	if status := extractStatus(raw); status > 0 {
+		evidence["status_code"] = status
+	}
+	value, _ := json.Marshal(evidence)
 	return value
 }
 

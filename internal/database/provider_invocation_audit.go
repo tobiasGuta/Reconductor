@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 )
@@ -20,8 +21,26 @@ func (s *Store) RecordProviderInvocationStarted(ctx context.Context, record capa
 		return "", fmt.Errorf("provider invocation start requires action and execution authorization identities")
 	}
 	eventID := domain.NewID()
+	tag, err := insertProviderInvocationStarted(ctx, s.Pool, eventID, record)
+	if err != nil {
+		return "", err
+	}
+	if tag.RowsAffected() != 1 {
+		return "", fmt.Errorf("execution authorization event is not an exact execution-phase allow for action %s", record.ActionRequestID)
+	}
+	return eventID, nil
+}
+
+type providerInvocationStartExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func insertProviderInvocationStarted(ctx context.Context, executor providerInvocationStartExecutor, eventID domain.ID, record capability.ProviderInvocationStartRecord) (pgconn.CommandTag, error) {
+	if _, recovering := domain.PreparedRecoveryRequestFromContext(ctx); recovering {
+		return pgconn.CommandTag{}, fmt.Errorf("recovery admission cannot authorize provider execution")
+	}
 	scheduledExecutionID, schedulerAttempt := providerSchedulerProvenance(ctx)
-	tag, err := s.Pool.Exec(ctx, `INSERT INTO audit_events(
+	return executor.Exec(ctx, `INSERT INTO audit_events(
 		id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,
 		scheduled_execution_id,scheduler_attempt,action_request_id,step_attempt,queue_job_id,
 		execution_authorization_event_id,provider_attempt_id,capability,provider,safe_message,details)
@@ -46,13 +65,6 @@ func (s *Store) RecordProviderInvocationStarted(ctx context.Context, record capa
 		optionalID(record.WorkflowRunID), optionalID(record.StepRunID), scheduledExecutionID, schedulerAttempt,
 		record.ActionRequestID, exactPositiveInt(record.StepAttempt), optionalIDPointer(record.QueueJobID),
 		record.ExecutionAuthorizationEventID, nullIfEmpty(record.Capability), nullIfEmpty(record.Provider))
-	if err != nil {
-		return "", err
-	}
-	if tag.RowsAffected() != 1 {
-		return "", fmt.Errorf("execution authorization event is not an exact execution-phase allow for action %s", record.ActionRequestID)
-	}
-	return eventID, nil
 }
 
 func lockAndValidateProviderResult(ctx context.Context, tx pgx.Tx, lineage lockedResultLineage, programID domain.ID, step domain.StepRun, tool *domain.ToolRun, result domain.ActionResult, admission *capability.ResultAdmissionProvenance) error {
@@ -76,6 +88,10 @@ func lockAndValidateProviderResult(ctx context.Context, tx pgx.Tx, lineage locke
 	}
 	scheduledExecutionID, schedulerAttempt := providerSchedulerProvenance(ctx)
 	var providerAttemptID domain.ID
+	if lineage.recovery {
+		scheduledExecutionID = optionalIDPointer(lineage.scheduledID)
+		schedulerAttempt = lineage.schedulerAttempt
+	}
 	err := tx.QueryRow(ctx, `SELECT id FROM audit_events
 		WHERE id=$1
 		  AND event_type='provider_invocation_started'
@@ -99,7 +115,10 @@ func lockAndValidateProviderResult(ctx context.Context, tx pgx.Tx, lineage locke
 }
 
 func persistProviderResultAccepted(ctx context.Context, tx pgx.Tx, providerAttemptID, toolRunID domain.ID) (domain.ID, error) {
-	eventID := domain.NewID()
+	return persistProviderResultAcceptedWithID(ctx, tx, domain.NewID(), providerAttemptID, toolRunID)
+}
+
+func persistProviderResultAcceptedWithID(ctx context.Context, tx pgx.Tx, eventID, providerAttemptID, toolRunID domain.ID) (domain.ID, error) {
 	tag, err := tx.Exec(ctx, `INSERT INTO audit_events(
 		id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,tool_run_id,
 		scheduled_execution_id,scheduler_attempt,action_request_id,step_attempt,queue_job_id,

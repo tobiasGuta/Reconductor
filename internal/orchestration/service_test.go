@@ -20,12 +20,15 @@ func TestEngineConstructsWithInjectedModernStorageWithoutRetentionPrerequisite(t
 		Registry:  capability.NewRegistry(),
 		Artifacts: storage,
 	}
-	engine, err := service.engine(context.Background(), domain.Task{ProgramID: domain.NewID()}, engineLivenessScope{}, false, workflow.FileStore{Root: t.TempDir()}, nil, domain.NewID())
+	engine, err := service.engine(context.Background(), domain.Task{ProgramID: domain.NewID()}, engineLivenessScope{}, false, 2, workflow.FileStore{Root: t.TempDir()}, nil, domain.NewID())
 	if err != nil {
 		t.Fatalf("engine construction error=%v", err)
 	}
 	if engine.Executor == nil {
 		t.Fatal("engine did not construct an executor from injected modern artifact storage")
+	}
+	if engine.OperatorAttemptCeiling != 2 {
+		t.Fatalf("operator attempt ceiling=%d", engine.OperatorAttemptCeiling)
 	}
 }
 

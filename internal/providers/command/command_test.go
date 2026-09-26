@@ -111,6 +111,47 @@ func TestPassiveDiscoveryOutputIsFilteredPerRecordBeforeActiveUse(t *testing.T) 
 	}
 }
 
+func TestKatanaAuthorizedRecordsDropBulkEvidenceWithoutMutatingRawRecords(t *testing.T) {
+	bulk := strings.Repeat("x", domain.InlineSemanticJSONMaxBytes)
+	records := []provideroutput.Record{
+		{
+			Provider: "katana",
+			Kind:     provideroutput.URLRecord,
+			Target:   "https://example.test/",
+			Fields: map[string]any{
+				"request":  map[string]any{"endpoint": "https://example.test/", "method": "GET", "raw": bulk},
+				"response": map[string]any{"status_code": json.Number("200"), "headers": map[string]any{"content-type": "text/html"}, "body": bulk, "raw": bulk},
+			},
+		},
+	}
+	compact := compactAuthorizedRecords("katana", records)
+	request := compact[0].Fields["request"].(map[string]any)
+	response := compact[0].Fields["response"].(map[string]any)
+	if _, ok := request["raw"]; ok {
+		t.Fatal("compact request retained raw wire evidence")
+	}
+	if _, ok := response["body"]; ok {
+		t.Fatal("compact response retained body evidence")
+	}
+	if _, ok := response["raw"]; ok {
+		t.Fatal("compact response retained raw wire evidence")
+	}
+	if request["method"] != "GET" || response["status_code"] != json.Number("200") || response["headers"] == nil {
+		t.Fatalf("compact semantic fields=%#v", compact[0].Fields)
+	}
+	originalResponse := records[0].Fields["response"].(map[string]any)
+	if originalResponse["body"] != bulk || originalResponse["raw"] != bulk {
+		t.Fatal("full normalized record evidence was mutated")
+	}
+	encoded, err := json.Marshal(compact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > domain.InlineSemanticJSONMaxBytes {
+		t.Fatalf("compact authorized records bytes=%d", len(encoded))
+	}
+}
+
 func TestPassiveDiscoveryRootsAreVetoedAgainstCurrentTargetPlan(t *testing.T) {
 	tests := []struct {
 		name       string

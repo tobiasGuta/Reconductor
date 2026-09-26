@@ -43,6 +43,7 @@ type WorkflowRequest struct {
 	AcknowledgeScopeExpansion bool
 	ManualDiscoveryRoots      []targeting.ManualDiscoveryRoot
 	ApproveModerate           bool
+	OperatorAttemptCeiling    int
 	Lifecycle                 Lifecycle
 }
 
@@ -191,7 +192,7 @@ func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, 
 		lifecycleScopeVersionID = *state.Run.OriginalScopeVersionID
 	}
 	runtimeScope := targeting.WithDiscoveryRoots(sc, pinnedPlan.DiscoveryRoots, plan.DiscoveryRoots)
-	engine, err := s.engine(ctx, task, runtimeScope, req.Headless, fileStore, req.Lifecycle, lifecycleScopeVersionID)
+	engine, err := s.engine(ctx, task, runtimeScope, req.Headless, req.OperatorAttemptCeiling, fileStore, req.Lifecycle, lifecycleScopeVersionID)
 	if err != nil {
 		return WorkflowResult{Task: task, ScopeChange: change}, err
 	}
@@ -218,7 +219,7 @@ func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, 
 	defer stopWatching()
 	go WatchTaskControls(watchCtx, s.Store, task.ID, controls)
 	state, runErr := engine.Run(ctx, def, state, task, controls)
-	if state != nil && !database.IsScheduledExecutionFenceError(runErr) {
+	if state != nil && !database.IsScheduledExecutionFenceError(runErr) && !domain.PersistenceUnresolved(runErr) {
 		status := map[domain.RunStatus]domain.TaskStatus{domain.RunCompleted: domain.TaskCompleted, domain.RunPaused: domain.TaskPaused, domain.RunFailed: domain.TaskFailed, domain.RunCancelled: domain.TaskCancelled}[state.Run.Status]
 		if status != "" {
 			_ = s.Store.SetTaskStatusFromWorkflow(context.WithoutCancel(ctx), task.ID, status)
@@ -343,7 +344,7 @@ func (s Service) resolveTask(ctx context.Context, req WorkflowRequest, def workf
 	return task, nil
 }
 
-func (s Service) engine(ctx context.Context, task domain.Task, sc capability.Scope, headless bool, fileStore workflow.FileStore, lifecycle Lifecycle, scopeVersionID domain.ID) (workflow.Engine, error) {
+func (s Service) engine(ctx context.Context, task domain.Task, sc capability.Scope, headless bool, operatorAttemptCeiling int, fileStore workflow.FileStore, lifecycle Lifecycle, scopeVersionID domain.ID) (workflow.Engine, error) {
 	if s.Artifacts == nil {
 		return workflow.Engine{}, fmt.Errorf("artifact storage is required")
 	}
@@ -356,7 +357,8 @@ func (s Service) engine(ctx context.Context, task domain.Task, sc capability.Sco
 			return lifecycle.WorkflowCreated(ctx, task, state.Run, scopeVersionID)
 		}
 	}
-	return workflow.Engine{Registry: s.Registry, Executor: execution.Service{Registry: s.Registry, Store: s.Store, Artifacts: s.Artifacts, ProgramID: task.ProgramID}, Persister: persister, Policy: pol, Scope: sc, Budget: limiter, MaxParallel: maxParallel, OriginalScopeVersionID: scopeVersionID}, nil
+	executor := execution.Service{Registry: s.Registry, Store: s.Store, Artifacts: s.Artifacts, ProgramID: task.ProgramID}
+	return workflow.Engine{Registry: s.Registry, Executor: executor, BindingResolver: executor, Persister: persister, Policy: pol, Scope: sc, Budget: limiter, MaxParallel: maxParallel, OriginalScopeVersionID: scopeVersionID, OperatorAttemptCeiling: operatorAttemptCeiling}, nil
 }
 
 func (s Service) resumeApproval(ctx context.Context, state *workflow.State) (bool, error) {

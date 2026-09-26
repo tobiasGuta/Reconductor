@@ -68,6 +68,32 @@ The migration establishes:
 
 Applying 0017 requires running `platform migrate`. Existing pre-0017 rows remain fully compatible and default to the unclaimed state (`UNCLAIMED`, where all cleanup lifecycle fields are null). Operators can then run bounded cleanup via `platform artifact-store cleanup [--batch-size N]`.
 
+### Large-result publication journal migration 0018
+
+Migration `0018_large_result_publication_journal.sql` adds the retained artifact-publication journal and its fenced `reserved -> publishing -> sealed -> adopted` lifecycle. Known failures may transition unresolved publications to `abandoned`; unverifiable filesystem outcomes transition to `quarantined`. Terminal rows and publication identity remain immutable. Applying 0018 requires a coordinated old-writer drain because pre-0018 binaries do not create or honor this journal.
+
+### Large-result recovery foundation migration 0019
+
+Migration `0019_large_result_recovery_foundation.sql` adds workflow attempt waves, wave members, step-attempt claims, and failure-finalization records. These records preserve exact attempt, scheduler, provider, and result-occurrence authority across recovery. Recovery must never infer success from Redis delivery state, allocate replacement identities, increment attempts, or replay a provider while persistence outcome is unresolved. Drain old workers and schedulers before applying the migration and start only binaries that require the current schema.
+
+### Prepared-evidence ownership migration 0020
+
+Migration `0020_prepared_evidence_ownership.sql` adds per-store prepared-evidence limits and retained ownership records for durable staged results. After migrating and initializing each physical store, configure its limits before starting artifact-producing processes:
+
+```powershell
+go run ./cmd/platform artifact-store prepared-limits --max-open-sets 128 --max-set-bytes 1048576 --max-unresolved-bytes 134217728
+```
+
+The values are an explicit local example. Size production limits from the expected provider-result ceiling and maintenance interval. Startup and `platform doctor` fail when limits are absent or cannot admit one additional maximum-sized set.
+
+Resolved prepared sets remain charged until their staged bytes are removed and the database row reaches `CLEANED`. During a drained maintenance window, run bounded recovery and inspect the returned occupancy:
+
+```powershell
+go run ./cmd/platform artifact-store prepared-recover --batch-size 100
+```
+
+Repeat bounded batches as needed. Quarantined sets are retained and charged for operator investigation. The current native durable-publisher implementation supports Linux ext, XFS, and Btrfs; Windows and other operating systems fail closed and should use the Linux worker container.
+
 ## Environment and Compose
 
 Replace `RATE_LIMIT` with `NUCLEI_RATE_LIMIT` and `CONCURRENCY` with explicit host/template/headless concurrency variables. Add `DATABASE_URL` and `REDIS_PASSWORD`. Compare the complete new `.env.example`; duplicated per-binary parsers no longer exist.

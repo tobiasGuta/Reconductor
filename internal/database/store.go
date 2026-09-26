@@ -677,6 +677,11 @@ func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, acto
 		return err
 	}
 	defer tx.Rollback(ctx)
+	return decideApprovalTx(ctx, tx, id, decision, actor)
+}
+
+func decideApprovalTx(ctx context.Context, tx pgx.Tx, id domain.ID, decision, actor string) error {
+	var err error
 	var stepID, workflowRunID, taskID, programID domain.ID
 	if err := tx.QueryRow(ctx, `SELECT a.request_id,sr.workflow_run_id,wr.task_id,t.program_id
 		FROM approvals a
@@ -694,10 +699,20 @@ func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, acto
 		if err != nil {
 			return err
 		}
+		// Serialize with allocation/adoption before touching approval or lineage.
+		if err := lockApprovalWorkflow(ctx, tx, workflowRunID); err != nil {
+			return err
+		}
 	}
 	tag, err := tx.Exec(ctx, `UPDATE approvals SET decision=$2,decided_by=$3,decided_at=now() WHERE id=$1 AND decision='pending'`, id, decision, actor)
 	if err == nil && tag.RowsAffected() == 0 {
-		return fmt.Errorf("pending approval %s not found", id)
+		var existing string
+		if err := tx.QueryRow(ctx, `SELECT decision FROM approvals WHERE id=$1`, id).Scan(&existing); err != nil {
+			return err
+		}
+		if decision != "rejected" || existing != decision {
+			return fmt.Errorf("pending approval %s not found", id)
+		}
 	}
 	if err != nil {
 		return err
@@ -706,10 +721,27 @@ func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, acto
 	if decision == "approved" {
 		eventType = "moderate_approval_accepted"
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,safe_message,details) VALUES($1,$2,'platform',$3,$4,$5,$6,$7,'moderate approval decided',$8)`, domain.NewID(), eventType, actor, taskID, programID, workflowRunID, stepID, mustJSON(map[string]string{"decision": decision})); err != nil {
-		return err
+	if tag.RowsAffected() == 1 {
+		if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,safe_message,details) VALUES($1,$2,'platform',$3,$4,$5,$6,$7,'moderate approval decided',$8)`, domain.NewID(), eventType, actor, taskID, programID, workflowRunID, stepID, mustJSON(map[string]string{"decision": decision})); err != nil {
+			return err
+		}
 	}
 	if decision == "rejected" {
+		pending, err := hasUnresolvedWorkflowPrepared(ctx, tx, workflowRunID)
+		if err != nil {
+			return err
+		}
+		if pending {
+			// The human decision commits; every execution-lineage field stays put.
+			return commitApprovalDecision(ctx, tx)
+		}
+		var status domain.StepStatus
+		if err := tx.QueryRow(ctx, `SELECT status FROM step_runs WHERE id=$1`, stepID).Scan(&status); err != nil {
+			return err
+		}
+		if status == domain.StepFailed {
+			return commitApprovalDecision(ctx, tx)
+		}
 		now := time.Now().UTC()
 		stepTag, updateErr := tx.Exec(ctx, `UPDATE step_runs
 			SET status='failed',
@@ -750,7 +782,7 @@ func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, acto
 			}
 		}
 	}
-	return tx.Commit(ctx)
+	return commitApprovalDecision(ctx, tx)
 }
 func (s *Store) StepApproved(ctx context.Context, stepID domain.ID) (bool, error) {
 	var approved bool
@@ -1689,6 +1721,9 @@ func (s *Store) LoadEffectiveStepInput(ctx context.Context, programID domain.ID,
 }
 
 func (s *Store) PersistEffectiveStepInput(ctx context.Context, programID domain.ID, action domain.ActionRequest, proposed json.RawMessage) (json.RawMessage, error) {
+	if _, recovering := domain.PreparedRecoveryRequestFromContext(ctx); recovering {
+		return nil, fmt.Errorf("recovery admission cannot allocate attempts")
+	}
 	if action.StepAttempt < 1 || len(proposed) == 0 || !json.Valid(proposed) {
 		return nil, fmt.Errorf("%w: effective input or attempt is invalid", workflow.ErrEffectiveStepInputConflict)
 	}
@@ -1699,6 +1734,9 @@ func (s *Store) PersistEffectiveStepInput(ctx context.Context, programID domain.
 	defer tx.Rollback(ctx)
 	step := effectiveInputStep(action)
 	if _, err := lockResultLineage(ctx, tx, programID, step); err != nil {
+		return nil, err
+	}
+	if err := ensureNoUnresolvedPrepared(ctx, tx, action.StepRunID); err != nil {
 		return nil, err
 	}
 	var persisted json.RawMessage

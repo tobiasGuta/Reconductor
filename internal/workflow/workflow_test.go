@@ -152,6 +152,58 @@ func registryFor(t *testing.T, capabilityImpl capability.Capability) *capability
 	}
 	return r
 }
+
+type retryCeilingExecutor struct {
+	calls     int
+	retryable bool
+	succeedAt int
+}
+
+func (e *retryCeilingExecutor) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
+	e.calls++
+	if e.succeedAt == e.calls {
+		return capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "ok", Output: json.RawMessage(`{"lines":[]}`)}}, nil
+	}
+	return capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "failed", Error: &domain.StructuredError{Classification: "provider_error", Message: "deterministic provider failure", Retryable: e.retryable}}}, errors.New("deterministic provider failure")
+}
+
+func TestOperatorAttemptCeilingConstrainsWorkflowRetryAuthority(t *testing.T) {
+	cases := []struct {
+		name      string
+		ceiling   int
+		retryable bool
+		succeedAt int
+		wantCalls int
+		wantErr   bool
+	}{
+		{name: "workflow authority without ceiling", retryable: true, wantCalls: 3, wantErr: true},
+		{name: "ceiling one", ceiling: 1, retryable: true, wantCalls: 1, wantErr: true},
+		{name: "ceiling two", ceiling: 2, retryable: true, wantCalls: 2, wantErr: true},
+		{name: "ceiling cannot increase authority", ceiling: 10, retryable: true, wantCalls: 3, wantErr: true},
+		{name: "non retryable remains one attempt", ceiling: 10, retryable: false, wantCalls: 1, wantErr: true},
+		{name: "successful first attempt does not retry", ceiling: 10, retryable: true, succeedAt: 1, wantCalls: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			registry := registryFor(t, testCap{name: "retry-ceiling", calls: &calls})
+			executor := &retryCeilingExecutor{retryable: tc.retryable, succeedAt: tc.succeedAt}
+			engine := Engine{Registry: registry, Executor: executor, Policy: policy.Policy{AllowedCapabilities: []string{"retry-ceiling"}}, Scope: allScope{}, OperatorAttemptCeiling: tc.ceiling}
+			definition := Definition{ID: domain.NewID(), Name: "retry-ceiling", Version: "1", Steps: []Step{{ID: "provider", Capability: "retry-ceiling", Input: json.RawMessage(`{}`), Retry: RetryPolicy{MaxAttempts: 3, BaseDelay: time.Nanosecond}}}}
+			state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), WorkflowDefinitionID: definition.ID}, nil)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error=%v wantErr=%t", err, tc.wantErr)
+			}
+			if executor.calls != tc.wantCalls {
+				t.Fatalf("provider calls=%d want=%d", executor.calls, tc.wantCalls)
+			}
+			if got := state.Steps["provider"].Run.AttemptCount; got != tc.wantCalls {
+				t.Fatalf("durable attempts=%d want=%d", got, tc.wantCalls)
+			}
+		})
+	}
+}
+
 func TestDependencyValidation(t *testing.T) {
 	calls := 0
 	r := registryFor(t, testCap{"x", &calls, false})
@@ -237,7 +289,7 @@ func TestResolveInputPreservesJSONNumbersInBoundProviderOutput(t *testing.T) {
 	state := &State{Steps: map[string]*StepState{
 		"probe": {Run: domain.StepRun{Output: json.RawMessage(`{"authorized_records":[{"fields":{"status_code":200,"confidence":2e-1,"large":9007199254740993}}]}`)}},
 	}}
-	resolved, err := resolveInput(Step{
+	resolved, err := resolveInput(context.Background(), &Engine{Registry: capability.NewRegistry()}, "", "", Step{
 		Input:    json.RawMessage(`{"http_observations":[]}`),
 		Bindings: map[string]string{"http_observations": "probe.output.authorized_records"},
 	}, state)
@@ -255,7 +307,7 @@ func TestResolveInputPreservesJSONNumbersInBoundProviderOutput(t *testing.T) {
 		t.Fatalf("resolved records=%#v", input)
 	}
 	fields := records[0].(map[string]any)["fields"].(map[string]any)
-	for key, want := range map[string]string{"status_code": "200", "confidence": "2e-1", "large": "9007199254740993"} {
+	for key, want := range map[string]string{"status_code": "200", "confidence": "0.2", "large": "9007199254740993"} {
 		value, ok := fields[key].(json.Number)
 		if !ok || value.String() != want {
 			t.Fatalf("%s=%#v want json.Number(%q)", key, fields[key], want)

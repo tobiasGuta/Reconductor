@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -30,9 +31,12 @@ type Storage interface {
 type Local struct {
 	root        string
 	storeID     domain.ID
+	identity    StoreIdentity
 	redactor    *redaction.Redactor
 	newID       func() domain.ID
 	initialized bool
+	rootInfo    os.FileInfo
+	markerInfo  os.FileInfo
 }
 
 func (l *Local) Put(_ context.Context, request PutRequest) (domain.Artifact, error) {
@@ -126,6 +130,77 @@ func (l *Local) StoreID() domain.ID {
 	return l.storeID
 }
 
+func (l *Local) Identity() StoreIdentity {
+	if l == nil {
+		return StoreIdentity{}
+	}
+	return l.identity
+}
+
+func (l *Local) OpenVerified(ctx context.Context, reference domain.ResultArtifactRefV1) (io.ReadCloser, error) {
+	if l == nil || !l.initialized || reference.ArtifactStoreID != l.storeID {
+		return nil, fmt.Errorf("semantic artifact store identity mismatch")
+	}
+	if err := reference.Validate(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return l.openAuthoritativeArtifact(ctx, reference)
+}
+
+type verifiedArtifactReader struct {
+	file           *os.File
+	limited        io.Reader
+	hash           hash.Hash
+	expectedSize   int64
+	expectedDigest []byte
+	read           int64
+	verified       bool
+	verification   error
+}
+
+func (r *verifiedArtifactReader) Read(buffer []byte) (int, error) {
+	if r.verification != nil {
+		return 0, r.verification
+	}
+	n, err := r.limited.Read(buffer)
+	if n > 0 {
+		r.read += int64(n)
+		_, _ = r.hash.Write(buffer[:n])
+	}
+	if errors.Is(err, io.EOF) {
+		r.verification = r.verify()
+		if r.verification != nil {
+			return n, r.verification
+		}
+	}
+	return n, err
+}
+
+func (r *verifiedArtifactReader) verify() error {
+	if r.verified {
+		return r.verification
+	}
+	r.verified = true
+	if r.read != r.expectedSize || !bytes.Equal(r.hash.Sum(nil), r.expectedDigest) {
+		return fmt.Errorf("semantic artifact integrity mismatch")
+	}
+	return nil
+}
+
+func (r *verifiedArtifactReader) Close() error {
+	if r.file == nil {
+		return r.verification
+	}
+	_, drainErr := io.Copy(io.Discard, r)
+	verifyErr := r.verify()
+	closeErr := r.file.Close()
+	r.file = nil
+	return errors.Join(drainErr, verifyErr, closeErr)
+}
+
 func (l *Local) DeleteContent(ctx context.Context, id domain.ID, storageKey string) (ContentDeletionOutcome, error) {
 	if l == nil || !l.initialized || l.root == "" || l.storeID == "" {
 		return "", fmt.Errorf("artifact store is not initialized")
@@ -140,76 +215,7 @@ func (l *Local) DeleteContent(ctx context.Context, id domain.ID, storageKey stri
 		return "", fmt.Errorf("artifact storage key is not canonical for its identity: %w", err)
 	}
 
-	location, err := l.pathForKey(storageKey, id)
-	if err != nil {
-		return "", err
-	}
-
-	info, err := os.Lstat(location)
-	switch {
-	case err == nil:
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return "", fmt.Errorf("%w: entry at %s is not a regular file", ErrUnexpectedEntryType, storageKey)
-		}
-		if err := os.Remove(location); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return l.syncExistingAncestorForAbsent(filepath.Dir(location))
-			}
-			return "", fmt.Errorf("remove artifact file: %w", err)
-		}
-		if err := syncDirectoryChain(filepath.Dir(location), l.root); err != nil {
-			return "", &DurabilitySyncError{Err: fmt.Errorf("sync directory chain after delete: %w", err)}
-		}
-		return ContentRemoved, nil
-
-	case errors.Is(err, os.ErrNotExist):
-		return l.syncExistingAncestorForAbsent(filepath.Dir(location))
-
-	default:
-		return "", fmt.Errorf("inspect artifact file: %w", err)
-	}
-}
-
-func (l *Local) syncExistingAncestorForAbsent(shardDir string) (ContentDeletionOutcome, error) {
-	ancestor, err := nearestExistingAncestorLstat(shardDir, l.root)
-	if err != nil {
-		return "", err
-	}
-	if err := syncDirectoryChain(ancestor, l.root); err != nil {
-		return "", &DurabilitySyncError{Err: fmt.Errorf("sync directory chain for absent artifact: %w", err)}
-	}
-	return ContentAlreadyAbsent, nil
-}
-
-func nearestExistingAncestorLstat(path, root string) (string, error) {
-	current, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-	for {
-		if !within(absRoot, current) && filepath.Clean(current) != filepath.Clean(absRoot) {
-			return "", fmt.Errorf("ancestor search left storage root")
-		}
-		info, statErr := os.Lstat(current)
-		switch {
-		case statErr == nil:
-			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-				return "", fmt.Errorf("%w: ancestor %s is not a regular directory", ErrUnexpectedEntryType, current)
-			}
-			return current, nil
-		case !errors.Is(statErr, os.ErrNotExist):
-			return "", statErr
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return "", fmt.Errorf("no existing directory ancestor within root")
-		}
-		current = parent
-	}
+	return l.deleteAuthoritativeArtifact(ctx, storageKey)
 }
 
 func (l *Local) pathForKey(key string, id domain.ID) (string, error) {

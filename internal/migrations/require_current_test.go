@@ -52,7 +52,7 @@ func (r schemaRowStub) Scan(dest ...any) error {
 }
 
 func TestRequireCurrentAcceptsOnlyNewestExactMigration(t *testing.T) {
-	db := &schemaDBStub{version: 19, name: "0019_large_result_recovery_foundation.sql"}
+	db := &schemaDBStub{version: 20, name: "0020_prepared_evidence_ownership.sql"}
 	if err := RequireCurrent(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
@@ -70,8 +70,8 @@ func TestRequireCurrentFailsClosedWithoutMutatingSchema(t *testing.T) {
 	}{
 		{name: "missing ledger row", queryError: pgx.ErrNoRows},
 		{name: "behind embedded schema", version: 18, applied: "0018_large_result_publication_journal.sql"},
-		{name: "ahead of embedded schema", version: 20, applied: "0020_future.sql"},
-		{name: "wrong migration name", version: 19, applied: "0019_wrong.sql"},
+		{name: "ahead of embedded schema", version: 21, applied: "0021_future.sql"},
+		{name: "wrong migration name", version: 20, applied: "0020_wrong.sql"},
 		{name: "query failure", queryError: errors.New("schema ledger unavailable")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
