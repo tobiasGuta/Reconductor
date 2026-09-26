@@ -272,14 +272,33 @@ func TestWorkflowRunMaxStepAttemptsRejectsInvalidCeilingsBeforeRuntimeSetup(t *t
 	}
 }
 
-func TestLife360S2002RegressionScopePlanIsNarrow(t *testing.T) {
+func TestS2002ExactHostRegressionScopePlanIsNarrow(t *testing.T) {
+	root := t.TempDir()
+	scopePath := filepath.Join(root, "scope.json")
+	scopeDocument := []byte(`{
+  "target": {
+    "scope": {
+      "advanced_mode": true,
+      "exclude": [],
+      "include": [
+        {"enabled": true, "file": "^/.*", "host": "^www\\.example\\.test$", "port": "^80$", "protocol": "http"},
+        {"enabled": true, "file": "^/.*", "host": "^www\\.example\\.test$", "port": "^443$", "protocol": "https"},
+        {"enabled": true, "file": "^/.*", "host": "^intl\\.example\\.test$", "port": "^80$", "protocol": "http"},
+        {"enabled": true, "file": "^/.*", "host": "^intl\\.example\\.test$", "port": "^443$", "protocol": "https"}
+      ]
+    }
+  }
+}`)
+	if err := os.WriteFile(scopePath, scopeDocument, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := config.LoadPlanning()
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.Scope.Root = filepath.Join("..", "..")
+	cfg.Scope.Root = root
 	out, err := captureStdout(func() error {
-		return scopeCommand(context.Background(), cfg, []string{"plan", "--scope", "scope/life360-s2-002-regression.json"})
+		return scopeCommand(context.Background(), cfg, []string{"plan", "--scope", "scope.json"})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -296,10 +315,10 @@ func TestLife360S2002RegressionScopePlanIsNarrow(t *testing.T) {
 	for _, seed := range payload.ExactActiveSeeds {
 		got[seed.Host] = true
 	}
-	if len(got) != 2 || !got["www.life360.com"] || !got["intl.life360.com"] {
+	if len(got) != 2 || !got["www.example.test"] || !got["intl.example.test"] {
 		t.Fatalf("unexpected regression scope hosts: %s", out)
 	}
-	for _, forbidden := range []string{"api.life360.com", "api-cloudfront.life360.com", "tile.com", "thetileapp.com", "production.tile-api.com", "backend.jiobit.com", "api.nativo.com"} {
+	for _, forbidden := range []string{"example.test", "api.example.test", "admin.example.test"} {
 		if got[forbidden] {
 			t.Fatalf("forbidden host %q appeared in regression scope: %s", forbidden, out)
 		}
