@@ -196,7 +196,7 @@ func TestOnlyExplicitAdministrativeCommandAppliesMigrations(t *testing.T) {
 	if strings.Count(platformSource, ".Migrate(ctx)") != 1 || !strings.Contains(platformSource, `case "migrate":`) {
 		t.Fatal("platform schema mutation is not confined to the explicit migrate command")
 	}
-	if strings.Count(platformSource, "database.Open(ctx") != 2 || !strings.Contains(platformSource, "s.RequireCurrentSchema(ctx)") {
+	if strings.Count(platformSource, "database.Open(ctx") != 3 || !strings.Contains(platformSource, "s.RequireCurrentSchema(ctx)") || !strings.Contains(platformSource, `case "prepared-limits-remediate-0021":`) {
 		t.Fatal("ordinary platform database startup does not use the fail-closed schema check")
 	}
 	for _, path := range []string{filepath.Join("..", "worker", "main.go"), filepath.Join("..", "scheduler", "main.go")} {

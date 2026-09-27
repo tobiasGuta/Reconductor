@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/capability"
+	"github.com/tobiasGuta/Reconductor/internal/domain"
 )
 
 // Both pipe-copy goroutines share one byte authority. No Write grows storage
@@ -61,7 +62,7 @@ func (s *captureStream) Write(p []byte) (int, error) {
 }
 
 func runCaptured(ctx context.Context, name string, args []string, stdin []byte, limit int64) ([]byte, []byte, int, error) {
-	if limit < 1 || limit > 1<<40 {
+	if limit < 1 || limit > domain.PreparedSetOutputAuthorityMaxBytes {
 		return nil, nil, -1, errors.New("invalid provider output byte authority")
 	}
 	runCtx, cancel := context.WithCancel(ctx)

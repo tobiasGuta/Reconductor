@@ -28,10 +28,11 @@ func TestPreparedEvidenceStatusRequiresConfiguredAvailableCapacity(t *testing.T)
 	}
 
 	for name, status := range map[string]PreparedEvidenceStatus{
-		"invalid limits":    {MaxOpenSets: 0, MaxSetBytes: 1024, MaxUnresolvedBytes: 4096},
-		"invalid occupancy": {MaxOpenSets: 4, MaxSetBytes: 1024, MaxUnresolvedBytes: 4096, OpenSets: -1},
-		"open sets":         {MaxOpenSets: 4, MaxSetBytes: 1024, MaxUnresolvedBytes: 8192, OpenSets: 4},
-		"byte limit":        {MaxOpenSets: 8, MaxSetBytes: 1024, MaxUnresolvedBytes: 4096, UnresolvedBytes: 3073},
+		"invalid limits":       {MaxOpenSets: 0, MaxSetBytes: 1024, MaxUnresolvedBytes: 4096},
+		"oversized stored set": {MaxOpenSets: 4, MaxSetBytes: domain.PreparedSetOutputAuthorityMaxBytes + 1, MaxUnresolvedBytes: domain.PreparedSetOutputAuthorityMaxBytes + 1},
+		"invalid occupancy":    {MaxOpenSets: 4, MaxSetBytes: 1024, MaxUnresolvedBytes: 4096, OpenSets: -1},
+		"open sets":            {MaxOpenSets: 4, MaxSetBytes: 1024, MaxUnresolvedBytes: 8192, OpenSets: 4},
+		"byte limit":           {MaxOpenSets: 8, MaxSetBytes: 1024, MaxUnresolvedBytes: 4096, UnresolvedBytes: 3073},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := status.RequireAdmissionCapacity()
@@ -43,6 +44,26 @@ func TestPreparedEvidenceStatusRequiresConfiguredAvailableCapacity(t *testing.T)
 				if !errors.As(err, &limit) || !strings.Contains(err.Error(), "prepared-recover") {
 					t.Fatalf("error=%v", err)
 				}
+			}
+		})
+	}
+}
+
+func TestPreparedEvidenceLimitValueBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		maxSet        int64
+		maxUnresolved int64
+		wantError     bool
+	}{
+		{name: "documented one MiB", maxSet: 1 << 20, maxUnresolved: 128 << 20},
+		{name: "exact per-set maximum with independent aggregate", maxSet: domain.PreparedSetOutputAuthorityMaxBytes, maxUnresolved: 1 << 50},
+		{name: "per-set maximum plus one", maxSet: domain.PreparedSetOutputAuthorityMaxBytes + 1, maxUnresolved: domain.PreparedSetOutputAuthorityMaxBytes + 1, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validatePreparedEvidenceLimitValues(128, test.maxSet, test.maxUnresolved)
+			if (err != nil) != test.wantError {
+				t.Fatalf("maxSet=%d maxUnresolved=%d error=%v", test.maxSet, test.maxUnresolved, err)
 			}
 		})
 	}

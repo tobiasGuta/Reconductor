@@ -19,6 +19,14 @@ var testStoreIdentity = artifact.StoreIdentity{ArtifactStoreID: "00000000-0000-4
 
 func compileTestResult(t *testing.T, result capability.Result, schema string, reservation ...int64) CompiledResult {
 	t.Helper()
+	compiled, err := Compile(compileTestRequest(result, schema, reservation...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return compiled
+}
+
+func compileTestRequest(result capability.Result, schema string, reservation ...int64) CompileRequest {
 	actionID, attemptID := domain.NewID(), domain.NewID()
 	result.ProviderAttemptID = &attemptID
 	result.AdmissionProvenance = &capability.ResultAdmissionProvenance{ProviderAttemptID: attemptID, ActionRequestID: actionID, StepAttempt: 1, Provider: "test", ReservedCapacityBytes: 1 << 20}
@@ -30,18 +38,14 @@ func compileTestResult(t *testing.T, result capability.Result, schema string, re
 	}
 	now := time.Now().UTC()
 	stepID := domain.NewID()
-	compiled, err := Compile(CompileRequest{
+	return CompileRequest{
 		ProgramID:     domain.NewID(),
 		Action:        domain.ActionRequest{ID: actionID, TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: stepID, Capability: "test.result", StepAttempt: 1},
 		Manifest:      capability.Manifest{Name: "test.result", Version: "1", OutputSchema: json.RawMessage(schema)},
 		StoreIdentity: testStoreIdentity,
 		Result:        result,
 		ToolRun:       domain.ToolRun{ID: domain.NewID(), StepRunID: stepID, Capability: "test.result", Provider: "test", ToolVersion: "1", StartedAt: now, CompletedAt: &now, ProviderAttemptID: &attemptID},
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	return compiled
 }
 
 func preparedByRole(t *testing.T, compiled CompiledResult, role domain.ResultArtifactRoleV1) PreparedArtifact {

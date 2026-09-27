@@ -119,7 +119,7 @@ func Compile(request CompileRequest) (CompiledResult, error) {
 	if request.Result.AdmissionProvenance.ReservedCapacityBytes > 0 {
 		budget = request.Result.AdmissionProvenance.ReservedCapacityBytes
 	}
-	if budget < 1 || budget > 1<<40 {
+	if budget < 1 || budget > domain.PreparedSetOutputAuthorityMaxBytes {
 		return CompiledResult{}, fmt.Errorf("invalid result byte authority")
 	}
 	// Defense in depth: direct callers cannot force a full copy/decode before

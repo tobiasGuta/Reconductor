@@ -107,6 +107,22 @@ The result reports remaining open-set and reserved-byte occupancy. Repeat as nee
 
 Durable publisher and recovery operations currently require Linux with ext, XFS, or Btrfs. Native Windows and other operating systems fail closed; use the Linux worker container on those hosts.
 
+### Upgrade from oversized schema-0020 authority
+
+Migration 0021 lowers the permitted `max-set-bytes` to exactly 8 MiB without reducing the independently configured aggregate limit. If `platform migrate` reports an oversized configuration, keep every artifact-producing runtime stopped and do not edit the row directly. First inspect non-cleaned prepared sets reserved above 8 MiB.
+
+Use the last binary whose current schema is 0020 to run `artifact-store prepared-recover --batch-size 100` against the same StoreID and root. If using `go run`, run it from a checked-out schema-0020 release rather than the new source tree. That recovery path can verify and reconcile legacy `ALLOCATED` and `SEALED` sets reserved under the former authority and can clean `RESOLVED_ADOPTED` and `RESOLVED_ABANDONED` sets. Repeat it until no oversized non-cleaned set remains. `CLEANED` rows need no action. `QUARANTINED` sets are deliberately retained and skipped; an oversized quarantined set blocks this upgrade because there is no safe supported disposition.
+
+Then use the new binary:
+
+```powershell
+go run ./cmd/platform artifact-store prepared-limits-remediate-0021 --max-set-bytes 8388608 --confirm-artifact-runtimes-stopped
+go run ./cmd/platform migrate
+go run ./cmd/platform doctor
+```
+
+The remediation command exists only at the exact 0020-to-0021 frontier. It requires the configured existing StoreID, validates the durable database is drained, refuses active prepared/publication state and any oversized legacy evidence, and updates only `max_set_bytes`. It neither creates defaults nor changes `max_open_sets` or `max_unresolved_bytes`. A failed attempt is transactional; preserve the diagnostic and evidence, finish supported schema-0020 recovery, and retry. See [the migration guide](migration.md#provider-output-authority-ceiling-migration-0021) for the inspection query, lifecycle distinctions, and remaining quarantine blocker.
+
 Rollback is not a normal binary downgrade. Once 0016 is applied, an old writer cannot insert artifacts, while a pre-0016 schema cannot represent version-1 addresses. Recover by rolling forward or by restoring a coordinated pre-migration database and artifact backup.
 
 The local backend assumes the configured root and its parent directories are trusted against same-privilege replacement while the process runs. Canonical keys and a final lexical containment check prevent malformed path construction; they do not provide hostile filesystem or TOCTOU confinement.

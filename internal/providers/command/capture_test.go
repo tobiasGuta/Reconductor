@@ -40,6 +40,16 @@ func TestOSRunnerBoundedOutput(t *testing.T) {
 	}
 }
 
+func TestOSRunnerAuthorityBoundary(t *testing.T) {
+	args := []string{"-test.run=^TestOutputCaptureProcess$", "--", "capture-helper", "stdout", "0"}
+	if _, _, _, err := runCaptured(context.Background(), os.Args[0], args, nil, domain.PreparedSetOutputAuthorityMaxBytes); err != nil {
+		t.Fatalf("exact authority: %v", err)
+	}
+	if _, _, _, err := runCaptured(context.Background(), os.Args[0], args, nil, domain.PreparedSetOutputAuthorityMaxBytes+1); err == nil || !strings.Contains(err.Error(), "invalid provider output byte authority") {
+		t.Fatalf("oversized authority error=%v", err)
+	}
+}
+
 func TestProviderNormalizationExpansionRejectsWithoutTruncatedSuccess(t *testing.T) {
 	for _, raw := range []string{strings.Repeat("x", 600), strings.Repeat("a\n", domain.InlineSemanticJSONMaxNodes+1)} {
 		budget := int64(1024)

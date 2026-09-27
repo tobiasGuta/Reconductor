@@ -10,6 +10,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/migrations"
 	"github.com/tobiasGuta/Reconductor/internal/resultadmission"
 )
 
@@ -26,7 +27,7 @@ type PreparedEvidenceStatus struct {
 }
 
 func (s PreparedEvidenceStatus) RequireAdmissionCapacity() error {
-	if s.MaxOpenSets < 1 || s.MaxSetBytes < 1 || s.MaxUnresolvedBytes < s.MaxSetBytes || s.OpenSets < 0 || s.UnresolvedBytes < 0 {
+	if err := validatePreparedEvidenceLimitValues(s.MaxOpenSets, s.MaxSetBytes, s.MaxUnresolvedBytes); err != nil || s.OpenSets < 0 || s.UnresolvedBytes < 0 {
 		return fmt.Errorf("prepared evidence limits are invalid")
 	}
 	if s.OpenSets >= s.MaxOpenSets {
@@ -72,7 +73,10 @@ func (s *Store) RequirePreparedEvidenceReady(ctx context.Context, storeID domain
 }
 
 func (s *Store) ConfigurePreparedEvidenceLimits(ctx context.Context, storeID domain.ID, maxOpen int, maxSetBytes, maxUnresolvedBytes int64) error {
-	if _, err := domain.ParseID(string(storeID)); err != nil || maxOpen < 1 || maxOpen > 1_000_000 || maxSetBytes < 1 || maxSetBytes > 1<<40 || maxUnresolvedBytes < maxSetBytes || maxUnresolvedBytes > 1<<50 {
+	if _, err := domain.ParseID(string(storeID)); err != nil {
+		return fmt.Errorf("prepared evidence store ID is not canonical")
+	}
+	if err := validatePreparedEvidenceLimitValues(maxOpen, maxSetBytes, maxUnresolvedBytes); err != nil {
 		return fmt.Errorf("prepared evidence limits are outside accepted bounds")
 	}
 	tag, err := s.Pool.Exec(ctx, `INSERT INTO artifact_store_prepared_limits(artifact_store_id,max_open_sets,max_set_bytes,max_unresolved_bytes)
@@ -82,6 +86,17 @@ func (s *Store) ConfigurePreparedEvidenceLimits(ctx context.Context, storeID dom
 	}
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("prepared evidence limit configuration did not affect exact store")
+	}
+	return nil
+}
+
+func (s *Store) RemediateProviderOutputAuthority0021(ctx context.Context, storeID domain.ID, maxSetBytes int64) (migrations.ProviderOutputAuthorityRemediation, error) {
+	return migrations.RemediateProviderOutputAuthority0021(ctx, s.Pool, storeID, maxSetBytes)
+}
+
+func validatePreparedEvidenceLimitValues(maxOpen int, maxSetBytes, maxUnresolvedBytes int64) error {
+	if maxOpen < 1 || maxOpen > 1_000_000 || maxSetBytes < 1 || maxSetBytes > domain.PreparedSetOutputAuthorityMaxBytes || maxUnresolvedBytes < maxSetBytes || maxUnresolvedBytes > 1<<50 {
+		return fmt.Errorf("prepared evidence limits are outside accepted bounds")
 	}
 	return nil
 }
@@ -149,6 +164,9 @@ func (s *Store) AllocateProviderInvocation(ctx context.Context, record capabilit
 	}
 	if registered != identity {
 		return capability.ProviderInvocationAdmission{}, fmt.Errorf("prepared evidence store identity changed before allocation")
+	}
+	if err := validatePreparedEvidenceLimitValues(maxOpen, maxSet, maxUnresolved); err != nil {
+		return capability.ProviderInvocationAdmission{}, fmt.Errorf("prepared evidence limits are invalid")
 	}
 	var openSets int
 	var unresolvedBytes int64

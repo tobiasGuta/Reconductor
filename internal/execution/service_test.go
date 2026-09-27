@@ -87,7 +87,7 @@ func (s *capturedStore) AllocateProviderInvocation(_ context.Context, record cap
 	}
 	capacity := s.reservedCapacity
 	if capacity == 0 {
-		capacity = 1 << 30
+		capacity = domain.PreparedSetOutputAuthorityMaxBytes
 	}
 	return capability.ProviderInvocationAdmission{ProviderAttemptID: s.startID, PreparedSetID: domain.NewID(), ManifestID: domain.NewID(), ReservedCapacityBytes: capacity}, nil
 }
@@ -1031,7 +1031,7 @@ func TestPreparedRecoveryReusesExactIdentitiesWithoutProviderReplay(t *testing.T
 
 func TestResolvedPreparedCleanupRetriesAfterPhysicalDeletion(t *testing.T) {
 	setID := domain.NewID()
-	store := &capturedStore{recoveryRecords: []domain.PreparedSetRecord{{ID: setID, ArtifactStoreID: capturedPublisherIdentity.ArtifactStoreID, StoreIncarnationNonce: capturedPublisherIdentity.IncarnationNonce, State: domain.PreparedResolvedAdopted}}, cleanErrors: []error{&injectedCommitUnknown{operation: "cleanup"}, nil}}
+	store := &capturedStore{recoveryRecords: []domain.PreparedSetRecord{{ID: setID, ArtifactStoreID: capturedPublisherIdentity.ArtifactStoreID, StoreIncarnationNonce: capturedPublisherIdentity.IncarnationNonce, State: domain.PreparedResolvedAdopted, ReservedCapacityBytes: domain.PreparedSetOutputAuthorityMaxBytes}}, cleanErrors: []error{&injectedCommitUnknown{operation: "cleanup"}, nil}}
 	artifacts := &capturedArtifacts{}
 	service := Service{Store: store, Artifacts: artifacts}
 	if err := service.RecoverPreparedEvidence(context.Background(), 10); !commitOutcomeUnknown(err) {
@@ -1046,7 +1046,7 @@ func TestResolvedPreparedCleanupRetriesAfterPhysicalDeletion(t *testing.T) {
 }
 
 func TestPreparedRecoveryRetainsQuarantine(t *testing.T) {
-	record := domain.PreparedSetRecord{ID: domain.NewID(), ArtifactStoreID: capturedPublisherIdentity.ArtifactStoreID, StoreIncarnationNonce: capturedPublisherIdentity.IncarnationNonce, State: domain.PreparedQuarantined}
+	record := domain.PreparedSetRecord{ID: domain.NewID(), ArtifactStoreID: capturedPublisherIdentity.ArtifactStoreID, StoreIncarnationNonce: capturedPublisherIdentity.IncarnationNonce, State: domain.PreparedQuarantined, ReservedCapacityBytes: domain.PreparedSetOutputAuthorityMaxBytes}
 	store, artifacts := &capturedStore{recoveryRecords: []domain.PreparedSetRecord{record}}, &capturedArtifacts{}
 	if err := (Service{Store: store, Artifacts: artifacts}).RecoverPreparedEvidence(context.Background(), 10); err != nil {
 		t.Fatal(err)

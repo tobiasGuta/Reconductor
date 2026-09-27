@@ -47,7 +47,7 @@ func (e *PreparedCapacityError) ResultContractLimit() domain.ResultContractLimit
 // ValidateCapacity performs an overflow-safe preflight without opening sources or
 // creating directories. Subtraction also bounds the aggregate of hostile lengths.
 func (r PreparedStageRequest) ValidateCapacity() error {
-	if r.ReservedCapacityBytes < 1 || r.ReservedCapacityBytes > 1<<40 {
+	if r.ReservedCapacityBytes < 1 || r.ReservedCapacityBytes > domain.PreparedSetOutputAuthorityMaxBytes {
 		return fmt.Errorf("invalid prepared reservation")
 	}
 	remaining := r.ReservedCapacityBytes

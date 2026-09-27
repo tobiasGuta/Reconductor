@@ -155,7 +155,7 @@ func (s *workerStore) AllocateProviderInvocation(_ context.Context, record capab
 	s.start = record
 	s.startID = domain.NewID()
 	s.startIDs = append(s.startIDs, s.startID)
-	return capability.ProviderInvocationAdmission{ProviderAttemptID: s.startID, PreparedSetID: domain.NewID(), ManifestID: domain.NewID(), ReservedCapacityBytes: 1 << 30}, nil
+	return capability.ProviderInvocationAdmission{ProviderAttemptID: s.startID, PreparedSetID: domain.NewID(), ManifestID: domain.NewID(), ReservedCapacityBytes: domain.PreparedSetOutputAuthorityMaxBytes}, nil
 }
 
 func (s *workerStore) SealPreparedEvidence(_ context.Context, record resultadmission.PreparedSealRecord) error {

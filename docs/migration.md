@@ -94,6 +94,58 @@ go run ./cmd/platform artifact-store prepared-recover --batch-size 100
 
 Repeat bounded batches as needed. Quarantined sets are retained and charged for operator investigation. The current native durable-publisher implementation supports Linux ext, XFS, and Btrfs; Windows and other operating systems fail closed and should use the Linux worker container.
 
+### Provider-output authority ceiling migration 0021
+
+Migration `0021_provider_output_authority_ceiling.sql` fixes the per-set provider-output authority at 8,388,608 bytes while leaving `max_open_sets` and `max_unresolved_bytes` independent. It never rewrites an operator's configuration. An oversized configuration, active execution/publication state, or non-cleaned prepared set reserved above 8 MiB makes the migration fail transactionally; version 0021 is not recorded.
+
+Use this maintenance sequence only for an installation whose exact frontier is `20 (0020_prepared_evidence_ownership.sql)`:
+
+1. Stop new admission, workers, schedulers, and every direct `platform workflow run` or `platform run retry` process. Take coordinated PostgreSQL and artifact-store backups. Keep those runtimes stopped until readiness has been verified.
+2. Confirm the migration frontier and inspect oversized prepared evidence with read-only queries:
+
+   ```sql
+   SELECT version, name
+   FROM schema_migrations
+   ORDER BY version DESC
+   LIMIT 1;
+
+   SELECT artifact_store_id, lifecycle_state, count(*) AS sets,
+          sum(reserved_capacity_bytes) AS reserved_bytes
+   FROM prepared_evidence_sets
+   WHERE lifecycle_state <> 'CLEANED'
+     AND reserved_capacity_bytes > 8388608
+   GROUP BY artifact_store_id, lifecycle_state
+   ORDER BY artifact_store_id, lifecycle_state;
+   ```
+
+3. Handle every oversized legacy row according to its retained lifecycle. `ALLOCATED` and `SEALED` rows still need authoritative recovery. `RESOLVED_ADOPTED` and `RESOLVED_ABANDONED` rows are resolved but remain charged until staged content is removed and they reach `CLEANED`. Run the last schema-0020-compatible binary—not the new 8 MiB binary—against the same database and physical StoreID:
+
+   ```powershell
+   go run ./cmd/platform artifact-store prepared-recover --batch-size 100
+   ```
+
+   Run that example from a checked-out schema-0020 release; otherwise invoke the deployed schema-0020 `platform` binary directly. The schema-0020 implementation accepts the old authority up to 1 TiB, verifies store identity, manifests, digests, attempt lineage, and publication state, and never replays a provider. Repeat bounded batches and the read-only inspection until no oversized non-cleaned row remains. `CLEANED` rows are safe and retain their history with a zero reservation.
+
+   `QUARANTINED` rows are intentionally skipped by automatic recovery and have no supported automatic disposition. An oversized quarantined row is a remaining upgrade blocker: preserve it, do not delete it, resize its reservation, fabricate resolution, or change its identity, and stop the upgrade for operator investigation.
+
+4. For each initialized store whose existing `max_set_bytes` is oversized, configure `ARTIFACT_STORE_ID` for that store and run the new binary's narrow maintenance command:
+
+   ```powershell
+   go run ./cmd/platform artifact-store prepared-limits-remediate-0021 --max-set-bytes 8388608 --confirm-artifact-runtimes-stopped
+   ```
+
+   The acknowledgement is necessary but not sufficient. The command also takes the migration lock and non-waiting database locks, requires the exact 0020 frontier, requires an existing configuration owned by the configured store, rejects values outside 1..8,388,608, and checks durable execution, schedule, prepared-set, and publication state. It changes only `max_set_bytes`; the open-set and aggregate unresolved-byte limits are returned unchanged in its JSON result. It cannot create a configuration or operate after migration 0021.
+
+5. Retry the migration with the new binary:
+
+   ```powershell
+   go run ./cmd/platform migrate
+   ```
+
+6. Verify that `schema_migrations` records version 21, then run `go run ./cmd/platform doctor` before restarting any runtime. Ordinary commands continue to require the current schema and cannot execute merely because the configuration correction succeeded.
+
+If remediation or migration fails, its transaction leaves the migration ledger and evidence unchanged. Read the categorized diagnostic, keep runtimes stopped, resolve the reported state with the schema-0020 recovery path where supported, and retry. Do not substitute an ad hoc configuration `UPDATE` or force the migration. After 0021 is current, use the ordinary `artifact-store prepared-limits` command for later configuration changes.
+
 ## Environment and Compose
 
 Replace `RATE_LIMIT` with `NUCLEI_RATE_LIMIT` and `CONCURRENCY` with explicit host/template/headless concurrency variables. Add `DATABASE_URL` and `REDIS_PASSWORD`. Compare the complete new `.env.example`; duplicated per-binary parsers no longer exist.

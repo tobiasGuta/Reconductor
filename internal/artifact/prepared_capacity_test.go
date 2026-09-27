@@ -7,6 +7,8 @@ import (
 	"math"
 	"strings"
 	"testing"
+
+	"github.com/tobiasGuta/Reconductor/internal/domain"
 )
 
 func TestPreparedCapacityAggregatePreflight(t *testing.T) {
@@ -39,6 +41,17 @@ func TestPreparedCapacityAggregatePreflight(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPreparedStageAuthorityBoundary(t *testing.T) {
+	exact := PreparedStageRequest{ReservedCapacityBytes: domain.PreparedSetOutputAuthorityMaxBytes, ManifestJSON: []byte("m")}
+	if err := exact.ValidateCapacity(); err != nil {
+		t.Fatalf("exact authority: %v", err)
+	}
+	oversized := PreparedStageRequest{ReservedCapacityBytes: domain.PreparedSetOutputAuthorityMaxBytes + 1, ManifestJSON: []byte("m")}
+	if err := oversized.ValidateCapacity(); err == nil || !strings.Contains(err.Error(), "invalid prepared reservation") {
+		t.Fatalf("oversized authority error=%v", err)
 	}
 }
 

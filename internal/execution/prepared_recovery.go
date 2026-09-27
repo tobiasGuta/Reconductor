@@ -65,6 +65,9 @@ func (s Service) recoverPreparedRecord(ctx context.Context, store preparedRecove
 	if record.ArtifactStoreID != identity.ArtifactStoreID || record.StoreIncarnationNonce != identity.IncarnationNonce {
 		return fmt.Errorf("database/store identity contradiction")
 	}
+	if err := validatePreparedRecoveryAuthority(record.ReservedCapacityBytes); err != nil {
+		return err
+	}
 	switch record.State {
 	case domain.PreparedQuarantined:
 		return nil
@@ -90,7 +93,7 @@ func (s Service) recoverPreparedRecord(ctx context.Context, store preparedRecove
 		return errors.Join(err, store.QuarantinePreparedEvidence(ctx, record.ID, "prepared_control_contradiction"))
 	}
 	contentBytes := int64(len(inspection.ManifestJSON) + len(inspection.ControlJSON))
-	if record.ReservedCapacityBytes < contentBytes || record.ReservedCapacityBytes > 1<<40 {
+	if record.ReservedCapacityBytes < contentBytes {
 		return &domain.UnresolvedPersistenceError{Err: fmt.Errorf("prepared recovery capacity contradiction")}
 	}
 	for _, member := range inspection.Manifest.Members {
@@ -208,6 +211,13 @@ func (s Service) recoverPreparedRecord(ctx context.Context, store preparedRecove
 		// Failure to prove admission (including missing live credentials) is
 		// not proof of nonadoption and never grants abandonment authority.
 		return &domain.UnresolvedPersistenceError{Err: err}
+	}
+	return nil
+}
+
+func validatePreparedRecoveryAuthority(reservedCapacityBytes int64) error {
+	if reservedCapacityBytes < 1 || reservedCapacityBytes > domain.PreparedSetOutputAuthorityMaxBytes {
+		return &domain.UnresolvedPersistenceError{Err: fmt.Errorf("prepared recovery capacity contradiction")}
 	}
 	return nil
 }

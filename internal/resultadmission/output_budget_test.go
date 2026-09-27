@@ -38,6 +38,31 @@ func TestCompilerTinyReservationAndCanonicalExpansion(t *testing.T) {
 	}
 }
 
+func TestCompilerAuthorityAndAggregateEvidenceBoundaries(t *testing.T) {
+	exactAuthority := compileTestResult(t, capability.Result{Action: domain.ActionResult{Status: "succeeded", Output: json.RawMessage(`{}`)}}, `{}`, domain.PreparedSetOutputAuthorityMaxBytes)
+	exactAuthority.Close()
+
+	if _, err := Compile(compileTestRequest(capability.Result{Action: domain.ActionResult{Status: "succeeded", Output: json.RawMessage(`{}`)}}, `{}`, domain.PreparedSetOutputAuthorityMaxBytes+1)); err == nil || !strings.Contains(err.Error(), "invalid result byte authority") {
+		t.Fatalf("oversized authority error=%v", err)
+	}
+
+	exactAggregate := compileTestResult(t, capability.Result{Action: domain.ActionResult{Status: "succeeded", Output: json.RawMessage(`{}`)}, RawStdout: []byte("aa"), RawStderr: []byte("bb")}, `{}`, 6)
+	var evidenceBytes int64
+	for _, item := range exactAggregate.Artifacts {
+		evidenceBytes += item.Source.SizeBytes()
+	}
+	if evidenceBytes != 6 || exactAggregate.Envelope.Error != nil {
+		t.Fatalf("exact aggregate bytes=%d envelope=%#v", evidenceBytes, exactAggregate.Envelope)
+	}
+	exactAggregate.Close()
+
+	overAggregate := compileTestResult(t, capability.Result{Action: domain.ActionResult{Status: "succeeded", Output: json.RawMessage(`{}`)}, RawStdout: []byte("aa"), RawStderr: []byte("bb")}, `{}`, 5)
+	if overAggregate.Envelope.Error == nil || overAggregate.Envelope.Error.Code != "result_contract_limit" || overAggregate.Envelope.Error.Retryable {
+		t.Fatalf("aggregate overflow envelope=%#v", overAggregate.Envelope)
+	}
+	overAggregate.Close()
+}
+
 func TestCompilerControlStringsCannotBypassByteAdmission(t *testing.T) {
 	large := strings.Repeat("x", (1<<20)+1)
 	for _, action := range []domain.ActionResult{

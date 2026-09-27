@@ -247,6 +247,34 @@ func TestCompareAssetsStatusRouting(t *testing.T) {
 	}
 }
 
+func TestInternalProviderOverBudgetIsRejectedByRegistry(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := platformscope.Compile([]platformscope.Rule{{Protocol: `^http$`, Host: `^127\.0\.0\.1$`, Port: `^8080$`, File: `^/.*`, Enabled: true}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	urls := make([]string, 500)
+	for i := range urls {
+		urls[i] = fmt.Sprintf("http://127.0.0.1:8080/resource/%06d/%s", i, strings.Repeat("x", 64))
+	}
+	input, err := json.Marshal(TargetingPrepareInput{ExactURLs: urls, DiscoveredURLs: []string{}, Ports: []int{8080}, TargetPlanDigest: "internal-output-limit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executeProviderTest(Registry(cfg), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "targeting.prepare", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"targeting.prepare"}}, Scope: sc})
+	if err == nil || result.Action.Error == nil || result.Action.Error.Classification != "result_contract_limit" || result.Action.Error.Retryable || len(result.Action.Output) != 0 || result.OutputLimit == nil || result.OutputLimit.Limit != domain.ResultEnvelopeMaxBytes {
+		t.Fatalf("result=%#v error=%v input_bytes=%d", result, err, len(input))
+	}
+}
+
 func TestCompareAssetsRejectsMalformedStructuredCurrentObservations(t *testing.T) {
 	cfg, err := config.LoadWith(func(k string) string {
 		if k == "DATABASE_URL" {

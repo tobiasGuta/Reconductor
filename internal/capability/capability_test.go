@@ -19,6 +19,11 @@ type failingPreparedAllocator struct {
 	err error
 }
 
+type fixedPreparedAllocator struct {
+	capturedInvocations
+	admission ProviderInvocationAdmission
+}
+
 type unresolvedAllocationError struct{}
 
 func (*unresolvedAllocationError) Error() string              { return "allocation acknowledgement unresolved" }
@@ -27,6 +32,11 @@ func (*unresolvedAllocationError) CommitOutcomeUnknown() bool { return true }
 func (f *failingPreparedAllocator) AllocateProviderInvocation(_ context.Context, record ProviderInvocationStartRecord, _ artifact.StoreIdentity) (ProviderInvocationAdmission, error) {
 	f.starts = append(f.starts, record)
 	return ProviderInvocationAdmission{}, f.err
+}
+
+func (f *fixedPreparedAllocator) AllocateProviderInvocation(_ context.Context, record ProviderInvocationStartRecord, _ artifact.StoreIdentity) (ProviderInvocationAdmission, error) {
+	f.starts = append(f.starts, record)
+	return f.admission, nil
 }
 
 type executionProbeCapability struct{ executed bool }
@@ -54,6 +64,39 @@ func TestPreparedAllocationFailurePreventsProviderInvocation(t *testing.T) {
 	var unknown interface{ CommitOutcomeUnknown() bool }
 	if !errors.Is(err, cause) || !errors.As(err, &unknown) || !unknown.CommitOutcomeUnknown() || implementation.executed || len(allocator.starts) != 1 {
 		t.Fatalf("error=%v executed=%v allocations=%d", err, implementation.executed, len(allocator.starts))
+	}
+}
+
+func TestPreparedAllocationAuthorityValidatedBeforeProviderInvocation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		authority int64
+		wantError bool
+	}{
+		{name: "exact maximum", authority: domain.PreparedSetOutputAuthorityMaxBytes},
+		{name: "maximum plus one", authority: domain.PreparedSetOutputAuthorityMaxBytes + 1, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			implementation := &executionProbeCapability{}
+			registry := NewRegistry()
+			if err := registry.Register(implementation); err != nil {
+				t.Fatal(err)
+			}
+			allocator := &fixedPreparedAllocator{admission: ProviderInvocationAdmission{ProviderAttemptID: domain.NewID(), PreparedSetID: domain.NewID(), ManifestID: domain.NewID(), ReservedCapacityBytes: test.authority}}
+			identity := artifact.StoreIdentity{ArtifactStoreID: domain.NewID(), IncarnationNonce: domain.NewID(), BackendKind: artifact.BackendKind, MarkerFormat: artifact.MarkerFormat, MarkerVersion: artifact.MarkerVersion}
+			request := Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "prepared.probe", StepAttempt: 1}, ProgramID: domain.NewID(), Policy: policy.Policy{AllowedCapabilities: []string{"prepared.probe"}}, Scope: allowAllScope{}, DecisionRecorder: &capturedDecision{}, InvocationRecorder: allocator, PreparedStoreIdentity: &identity, RequirePreparedEvidence: true}
+			_, err := registry.Execute(context.Background(), request)
+			if test.wantError {
+				var unresolved *domain.UnresolvedPersistenceError
+				if err == nil || !errors.As(err, &unresolved) || implementation.executed {
+					t.Fatalf("error=%v executed=%v", err, implementation.executed)
+				}
+				return
+			}
+			if err != nil || !implementation.executed {
+				t.Fatalf("error=%v executed=%v", err, implementation.executed)
+			}
+		})
 	}
 }
 

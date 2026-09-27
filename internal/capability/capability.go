@@ -304,7 +304,7 @@ func (r *Registry) Execute(ctx context.Context, req Request) (Result, error) {
 	budget := int64(domain.ResultEnvelopeMaxBytes)
 	if req.RequirePreparedEvidence {
 		budget = preparedAdmission.ReservedCapacityBytes
-		if budget < 1 || budget > 1<<40 {
+		if budget < 1 || budget > domain.PreparedSetOutputAuthorityMaxBytes {
 			return Result{}, &domain.UnresolvedPersistenceError{Err: fmt.Errorf("invalid allocated output byte authority")}
 		}
 	}

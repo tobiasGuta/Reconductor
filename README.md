@@ -399,8 +399,11 @@ platform migrate
 platform artifact-store init [--allow-nonempty-root] [--resume-registration]
 platform artifact-store cleanup [--batch-size N]
 platform artifact-store prepared-limits --max-open-sets N --max-set-bytes N --max-unresolved-bytes N
+platform artifact-store prepared-limits-remediate-0021 --max-set-bytes N --confirm-artifact-runtimes-stopped
 platform artifact-store prepared-recover [--batch-size N]
 ```
+
+`prepared-limits-remediate-0021` is a maintenance-only command for the exact schema-0020-to-0021 upgrade window. Follow the stopped-runtime and legacy-evidence procedure in the [migration guide](docs/migration.md#provider-output-authority-ceiling-migration-0021); it is not a general readiness bypass.
 
 `run retry <run-id>` accepts the same `--program-id`, `--domain`, `--scope`, and approval flags as `workflow run`; successful unchanged steps are retained. Queue inspection uses the single Redis consumer group and dead-letter stream.
 

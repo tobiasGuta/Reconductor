@@ -122,7 +122,7 @@ func artifactStoreCommand(ctx context.Context, cfg config.Config, args []string)
 
 func artifactStoreCommandWithCleanup(ctx context.Context, cfg config.Config, args []string, cleanup func(context.Context, config.Config, domain.ID, int) (artifact.CleanupResult, error)) error {
 	if len(args) == 0 {
-		return fmt.Errorf("artifact-store requires init, cleanup, prepared-limits, or prepared-recover")
+		return fmt.Errorf("artifact-store requires init, cleanup, prepared-limits, prepared-limits-remediate-0021, or prepared-recover")
 	}
 	switch args[0] {
 	case "init":
@@ -200,6 +200,37 @@ func artifactStoreCommandWithCleanup(ctx context.Context, cfg config.Config, arg
 		}
 		return printJSON(map[string]any{"store_id": storeID, "max_open_sets": *maxOpen, "max_set_bytes": *maxSet, "max_unresolved_bytes": *maxUnresolved, "status": "configured"})
 
+	case "prepared-limits-remediate-0021":
+		fs := flag.NewFlagSet("artifact-store prepared-limits-remediate-0021", flag.ContinueOnError)
+		maxSet := fs.Int64("max-set-bytes", 0, "explicit corrected per-set authority at or below 8388608 bytes")
+		confirmedStopped := fs.Bool("confirm-artifact-runtimes-stopped", false, "confirm that workers, schedulers, and direct workflow processes are stopped")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return fmt.Errorf("artifact-store prepared-limits-remediate-0021 accepts no positional arguments")
+		}
+		if !*confirmedStopped {
+			return fmt.Errorf("artifact-store prepared-limits-remediate-0021 requires --confirm-artifact-runtimes-stopped after stopping artifact-producing runtimes")
+		}
+		if *maxSet < 1 || *maxSet > domain.PreparedSetOutputAuthorityMaxBytes {
+			return fmt.Errorf("max-set-bytes must be between 1 and %d", domain.PreparedSetOutputAuthorityMaxBytes)
+		}
+		storeID, err := cfg.ArtifactStorage.RequiredStoreID()
+		if err != nil {
+			return err
+		}
+		store, err := database.Open(ctx, cfg.Database.URL)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		result, err := store.RemediateProviderOutputAuthority0021(ctx, storeID, *maxSet)
+		if err != nil {
+			return err
+		}
+		return printJSON(map[string]any{"store_id": result.ArtifactStoreID, "previous_max_set_bytes": result.PreviousMaxSetBytes, "max_set_bytes": result.MaxSetBytes, "max_open_sets": result.MaxOpenSets, "max_unresolved_bytes": result.MaxUnresolvedBytes, "schema_frontier_version": result.SchemaFrontierVersion, "status": "migration_0021_remediated"})
+
 	case "prepared-recover":
 		fs := flag.NewFlagSet("artifact-store prepared-recover", flag.ContinueOnError)
 		batchSize := fs.Int("batch-size", 100, "maximum prepared sets to reconcile or clean (1..1000)")
@@ -235,7 +266,7 @@ func artifactStoreCommandWithCleanup(ctx context.Context, cfg config.Config, arg
 		return printJSON(map[string]any{"store_id": storeID, "batch_size": *batchSize, "status": "reconciled", "open_sets": prepared.OpenSets, "max_open_sets": prepared.MaxOpenSets, "unresolved_bytes": prepared.UnresolvedBytes, "max_unresolved_bytes": prepared.MaxUnresolvedBytes, "max_set_bytes": prepared.MaxSetBytes})
 
 	default:
-		return fmt.Errorf("artifact-store requires init, cleanup, prepared-limits, or prepared-recover")
+		return fmt.Errorf("artifact-store requires init, cleanup, prepared-limits, prepared-limits-remediate-0021, or prepared-recover")
 	}
 }
 
