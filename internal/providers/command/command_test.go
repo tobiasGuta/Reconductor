@@ -44,7 +44,7 @@ func (f *fakeRunner) Run(_ context.Context, name string, args []string, stdin []
 
 func TestFailureDiagnosticIsRedactedBoundedAndKeepsRawStderr(t *testing.T) {
 	runCause := errors.New("exit status 1; token=runtime-secret")
-	runner := &fakeRunner{stderr: "password=super-sensitive\x00\n" + strings.Repeat("x", 5000), exit: 1, err: runCause}
+	runner := &fakeRunner{stderr: "password=super-sensitive\x00\n" + strings.Repeat("x", 5000), exit: 1, err: runCause, version: "httpx token=tool-version-secret"}
 	p := New(Definition{Name: "probe.http", Provider: "httpx", Executable: "httpx", Version: "1", Risk: policy.Low, BuildArgs: func(i Input, _ policy.Policy) ([]string, error) { return []string{"-u", i.Targets[0]}, nil }}, runner, redaction.New())
 	raw, _ := json.Marshal(Input{Targets: []string{"https://example.test"}})
 	req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), StepRunID: domain.NewID(), Capability: "probe.http", Input: raw}, Policy: policy.Policy{AllowedCapabilities: []string{"probe.http"}}, Scope: allowScope(true)}
@@ -60,6 +60,9 @@ func TestFailureDiagnosticIsRedactedBoundedAndKeepsRawStderr(t *testing.T) {
 	}
 	if !strings.Contains(string(result.RawStderr), "<redacted>") || len(result.RawStderr) < 4000 {
 		t.Fatalf("raw stderr was not complete and redacted")
+	}
+	if result.ToolRun == nil || strings.Contains(result.ToolRun.ToolVersion, "tool-version-secret") || !strings.Contains(result.ToolRun.ToolVersion, "<redacted>") {
+		t.Fatal("tool version was not sanitized")
 	}
 }
 

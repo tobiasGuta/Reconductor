@@ -60,6 +60,7 @@ type capturedStore struct {
 	startID            domain.ID
 	start              capability.ProviderInvocationStartRecord
 	terminal           capability.ProviderInvocationTerminalRecord
+	terminalEvents     int
 	startErr           error
 	terminalErr        error
 	publishingErr      error
@@ -127,6 +128,7 @@ func TestOversizedRejectionFailureRemainsUnresolvedWithSameIdentity(t *testing.T
 }
 
 func (s *capturedStore) SealPreparedEvidence(_ context.Context, record resultadmission.PreparedSealRecord) error {
+	s.terminalEvents++
 	s.terminal = capability.ProviderInvocationTerminalRecord{ProviderAttemptID: record.Admission.ProviderAttemptID, Outcome: record.Outcome}
 	return s.terminalErr
 }
@@ -154,6 +156,7 @@ func (s *capturedStore) RecordProviderInvocationStarted(_ context.Context, recor
 }
 
 func (s *capturedStore) RecordProviderInvocationTerminal(_ context.Context, record capability.ProviderInvocationTerminalRecord) error {
+	s.terminalEvents++
 	s.terminal = record
 	return s.terminalErr
 }
@@ -879,6 +882,109 @@ func (c publicationPipelineCapability) Execute(_ context.Context, request capabi
 		output = json.RawMessage(`{}`)
 	}
 	return capability.Result{Action: domain.ActionResult{RequestID: request.Action.ID, Status: "succeeded", Summary: "pipeline", Output: append(json.RawMessage(nil), output...)}, RawStdout: append([]byte(nil), c.stdout...)}, nil
+}
+
+type confidentialityFailureCapability struct {
+	calls  int
+	detail string
+}
+
+func (c *confidentialityFailureCapability) Manifest() capability.Manifest {
+	return capability.Manifest{Name: "review.failure", Version: "1", Risk: policy.Low, RetrySafe: false, Idempotent: true, OutputSchema: json.RawMessage(`{}`)}
+}
+func (*confidentialityFailureCapability) Validate(context.Context, capability.Request) error {
+	return nil
+}
+func (c *confidentialityFailureCapability) Execute(_ context.Context, request capability.Request) (capability.Result, error) {
+	c.calls++
+	message := "provider failure " + c.detail
+	return capability.Result{
+		Action: domain.ActionResult{
+			RequestID: request.Action.ID,
+			Status:    "failed",
+			Summary:   message,
+			Error:     &domain.StructuredError{Classification: "provider_error", Message: message, Retryable: false},
+		},
+		RawDiagnostic: []byte("provider diagnostic " + c.detail),
+	}, errors.New(message)
+}
+
+func TestProviderErrorConfidentialitySurvivesAdoptionAndPreparedRecovery(t *testing.T) {
+	const secret = "token=assignment-ten-synthetic"
+	provider := &confidentialityFailureCapability{detail: secret + " " + strings.Repeat("x", domain.SafeMessageMaxBytes)}
+	registry := capability.NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	store, artifacts := &capturedStore{}, &capturedArtifacts{}
+	request := capability.Request{
+		Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), Capability: "review.failure", Input: json.RawMessage(`{}`), IdempotencyKey: "confidentiality-review", StepAttempt: 1},
+		Policy: policy.Policy{AllowedCapabilities: []string{"review.failure"}},
+		Scope:  allowedScope{},
+	}
+	result, err := (Service{Registry: registry, Store: store, Artifacts: artifacts, ProgramID: domain.NewID()}).Execute(context.Background(), request)
+	if err == nil || result.Envelope == nil || result.Envelope.Error == nil || result.Action.Error == nil || !store.persisted {
+		t.Fatal("failed provider result did not reach the admitted failure path")
+	}
+	if result.Envelope.Error.Code != "provider_error" || result.Envelope.Error.Retryable || store.step.ErrorClassification != "provider_error" || store.terminal.Outcome != capability.ProviderInvocationFailed {
+		t.Fatal("failure classification or retryability changed")
+	}
+	envelopeJSON, marshalErr := result.Envelope.CanonicalJSON()
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	for name, value := range map[string]string{"returned error": err.Error(), "returned action error": result.Action.Error.Message, "adopted step": store.step.ErrorDetails} {
+		if strings.Contains(value, "assignment-ten-synthetic") || !strings.Contains(value, "<redacted>") {
+			t.Fatalf("%s crossed the operator-safe boundary", name)
+		}
+	}
+	if bytes.Contains(envelopeJSON, []byte("assignment-ten-synthetic")) {
+		t.Fatal("compiled envelope retained the synthetic sentinel")
+	}
+	if len(result.Envelope.Error.Message) > domain.SafeMessageMaxBytes || len(store.step.ErrorDetails) > domain.SafeMessageMaxBytes {
+		t.Fatal("post-redaction error message exceeded the safe bound")
+	}
+	for _, data := range artifacts.prepared {
+		if bytes.Contains(data, []byte("assignment-ten-synthetic")) {
+			t.Fatal("prepared evidence retained the synthetic sentinel")
+		}
+	}
+	for _, published := range artifacts.requests {
+		if bytes.Contains(published.Data, []byte("assignment-ten-synthetic")) {
+			t.Fatal("published evidence retained the synthetic sentinel")
+		}
+	}
+
+	compiled := artifacts.compiled
+	manifestKey, _ := domain.PreparedManifestKey(compiled.PreparedSetID)
+	manifestJSON := artifacts.prepared[manifestKey]
+	manifest, decodeErr := domain.DecodePreparedManifestV1(manifestJSON)
+	if decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	controlJSON := artifacts.prepared[manifest.Control.StorageKey]
+	contentBytes := int64(len(manifestJSON) + len(controlJSON))
+	for _, member := range manifest.Members {
+		contentBytes += member.ContentSizeBytes
+	}
+	manifestSize := int64(len(manifestJSON))
+	manifestDigest := artifact.DigestString(artifact.DigestBytes(manifestJSON))
+	memberCount := len(manifest.Members)
+	occurrence := manifest.ResultOccurrenceID
+	recoveryStore := &capturedStore{recoveryRecords: []domain.PreparedSetRecord{{ID: manifest.SetID, ManifestID: manifest.ManifestID, ProviderAttemptID: manifest.ProviderAttemptID, ProgramID: artifacts.req.ProgramID, TaskID: artifacts.req.Action.TaskID, WorkflowRunID: artifacts.req.Action.WorkflowRunID, StepRunID: artifacts.req.Action.StepRunID, ActionRequestID: artifacts.req.Action.ID, StepAttempt: artifacts.req.Action.StepAttempt, ArtifactStoreID: capturedPublisherIdentity.ArtifactStoreID, StoreIncarnationNonce: capturedPublisherIdentity.IncarnationNonce, State: domain.PreparedSealed, ReservedCapacityBytes: contentBytes, ResultOccurrenceID: &occurrence, ProviderTerminalEventID: &compiled.ProviderTerminalEventID, ManifestStorageKey: &manifestKey, ManifestSizeBytes: &manifestSize, ManifestSHA256: &manifestDigest, MemberCount: &memberCount, ContentSizeBytes: &contentBytes}}}
+	recoveryStore.recoveryStates = make([]domain.PublicationState, len(compiled.Artifacts))
+	for index := range recoveryStore.recoveryStates {
+		recoveryStore.recoveryStates[index] = domain.PublicationSealed
+	}
+	if recoveryErr := (Service{Store: recoveryStore, Artifacts: artifacts}).RecoverPreparedEvidence(context.Background(), 10); recoveryErr != nil {
+		t.Fatal(recoveryErr)
+	}
+	if provider.calls != 1 || store.terminalEvents != 1 || recoveryStore.terminalEvents != 0 || store.adoptCalls != 1 || recoveryStore.adoptCalls != 1 || recoveryStore.tool == nil || store.tool == nil || recoveryStore.tool.ID != store.tool.ID || recoveryStore.admission == nil || recoveryStore.admission.ProviderAttemptID != compiled.Envelope.ProviderAttemptID || recoveryStore.admission.PreparedSetID != compiled.PreparedSetID || recoveryStore.result.RequestID != compiled.Envelope.ActionRequestID {
+		t.Fatal("prepared recovery replayed the provider or replaced result identity")
+	}
+	if strings.Contains(recoveryStore.step.ErrorDetails, "assignment-ten-synthetic") || !strings.Contains(recoveryStore.step.ErrorDetails, "<redacted>") {
+		t.Fatal("prepared recovery reintroduced the synthetic sentinel")
+	}
 }
 
 type injectedProjectionLimit struct{ limit domain.ResultContractLimitV1 }

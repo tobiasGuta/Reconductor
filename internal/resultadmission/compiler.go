@@ -172,7 +172,13 @@ func Compile(request CompileRequest) (CompiledResult, error) {
 	if providerOutcome == "" {
 		providerOutcome = deriveProviderOutcome(request.Result)
 	}
-	status, errorValue := mapOutcome(providerOutcome, request.Result.Action.Error)
+	actionError := request.Result.Action.Error
+	if actionError != nil {
+		safe := *actionError
+		safe.Message = request.Redactor.Text(safe.Message)
+		actionError = &safe
+	}
+	status, errorValue := mapOutcome(providerOutcome, actionError)
 	if request.Result.OutputLimit != nil {
 		status = domain.ResultStatusFailed
 		errorValue = &domain.ResultErrorV1{Code: "result_contract_limit", Message: "provider output exceeded result byte authority", Retryable: false, Limit: request.Result.OutputLimit}
