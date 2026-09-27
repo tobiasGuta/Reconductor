@@ -26,6 +26,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tobiasGuta/Reconductor/internal/artifact"
+	"github.com/tobiasGuta/Reconductor/internal/canonicaljson"
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/providercheck"
@@ -143,6 +145,17 @@ type guardInvocationCounts struct {
 type fixtureRequestCounts struct {
 	Total  int64
 	Nuclei int64
+}
+
+type toolRunPersistenceEvidence struct {
+	ID                 domain.ID
+	SanitizedArguments json.RawMessage
+}
+
+type scheduledExecutionAuditEvidence struct {
+	ID        domain.ID
+	EventType string
+	Details   json.RawMessage
 }
 
 type lineageStepSnapshot struct {
@@ -1004,18 +1017,14 @@ func (h *harness) assertPreApproval(s scenario) {
 		h.t.Fatalf("%s probe-http status=%s", s.name, probe.Run.Status)
 	}
 	var probeOutput commandprovider.ProviderOutput
-	decodeJSON(h.t, probe.Run.Output, &probeOutput, "probe-http output")
+	decodeJSON(h.t, h.requireSemanticOutput(probe.Run.Output, "probe-http output"), &probeOutput, "probe-http semantic output")
 	if len(probeOutput.AuthorizedRecords) != 1 {
-		var sanitized json.RawMessage
-		if snapshot, err := h.store.ConsoleSnapshot(h.ctx, s.program.ID); err == nil {
-			for _, tool := range snapshot.Tools {
-				if tool.StepDefinitionID == "probe-http" {
-					sanitized = tool.SanitizedArguments
-					break
-				}
-			}
+		evidence, evidenceErr := h.loadToolRunPersistenceEvidence(s.program.ID, s.state.Run.ID, "probe-http")
+		evidenceSummary := sanitizedArgumentEvidenceSummary(evidence)
+		if evidenceErr != nil {
+			evidenceSummary = "unavailable: " + evidenceErr.Error()
 		}
-		h.t.Fatalf("%s HTTPX output=%#v fixture_requests=%#v sanitized_arguments=%s, want exactly one authorized record", s.name, probeOutput, h.fixture.Counts(), sanitized)
+		h.t.Fatalf("%s HTTPX output=%#v fixture_requests=%#v persisted_tool_evidence=%s, want exactly one authorized record", s.name, probeOutput, h.fixture.Counts(), evidenceSummary)
 	}
 	record := probeOutput.AuthorizedRecords[0]
 	if record.Target != target || record.StatusCode != http.StatusOK {
@@ -1037,7 +1046,7 @@ func (h *harness) assertPreApproval(s scenario) {
 		h.t.Fatalf("%s compare-assets structured current record=%#v, want URL target=%q status=200", s.name, compareRecord, target)
 	}
 	var compareOutput providers.CompareAssetsOutput
-	decodeJSON(h.t, compare.Run.Output, &compareOutput, "compare-assets output")
+	decodeJSON(h.t, h.requireSemanticOutput(compare.Run.Output, "compare-assets output"), &compareOutput, "compare-assets semantic output")
 	assertExactStrings(h.t, s.name+" active route", compareOutput.StatusRoutes.Active, []string{target})
 	assertExactStrings(h.t, s.name+" scan_targets", compareOutput.ScanTargets, []string{target})
 
@@ -1137,8 +1146,9 @@ func (h *harness) assertApprovedCompletion(s scenario) {
 	var input commandprovider.Input
 	decodeJSON(h.t, nuclei.Run.Input, &input, "approved Nuclei input")
 	assertExactStrings(h.t, "approved Nuclei targets", input.Targets, []string{h.fixture.URL()})
-	if !bytes.Contains(nuclei.Run.Output, []byte("reconductor-local-approval")) {
-		h.t.Fatalf("Nuclei output does not contain isolated template ID: %s", nuclei.Run.Output)
+	nucleiOutput := h.requireSemanticOutput(nuclei.Run.Output, "Nuclei output")
+	if !bytes.Contains(nucleiOutput, []byte("reconductor-local-approval")) {
+		h.t.Fatal("Nuclei semantic output does not contain isolated template ID")
 	}
 	h.assertGuardScanCount(1)
 	entries := h.guardEntries()
@@ -1161,20 +1171,30 @@ func (h *harness) assertApprovedCompletion(s scenario) {
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	assertConsoleProjectionPrivacy(h.t, snapshot)
 	foundTool := false
 	for _, tool := range snapshot.Tools {
 		if tool.WorkflowRunID != *execution.WorkflowRunID || tool.StepDefinitionID != "run-safe-nuclei-profile" {
 			continue
 		}
 		foundTool = true
-		var safe map[string]any
-		decodeJSON(h.t, tool.SanitizedArguments, &safe, "Nuclei sanitized arguments")
-		if safe["target_count"] != float64(1) {
-			h.t.Fatalf("Nuclei sanitized target_count=%v want=1", safe["target_count"])
-		}
 	}
 	if !foundTool {
-		h.t.Fatal("completed workflow has no persisted Nuclei tool run")
+		h.t.Fatal("completed workflow has no console-projected Nuclei tool run")
+	}
+	evidence, err := h.loadToolRunPersistenceEvidence(s.program.ID, *execution.WorkflowRunID, "run-safe-nuclei-profile")
+	if err != nil {
+		h.t.Fatalf("load persisted Nuclei tool evidence: %v", err)
+	}
+	if len(evidence) == 0 {
+		h.t.Fatal("completed workflow has no persisted Nuclei tool evidence")
+	}
+	for _, row := range evidence {
+		var safe map[string]any
+		decodeJSON(h.t, row.SanitizedArguments, &safe, "persisted Nuclei sanitized arguments")
+		if safe["target_count"] != float64(1) {
+			h.t.Fatalf("persisted Nuclei tool %s sanitized target_count=%v want=1", row.ID, safe["target_count"])
+		}
 	}
 }
 
@@ -1389,6 +1409,7 @@ func (h *harness) captureLineage(s scenario) lineageSnapshot {
 	if err != nil {
 		h.t.Fatalf("get %s console snapshot: %v", s.name, err)
 	}
+	assertConsoleProjectionPrivacy(h.t, console)
 	if diffs := stepStoreDiff(*execution.WorkflowRunID, state.Steps, console.Steps); len(diffs) != 0 {
 		h.t.Fatalf("%s PostgreSQL/file step state diverged:\n%s", s.name, strings.Join(diffs, "\n"))
 	}
@@ -1409,7 +1430,11 @@ func (h *harness) captureLineage(s scenario) lineageSnapshot {
 			toolCounts[tool.StepDefinitionID]++
 		}
 	}
-	claimAudits, resumeAudits, err := scheduledExecutionAuditCounts(execution.ID, console.AuditEvents)
+	auditEvidence, err := h.loadScheduledExecutionAuditEvidence(s.program.ID)
+	if err != nil {
+		h.t.Fatalf("load %s scheduled-execution audit evidence: %v", s.name, err)
+	}
+	claimAudits, resumeAudits, err := scheduledExecutionAuditCounts(execution.ID, auditEvidence)
 	if err != nil {
 		h.t.Fatalf("count %s scheduled-execution audits: %v", s.name, err)
 	}
@@ -1447,7 +1472,112 @@ func (h *harness) captureLineage(s scenario) lineageSnapshot {
 	}
 }
 
-func scheduledExecutionAuditCounts(executionID domain.ID, events []database.ConsoleAuditEvent) (int, int, error) {
+func (h *harness) loadToolRunPersistenceEvidence(programID, runID domain.ID, stepDefinitionID string) ([]toolRunPersistenceEvidence, error) {
+	rows, err := h.store.Pool.Query(h.ctx, `SELECT tr.id,tr.sanitized_arguments
+		FROM tool_runs tr
+		JOIN step_runs sr ON sr.id=tr.step_run_id
+		JOIN workflow_runs wr ON wr.id=sr.workflow_run_id
+		JOIN tasks t ON t.id=wr.task_id
+		WHERE t.program_id=$1 AND sr.workflow_run_id=$2 AND sr.step_definition_id=$3
+		ORDER BY tr.started_at,tr.id`, programID, runID, stepDefinitionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var evidence []toolRunPersistenceEvidence
+	for rows.Next() {
+		var item toolRunPersistenceEvidence
+		if err := rows.Scan(&item.ID, &item.SanitizedArguments); err != nil {
+			return nil, err
+		}
+		evidence = append(evidence, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return evidence, nil
+}
+
+func sanitizedArgumentEvidenceSummary(evidence []toolRunPersistenceEvidence) string {
+	if len(evidence) == 0 {
+		return "none"
+	}
+	summaries := make([]string, 0, len(evidence))
+	for _, item := range evidence {
+		var safe struct {
+			TargetCount any `json:"target_count"`
+		}
+		if err := json.Unmarshal(item.SanitizedArguments, &safe); err != nil {
+			summaries = append(summaries, fmt.Sprintf("%s invalid_json", item.ID))
+			continue
+		}
+		summaries = append(summaries, fmt.Sprintf("%s target_count=%v", item.ID, safe.TargetCount))
+	}
+	return strings.Join(summaries, ", ")
+}
+
+func (h *harness) loadScheduledExecutionAuditEvidence(programID domain.ID) ([]scheduledExecutionAuditEvidence, error) {
+	rows, err := h.store.Pool.Query(h.ctx, `SELECT ae.id,ae.event_type,ae.details
+		FROM audit_events ae
+		WHERE (ae.program_id=$1 OR EXISTS (SELECT 1 FROM tasks t WHERE t.id=ae.task_id AND t.program_id=$1))
+		  AND ae.event_type IN ('scheduled_execution_claimed','scheduled_execution_resume_requested')
+		ORDER BY ae.occurred_at,ae.id`, programID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var evidence []scheduledExecutionAuditEvidence
+	for rows.Next() {
+		var item scheduledExecutionAuditEvidence
+		if err := rows.Scan(&item.ID, &item.EventType, &item.Details); err != nil {
+			return nil, err
+		}
+		evidence = append(evidence, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return evidence, nil
+}
+
+func assertConsoleProjectionPrivacy(t testing.TB, snapshot database.ConsoleSnapshot) {
+	t.Helper()
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal console projection: %v", err)
+	}
+	prohibited, err := prohibitedConsoleProjectionFields(encoded)
+	if err != nil {
+		t.Fatalf("inspect console projection privacy: %v", err)
+	}
+	if len(prohibited) != 0 {
+		t.Fatalf("console projection exposed prohibited persistence fields: %s", strings.Join(prohibited, ", "))
+	}
+}
+
+func prohibitedConsoleProjectionFields(encoded []byte) ([]string, error) {
+	var shape struct {
+		ToolRuns    []map[string]json.RawMessage `json:"tool_runs"`
+		AuditEvents []map[string]json.RawMessage `json:"audit_events"`
+	}
+	if err := json.Unmarshal(encoded, &shape); err != nil {
+		return nil, err
+	}
+	var prohibited []string
+	for index, item := range shape.ToolRuns {
+		if _, present := item["sanitized_arguments"]; present {
+			prohibited = append(prohibited, fmt.Sprintf("tool_runs[%d].sanitized_arguments", index))
+		}
+	}
+	for index, item := range shape.AuditEvents {
+		if _, present := item["details"]; present {
+			prohibited = append(prohibited, fmt.Sprintf("audit_events[%d].details", index))
+		}
+	}
+	return prohibited, nil
+}
+
+func scheduledExecutionAuditCounts(executionID domain.ID, events []scheduledExecutionAuditEvidence) (int, int, error) {
 	claimAudits, resumeAudits := 0, 0
 	for _, event := range events {
 		if event.EventType != "scheduled_execution_claimed" && event.EventType != "scheduled_execution_resume_requested" {
@@ -1965,6 +2095,57 @@ func requiredStep(t *testing.T, state *workflow.State, id string) *workflow.Step
 		t.Fatalf("workflow state has no step %q", id)
 	}
 	return step
+}
+
+func (h *harness) requireSemanticOutput(raw []byte, name string) json.RawMessage {
+	h.t.Helper()
+	_, canonical, _, _, err := canonicaljson.ParseStrict(raw)
+	if err != nil {
+		h.t.Fatalf("canonicalize %s persisted result envelope: %v", name, err)
+	}
+	envelope, err := domain.DecodeResultEnvelopeV1(canonical)
+	if err != nil {
+		h.t.Fatalf("decode %s result envelope: %v", name, err)
+	}
+	if envelope.Status != domain.ResultStatusSucceeded || envelope.ProviderOutcome != domain.ResultProviderSucceeded {
+		h.t.Fatalf("%s result envelope status=%s provider_outcome=%s, want succeeded", name, envelope.Status, envelope.ProviderOutcome)
+	}
+	switch envelope.SemanticOutput.Mode {
+	case domain.SemanticModeInlineJSON:
+		return append(json.RawMessage(nil), envelope.SemanticOutput.InlineJSON...)
+	case domain.SemanticModeArtifactJSON:
+		var semanticReference *domain.ResultArtifactRefV1
+		for index := range envelope.Artifacts {
+			reference := &envelope.Artifacts[index]
+			if reference.Role == domain.ArtifactRoleSemanticResult && reference.ArtifactID == envelope.SemanticOutput.ArtifactID {
+				semanticReference = reference
+				break
+			}
+		}
+		if semanticReference == nil {
+			h.t.Fatalf("%s result envelope has no semantic artifact reference", name)
+		}
+		if semanticReference.ContentSHA256 != envelope.SemanticOutput.ContentSHA256 || semanticReference.ContentSizeBytes != envelope.SemanticOutput.ContentSizeBytes {
+			h.t.Fatalf("%s semantic artifact metadata does not match the result envelope", name)
+		}
+		localStore, err := artifact.OpenLocal(h.ctx, filepath.Join(h.root, "artifacts"), h.artifactID, h.store, nil)
+		if err != nil {
+			h.t.Fatalf("open %s semantic artifact store: %v", name, err)
+		}
+		reader, err := localStore.OpenVerified(h.ctx, *semanticReference)
+		if err != nil {
+			h.t.Fatalf("open %s verified semantic artifact: %v", name, err)
+		}
+		semantic, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			h.t.Fatalf("read %s verified semantic artifact: %v", name, err)
+		}
+		return json.RawMessage(semantic)
+	default:
+		h.t.Fatalf("%s result envelope semantic mode=%s, want inline_json or artifact_json", name, envelope.SemanticOutput.Mode)
+		return nil
+	}
 }
 
 func decodeJSON(t *testing.T, raw []byte, target any, name string) {

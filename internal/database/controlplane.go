@@ -112,17 +112,16 @@ type ConsoleStep struct {
 }
 
 type ConsoleToolRun struct {
-	ID                 domain.ID       `json:"id"`
-	WorkflowRunID      domain.ID       `json:"workflow_run_id"`
-	StepDefinitionID   string          `json:"step_definition_id"`
-	Provider           string          `json:"provider"`
-	ToolVersion        string          `json:"tool_version"`
-	SanitizedArguments json.RawMessage `json:"sanitized_arguments"`
-	StartedAt          time.Time       `json:"started_at"`
-	CompletedAt        *time.Time      `json:"completed_at,omitempty"`
-	ExitCode           *int            `json:"exit_code,omitempty"`
-	TimedOut           bool            `json:"timed_out"`
-	ArtifactCount      int             `json:"artifact_count"`
+	ID               domain.ID  `json:"id"`
+	WorkflowRunID    domain.ID  `json:"workflow_run_id"`
+	StepDefinitionID string     `json:"step_definition_id"`
+	Provider         string     `json:"provider"`
+	ToolVersion      string     `json:"tool_version"`
+	StartedAt        time.Time  `json:"started_at"`
+	CompletedAt      *time.Time `json:"completed_at,omitempty"`
+	ExitCode         *int       `json:"exit_code,omitempty"`
+	TimedOut         bool       `json:"timed_out"`
+	ArtifactCount    int        `json:"artifact_count"`
 }
 
 type ConsoleAsset struct {
@@ -202,16 +201,15 @@ type ConsoleChangeItem struct {
 }
 
 type ConsoleAuditEvent struct {
-	ID            domain.ID       `json:"id"`
-	OccurredAt    time.Time       `json:"occurred_at"`
-	EventType     string          `json:"event_type"`
-	Component     string          `json:"component"`
-	Actor         string          `json:"actor"`
-	WorkflowRunID *domain.ID      `json:"workflow_run_id,omitempty"`
-	Capability    *string         `json:"capability,omitempty"`
-	Provider      *string         `json:"provider,omitempty"`
-	SafeMessage   string          `json:"safe_message"`
-	Details       json.RawMessage `json:"details"`
+	ID            domain.ID  `json:"id"`
+	OccurredAt    time.Time  `json:"occurred_at"`
+	EventType     string     `json:"event_type"`
+	Component     string     `json:"component"`
+	Actor         string     `json:"actor"`
+	WorkflowRunID *domain.ID `json:"workflow_run_id,omitempty"`
+	Capability    *string    `json:"capability,omitempty"`
+	Provider      *string    `json:"provider,omitempty"`
+	SafeMessage   string     `json:"safe_message"`
 }
 
 func (s *Store) ConsoleSnapshot(ctx context.Context, requestedProgramID domain.ID) (ConsoleSnapshot, error) {
@@ -404,14 +402,14 @@ func (s *Store) loadConsoleSteps(ctx context.Context, programID domain.ID, out *
 }
 
 func (s *Store) loadConsoleTools(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {
-	rows, err := s.Pool.Query(ctx, `SELECT tr.id,sr.workflow_run_id,sr.step_definition_id,tr.provider,tr.tool_version,tr.sanitized_arguments,tr.started_at,tr.completed_at,tr.exit_code,tr.timed_out,(SELECT count(*) FROM artifacts a WHERE a.tool_run_id=tr.id AND a.sensitive=false AND (a.expires_at IS NULL OR a.expires_at>now())) FROM tool_runs tr JOIN step_runs sr ON sr.id=tr.step_run_id JOIN workflow_runs wr ON wr.id=sr.workflow_run_id JOIN tasks t ON t.id=wr.task_id WHERE t.program_id=$1 ORDER BY tr.started_at DESC LIMIT 120`, programID)
+	rows, err := s.Pool.Query(ctx, `SELECT tr.id,sr.workflow_run_id,sr.step_definition_id,tr.provider,tr.tool_version,tr.started_at,tr.completed_at,tr.exit_code,tr.timed_out,(SELECT count(*) FROM artifacts a WHERE a.tool_run_id=tr.id AND a.sensitive=false AND (a.expires_at IS NULL OR a.expires_at>now())) FROM tool_runs tr JOIN step_runs sr ON sr.id=tr.step_run_id JOIN workflow_runs wr ON wr.id=sr.workflow_run_id JOIN tasks t ON t.id=wr.task_id WHERE t.program_id=$1 ORDER BY tr.started_at DESC LIMIT 120`, programID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var item ConsoleToolRun
-		if err := rows.Scan(&item.ID, &item.WorkflowRunID, &item.StepDefinitionID, &item.Provider, &item.ToolVersion, &item.SanitizedArguments, &item.StartedAt, &item.CompletedAt, &item.ExitCode, &item.TimedOut, &item.ArtifactCount); err != nil {
+		if err := rows.Scan(&item.ID, &item.WorkflowRunID, &item.StepDefinitionID, &item.Provider, &item.ToolVersion, &item.StartedAt, &item.CompletedAt, &item.ExitCode, &item.TimedOut, &item.ArtifactCount); err != nil {
 			return err
 		}
 		out.Tools = append(out.Tools, item)
@@ -504,14 +502,14 @@ func (s *Store) loadConsoleApprovals(ctx context.Context, programID domain.ID, o
 }
 
 func (s *Store) loadConsoleAudit(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {
-	rows, err := s.Pool.Query(ctx, `SELECT ae.id,ae.occurred_at,ae.event_type,ae.component,ae.actor,ae.workflow_run_id,ae.capability,ae.provider,ae.safe_message,ae.details FROM audit_events ae WHERE ae.program_id=$1 OR EXISTS (SELECT 1 FROM tasks t WHERE t.id=ae.task_id AND t.program_id=$1) ORDER BY ae.occurred_at DESC LIMIT 160`, programID)
+	rows, err := s.Pool.Query(ctx, `SELECT ae.id,ae.occurred_at,ae.event_type,ae.component,ae.actor,ae.workflow_run_id,ae.capability,ae.provider,ae.safe_message FROM audit_events ae WHERE ae.program_id=$1 OR EXISTS (SELECT 1 FROM tasks t WHERE t.id=ae.task_id AND t.program_id=$1) ORDER BY ae.occurred_at DESC LIMIT 160`, programID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var item ConsoleAuditEvent
-		if err := rows.Scan(&item.ID, &item.OccurredAt, &item.EventType, &item.Component, &item.Actor, &item.WorkflowRunID, &item.Capability, &item.Provider, &item.SafeMessage, &item.Details); err != nil {
+		if err := rows.Scan(&item.ID, &item.OccurredAt, &item.EventType, &item.Component, &item.Actor, &item.WorkflowRunID, &item.Capability, &item.Provider, &item.SafeMessage); err != nil {
 			return err
 		}
 		out.AuditEvents = append(out.AuditEvents, item)
