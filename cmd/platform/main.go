@@ -831,11 +831,14 @@ func watchTaskControlsInterval(ctx context.Context, store taskReader, taskID dom
 
 func runCommand(ctx context.Context, cfg config.Config, args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("run show|retry <run-id>")
+		return fmt.Errorf("run show|retry|evidence <run-id> [artifact-id]")
 	}
 	if args[0] == "retry" {
 		forward := append([]string{"--resume", args[1]}, args[2:]...)
 		return workflowRun(ctx, cfg, providers.Registry(cfg), forward)
+	}
+	if args[0] == "evidence" {
+		return runEvidenceCommand(ctx, cfg, args[1:])
 	}
 	s, err := readyStore(ctx, cfg)
 	if err != nil {

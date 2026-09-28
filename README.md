@@ -310,6 +310,15 @@ docker compose run --rm --entrypoint /usr/local/bin/platform worker run show <wo
 docker compose run --rm -e SCOPE_ROOT=/workspace -v "${PWD}\scope:/workspace/scope:ro" -v "${PWD}\state:/state" --entrypoint /usr/local/bin/platform worker run retry <workflow-run-id> --program-id $program.id --scope $scopePath --approve-moderate
 ```
 
+List and view adopted evidence for that run:
+
+```powershell
+docker compose run --rm --entrypoint /usr/local/bin/platform worker run evidence <workflow-run-id>
+docker compose run --rm --entrypoint /usr/local/bin/platform worker run evidence <workflow-run-id> <artifact-id>
+```
+
+The evidence commands are read-only and use the configured, already initialized artifact store. They exclude sensitive or unredacted artifacts and verify the complete selected object before showing terminal-safe, bounded content.
+
 Inspect queue state and generated change reports:
 
 ```powershell
@@ -388,6 +397,8 @@ platform program create|list
 platform task create|list|show|pause|resume|cancel
 platform scope plan|update
 platform workflow validate|plan|run
+platform run evidence <workflow-run-id>
+platform run evidence <workflow-run-id> <artifact-id>
 platform run show|retry
 platform approvals list|approve|reject
 platform queue pending|failed|retry

@@ -8,6 +8,23 @@ Command-provider `stdout.jsonl` and `stderr.txt` are stored as `raw-provider-out
 
 Provider evidence is staged in a durable prepared-evidence set before publication. The persisted StepRun output is a versioned result envelope: bounded semantic JSON can remain inline, while a larger semantic result is referenced by exact artifact ID, store, key, digest, size, and output-schema digest. Downstream workflow bindings authorize that adopted artifact and stream only their selected value. Workflow-facing projections may omit redundant bulk fields, such as Katana response bodies, while complete redacted stdout and normalized provider records remain in evidence artifacts.
 
+## Read-only run evidence viewing
+
+Use the run-scoped viewer with the same local operator database access and configured, already initialized artifact store required by other runtime commands:
+
+```text
+platform run evidence <workflow-run-id>
+platform run evidence <workflow-run-id> <artifact-id>
+```
+
+The operator journey is: find the run, list its eligible evidence, select an artifact ID, view the verified content, and then decide whether separate manual validation is warranted. These commands are read-only: they do not initialize or register stores, invoke providers, enqueue work, or change workflow, publication, audit, recovery, or artifact state. They are not a general artifact browser or export API.
+
+The list is derived from authoritative run lineage and includes only artifacts that satisfy the existing adopted-publication, exact-store, role, retention, redaction, and access checks. Sensitive evidence is excluded; unknown runs and cross-run artifact IDs return the same safe unavailable outcome rather than enabling enumeration. Storage keys and filesystem paths are never displayed.
+
+For a selected artifact, the service reads through the pinned local store and verifies the complete recorded object, including EOF and close-time integrity checks, before any evidence content is written. Terminal content is escaped and line-prefixed, with a 65,536-byte display limit applied after expansion. A shortened terminal display still identifies the underlying artifact as completely read and verified; it does not mean the evidence itself was truncated. Missing evidence is unavailable, while corrupt or unverifiable evidence reports verification failure without releasing content.
+
+The viewer presents recorded observations, not vulnerability verdicts. In particular, current HTTPX evidence contains the configured normalized/provider observations and does not promise a complete raw HTTP wire request and response capture.
+
 Normal logs and notifications must never contain credentials, authorization headers, cookies, JWTs, API keys, webhook URLs, password fields, or user-configured secret names. Notifications should use internal candidate/finding IDs and safe summaries, not credential-bearing curl commands.
 
 ## Tombstone state and evidence preservation
