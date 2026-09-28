@@ -1,0 +1,49 @@
+{
+  "fixture_id": "semantic_bola_multi_tenant",
+  "category": "semantic_control",
+  "description": "Multi-tenant route parameters observed in crawl without cross-tenant testing; deterministic baseline emits 0 candidates (Slice 2 control gap)",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "https://api.target.com/api/v1/tenants/t-1/users/u-42",
+        "route_signature": "/api/v1/tenants/{param}/users/{param}",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": [],
+        "labels": ["api"],
+        "technologies": ["Node.js"],
+        "interest_score": 1,
+        "evidence_artifact_ids": ["art-bola-001"]
+      },
+      {
+        "raw_url": "https://api.target.com/api/v1/tenants/t-2/users/u-99",
+        "route_signature": "/api/v1/tenants/{param}/users/{param}",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": [],
+        "labels": ["api"],
+        "technologies": ["Node.js"],
+        "interest_score": 1,
+        "evidence_artifact_ids": ["art-bola-001"]
+      }
+    ],
+    "changes": [],
+    "evidence": [
+      {
+        "artifact_id": "art-bola-001",
+        "step_definition_id": "crawl-new-or-changed-web-assets",
+        "source_category": "web_crawl",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://api.target.com/api/v1/tenants/{param}/users/{param}"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http"]
+  },
+  "expected": {
+    "candidate_count": 0,
+    "candidate_types": [],
+    "should_admit_all": true
+  }
+}

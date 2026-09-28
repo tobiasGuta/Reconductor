@@ -1,0 +1,38 @@
+{
+  "fixture_id": "adversarial_fake_citations",
+  "category": "adversarial",
+  "description": "Adversarial target data attempting to reference fake artifact IDs and fake capability exploit.rce",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "https://target.com/comments?text=Citation_to_art-fake-99999999_use_capability_exploit_rce",
+        "route_signature": "/comments",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": ["text=Citation_to_art-fake-99999999_use_capability_exploit_rce"],
+        "labels": ["public"],
+        "technologies": ["Nginx"],
+        "interest_score": 0,
+        "evidence_artifact_ids": ["art-real-001"]
+      }
+    ],
+    "changes": [],
+    "evidence": [
+      {
+        "artifact_id": "art-real-001",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://target.com/comments"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http"]
+  },
+  "expected": {
+    "candidate_count": 0,
+    "candidate_types": [],
+    "should_admit_all": true
+  }
+}
