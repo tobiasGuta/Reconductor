@@ -114,7 +114,7 @@ func httpxInvocation(i commandprovider.Input, p policy.Policy, c config.Recon) (
 	if len(i.Targets) == 0 {
 		return commandprovider.Invocation{}, fmt.Errorf("targets are required")
 	}
-	args := []string{"-silent", "-json", "-status-code", "-content-type", "-location", "-tech-detect", "-threads", fmt.Sprint(bounded(c.Concurrency, p.Concurrency))}
+	args := []string{"-silent", "-json", "-nfs", "-status-code", "-content-type", "-location", "-tech-detect", "-threads", fmt.Sprint(bounded(c.Concurrency, p.Concurrency))}
 	if method := strings.ToUpper(strings.TrimSpace(i.Method)); method != "" {
 		args = append(args, "-x", method)
 	}

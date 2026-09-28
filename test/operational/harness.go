@@ -143,8 +143,10 @@ type guardInvocationCounts struct {
 }
 
 type fixtureRequestCounts struct {
-	Total  int64
-	Nuclei int64
+	Total            int64
+	Nuclei           int64
+	PlainConnections int64
+	TLSConnections   int64
 }
 
 type toolRunPersistenceEvidence struct {
@@ -1016,6 +1018,11 @@ func (h *harness) assertPreApproval(s scenario) {
 	if probe.Run.Status != domain.StepSucceeded {
 		h.t.Fatalf("%s probe-http status=%s", s.name, probe.Run.Status)
 	}
+	counts := h.fixture.Counts()
+	if counts.PlainConnections < 1 || counts.TLSConnections != 0 {
+		h.t.Fatalf("%s HTTPX wire protocols=%#v, want HTTP traffic and no TLS ClientHello", s.name, counts)
+	}
+	h.t.Logf("%s HTTPX wire: requests=%d plain_connections=%d tls_connections=%d", s.name, counts.Total, counts.PlainConnections, counts.TLSConnections)
 	var probeOutput commandprovider.ProviderOutput
 	decodeJSON(h.t, h.requireSemanticOutput(probe.Run.Output, "probe-http output"), &probeOutput, "probe-http semantic output")
 	if len(probeOutput.AuthorizedRecords) != 1 {
@@ -1839,14 +1846,16 @@ func (h *harness) runExternalInDir(ctx context.Context, directory, executable st
 }
 
 type localFixture struct {
-	listener       net.Listener
-	server         *http.Server
-	url            string
-	runID          string
-	totalRequests  atomic.Int64
-	nucleiRequests atomic.Int64
-	mu             sync.Mutex
-	violation      string
+	listener         net.Listener
+	server           *http.Server
+	url              string
+	runID            string
+	totalRequests    atomic.Int64
+	nucleiRequests   atomic.Int64
+	plainConnections atomic.Int64
+	tlsConnections   atomic.Int64
+	mu               sync.Mutex
+	violation        string
 }
 
 func startLocalFixture(t *testing.T, runID string) *localFixture {
@@ -1855,7 +1864,9 @@ func startLocalFixture(t *testing.T, runID string) *localFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := &localFixture{listener: listener, runID: runID}
+	fixture := &localFixture{runID: runID}
+	recordingListener := &fixtureProtocolListener{Listener: listener, fixture: fixture}
+	fixture.listener = recordingListener
 	fixture.url = "http://" + listener.Addr().String() + "/"
 	fixture.server = &http.Server{
 		ReadHeaderTimeout: 2 * time.Second,
@@ -1883,7 +1894,7 @@ func startLocalFixture(t *testing.T, runID string) *localFixture {
 		}),
 	}
 	go func() {
-		_ = fixture.server.Serve(listener)
+		_ = fixture.server.Serve(recordingListener)
 	}()
 	return fixture
 }
@@ -1892,9 +1903,44 @@ func (f *localFixture) URL() string { return f.url }
 
 func (f *localFixture) Counts() fixtureRequestCounts {
 	return fixtureRequestCounts{
-		Total:  f.totalRequests.Load(),
-		Nuclei: f.nucleiRequests.Load(),
+		Total:            f.totalRequests.Load(),
+		Nuclei:           f.nucleiRequests.Load(),
+		PlainConnections: f.plainConnections.Load(),
+		TLSConnections:   f.tlsConnections.Load(),
 	}
+}
+
+type fixtureProtocolListener struct {
+	net.Listener
+	fixture *localFixture
+}
+
+func (l *fixtureProtocolListener) Accept() (net.Conn, error) {
+	connection, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &fixtureProtocolConnection{Conn: connection, fixture: l.fixture}, nil
+}
+
+type fixtureProtocolConnection struct {
+	net.Conn
+	fixture *localFixture
+	once    sync.Once
+}
+
+func (c *fixtureProtocolConnection) Read(buffer []byte) (int, error) {
+	read, err := c.Conn.Read(buffer)
+	if read > 0 {
+		c.once.Do(func() {
+			if buffer[0] == 0x16 {
+				c.fixture.tlsConnections.Add(1)
+				return
+			}
+			c.fixture.plainConnections.Add(1)
+		})
+	}
+	return read, err
 }
 
 func (f *localFixture) Violation() string {
