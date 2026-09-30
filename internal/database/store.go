@@ -58,6 +58,10 @@ func (s *Store) CreateProgram(ctx context.Context, p domain.Program, snapshot do
 	if _, err = tx.Exec(ctx, `INSERT INTO programs(id,name,platform,description,scope_reference,policy_reference,scope_digest,include_rule_digests,exclude_rule_digests,target_plan_digest,scope_plan_warnings,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, p.ID, p.Name, p.Platform, p.Description, p.ScopeReference, p.PolicyReference, p.ScopeDigest, p.IncludeRuleDigests, p.ExcludeRuleDigests, p.TargetPlanDigest, p.ScopePlanWarnings, p.CreatedAt, p.UpdatedAt); err != nil {
 		return err
 	}
+	if _, err = tx.Exec(ctx, `INSERT INTO program_launch_authority(program_id,status,authority_epoch,updated_by,reason)
+		VALUES($1,'BLOCKED',0,'program-creator','launch material has not been published')`, p.ID); err != nil {
+		return err
+	}
 	if snapshot.ID == "" {
 		snapshot.ID = domain.NewID()
 	}
@@ -212,6 +216,17 @@ func (s *Store) CheckAndRecordScopeSnapshot(ctx context.Context, snapshot domain
 	if change.Acknowledged {
 		_, err = tx.Exec(ctx, `UPDATE programs SET scope_reference=$2,scope_digest=$3,include_rule_digests=$4,exclude_rule_digests=$5,target_plan_digest=$6,scope_plan_warnings=$7,updated_at=now() WHERE id=$1`, snapshot.ProgramID, snapshot.ScopeReference, snapshot.ScopeDigest, snapshot.IncludeRuleDigests, snapshot.ExcludeRuleDigests, snapshot.TargetPlanDigest, snapshot.PlanningWarnings)
 		if err != nil {
+			return change, err
+		}
+	} else {
+		// A pending expansion may also contain a tighter exclusion. The
+		// program row stays on its acknowledged scope, so explicitly block
+		// exact launch in the same snapshot transaction.
+		var lockedProgramID domain.ID
+		if err := tx.QueryRow(ctx, `SELECT id FROM programs WHERE id=$1 FOR UPDATE`, snapshot.ProgramID).Scan(&lockedProgramID); err != nil {
+			return change, err
+		}
+		if err := invalidateLaunchAuthorityTx(ctx, tx, snapshot.ProgramID, actor, "scope change awaits acknowledgement"); err != nil {
 			return change, err
 		}
 	}
@@ -582,7 +597,7 @@ type ApprovalListItem struct {
 }
 
 func (s *Store) ListApprovals(ctx context.Context) ([]ApprovalListItem, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id,request_id,task_id,action_request_id,requested_risk_level,reason,requested_at,decision,decided_by,decided_at,expires_at FROM approvals ORDER BY requested_at DESC`)
+	rows, err := s.Pool.Query(ctx, `SELECT id,request_id,task_id,action_request_id,requested_risk_level,reason,requested_at,decision,decided_by,decided_at,expires_at FROM approvals WHERE approval_kind='workflow_step' ORDER BY requested_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -688,7 +703,7 @@ func decideApprovalTx(ctx context.Context, tx pgx.Tx, id domain.ID, decision, ac
 		JOIN step_runs sr ON sr.id=a.request_id
 		JOIN workflow_runs wr ON wr.id=sr.workflow_run_id
 		JOIN tasks t ON t.id=wr.task_id
-		WHERE a.id=$1`, id).Scan(&stepID, &workflowRunID, &taskID, &programID); err != nil {
+		WHERE a.id=$1 AND a.approval_kind='workflow_step'`, id).Scan(&stepID, &workflowRunID, &taskID, &programID); err != nil {
 		return err
 	}
 	var scheduledExecution domain.ScheduledExecution
@@ -704,10 +719,11 @@ func decideApprovalTx(ctx context.Context, tx pgx.Tx, id domain.ID, decision, ac
 			return err
 		}
 	}
-	tag, err := tx.Exec(ctx, `UPDATE approvals SET decision=$2,decided_by=$3,decided_at=now() WHERE id=$1 AND decision='pending'`, id, decision, actor)
+	tag, err := tx.Exec(ctx, `UPDATE approvals SET decision=$2,decided_by=$3,decided_at=now()
+		WHERE id=$1 AND approval_kind='workflow_step' AND decision='pending'`, id, decision, actor)
 	if err == nil && tag.RowsAffected() == 0 {
 		var existing string
-		if err := tx.QueryRow(ctx, `SELECT decision FROM approvals WHERE id=$1`, id).Scan(&existing); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT decision FROM approvals WHERE id=$1 AND approval_kind='workflow_step'`, id).Scan(&existing); err != nil {
 			return err
 		}
 		if decision != "rejected" || existing != decision {
@@ -786,12 +802,12 @@ func decideApprovalTx(ctx context.Context, tx pgx.Tx, id domain.ID, decision, ac
 }
 func (s *Store) StepApproved(ctx context.Context, stepID domain.ID) (bool, error) {
 	var approved bool
-	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM approvals WHERE request_id=$1 AND decision='approved' AND (expires_at IS NULL OR expires_at>now()))`, stepID).Scan(&approved)
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM approvals WHERE request_id=$1 AND approval_kind='workflow_step' AND decision='approved' AND (expires_at IS NULL OR expires_at>now()))`, stepID).Scan(&approved)
 	return approved, err
 }
 func (s *Store) StepApprovalDecision(ctx context.Context, stepID domain.ID) (string, error) {
 	var decision string
-	err := s.Pool.QueryRow(ctx, `SELECT decision FROM approvals WHERE request_id=$1`, stepID).Scan(&decision)
+	err := s.Pool.QueryRow(ctx, `SELECT decision FROM approvals WHERE request_id=$1 AND approval_kind='workflow_step'`, stepID).Scan(&decision)
 	return decision, err
 }
 
@@ -1870,9 +1886,13 @@ func (s *Store) saveWorkflowState(ctx context.Context, state *workflow.State, li
 				decidedBy = "workflow-operator"
 				decidedAt = time.Now().UTC()
 			}
-			_, err = tx.Exec(ctx, `INSERT INTO approvals(id,request_id,task_id,action_request_id,requested_risk_level,reason,decision,decided_by,decided_at) VALUES($1,$2,$3,$2,'moderate',$4,$5,$6,$7) ON CONFLICT(request_id) DO UPDATE SET decision=CASE WHEN approvals.decision IN ('approved','rejected') THEN approvals.decision ELSE EXCLUDED.decision END,decided_by=COALESCE(approvals.decided_by,EXCLUDED.decided_by),decided_at=COALESCE(approvals.decided_at,EXCLUDED.decided_at)`, domain.NewID(), x.ID, state.Run.TaskID, "workflow step "+x.StepDefinitionID, decision, decidedBy, decidedAt)
+			tag, approvalErr := tx.Exec(ctx, `INSERT INTO approvals(id,request_id,task_id,action_request_id,requested_risk_level,reason,decision,decided_by,decided_at) VALUES($1,$2,$3,$2,'moderate',$4,$5,$6,$7) ON CONFLICT(request_id) DO UPDATE SET decision=CASE WHEN approvals.decision IN ('approved','rejected') THEN approvals.decision ELSE EXCLUDED.decision END,decided_by=COALESCE(approvals.decided_by,EXCLUDED.decided_by),decided_at=COALESCE(approvals.decided_at,EXCLUDED.decided_at) WHERE approvals.approval_kind='workflow_step'`, domain.NewID(), x.ID, state.Run.TaskID, "workflow step "+x.StepDefinitionID, decision, decidedBy, decidedAt)
+			err = approvalErr
 			if err != nil {
 				return err
+			}
+			if tag.RowsAffected() != 1 {
+				return fmt.Errorf("workflow approval conflicts with exact approval")
 			}
 			if x.ApprovalState == "pending" {
 				_, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,capability,safe_message,details) SELECT $1,'moderate_approval_requested','workflow','workflow',$2,t.program_id,$3,$4,$5,'moderate approval requested',$6 FROM tasks t WHERE t.id=$2`, domain.NewID(), state.Run.TaskID, state.Run.ID, x.ID, x.Capability, mustJSON(map[string]string{"step": x.StepDefinitionID}))

@@ -52,7 +52,7 @@ func (s *Store) ReconcileDeferredApprovalRejections(ctx context.Context, limit i
 	}
 	rows, err := s.Pool.Query(ctx, `SELECT a.id,COALESCE(a.decided_by,'workflow-operator') FROM approvals a
 		JOIN step_runs sr ON sr.id=a.request_id JOIN workflow_runs wr ON wr.id=sr.workflow_run_id
-		WHERE a.decision='rejected' AND sr.status='awaiting_approval' AND wr.status IN ('running','paused')
+		WHERE COALESCE(to_jsonb(a)->>'approval_kind','workflow_step')='workflow_step' AND a.decision='rejected' AND sr.status='awaiting_approval' AND wr.status IN ('running','paused')
 		AND NOT EXISTS(SELECT 1 FROM prepared_evidence_sets p JOIN step_runs sibling ON sibling.id=p.step_run_id
 		 WHERE sibling.workflow_run_id=wr.id AND p.step_attempt=sibling.attempt_count AND p.lifecycle_state IN ('ALLOCATED','SEALED','QUARANTINED'))
 		ORDER BY a.id LIMIT $1`, limit)

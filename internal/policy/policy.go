@@ -144,6 +144,51 @@ func withinScanWindows(windows []string, at time.Time) (bool, string) {
 	return false, "current UTC time is outside configured scan windows"
 }
 
+// ValidateScanWindows checks publication-time syntax without requiring the
+// current instant to fall within a configured window.
+func ValidateScanWindows(windows []string) error {
+	for _, raw := range windows {
+		if _, err := parseScanWindow(raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CurrentScanWindowDeadline returns a conservative end of the current UTC
+// window. A future executor must check this deadline again after commit.
+func CurrentScanWindowDeadline(windows []string, at time.Time) (*time.Time, error) {
+	if len(windows) == 0 {
+		return nil, nil
+	}
+	at = at.UTC()
+	var earliest *time.Time
+	for _, raw := range windows {
+		window, err := parseScanWindow(raw)
+		if err != nil {
+			return nil, err
+		}
+		if !window.contains(at) {
+			continue
+		}
+		minute := at.Truncate(time.Minute)
+		for offset := 1; offset <= 24*60+1; offset++ {
+			candidate := minute.Add(time.Duration(offset) * time.Minute)
+			if !window.contains(candidate) {
+				if earliest == nil || candidate.Before(*earliest) {
+					copy := candidate
+					earliest = &copy
+				}
+				break
+			}
+		}
+	}
+	if earliest == nil {
+		return nil, fmt.Errorf("time is outside configured scan windows")
+	}
+	return earliest, nil
+}
+
 type scanWindow struct {
 	weekday *time.Weekday
 	start   int

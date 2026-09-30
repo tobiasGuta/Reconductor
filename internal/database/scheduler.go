@@ -681,7 +681,7 @@ func (s *Store) RequestScheduledExecutionResume(ctx context.Context, id domain.I
 			return fmt.Errorf("scheduled execution %s has no workflow lineage", id)
 		}
 		var decision string
-		err = tx.QueryRow(ctx, `SELECT a.decision FROM approvals a JOIN step_runs sr ON sr.id=a.request_id WHERE sr.workflow_run_id=$1 AND sr.status='awaiting_approval' ORDER BY a.requested_at DESC LIMIT 1`, item.WorkflowRunID).Scan(&decision)
+		err = tx.QueryRow(ctx, `SELECT a.decision FROM approvals a JOIN step_runs sr ON sr.id=a.request_id WHERE sr.workflow_run_id=$1 AND sr.status='awaiting_approval' AND a.approval_kind='workflow_step' ORDER BY a.requested_at DESC LIMIT 1`, item.WorkflowRunID).Scan(&decision)
 		if err != nil {
 			return err
 		}

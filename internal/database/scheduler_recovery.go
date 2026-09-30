@@ -325,8 +325,8 @@ func lockScheduledExecutionLineage(ctx context.Context, tx pgx.Tx, entry staleRe
 	approvalIDs := []domain.ID{}
 	if len(lineage.steps) > 0 || len(candidateTaskIDs) > 0 {
 		rows, err := tx.Query(ctx, `SELECT id FROM approvals
-			WHERE request_id=ANY($1::uuid[])
-			   OR (task_id=ANY($2::uuid[]) AND decision='pending')
+			WHERE COALESCE(to_jsonb(approvals)->>'approval_kind','workflow_step')='workflow_step' AND (request_id=ANY($1::uuid[])
+			   OR (task_id=ANY($2::uuid[]) AND decision='pending'))
 			ORDER BY id`, idStrings(recoveryStepIDs(lineage.steps)), idStrings(candidateTaskIDs))
 		if err != nil {
 			return staleLineage{}, false, err
@@ -345,7 +345,7 @@ func lockScheduledExecutionLineage(ctx context.Context, tx pgx.Tx, entry staleRe
 		}
 	}
 	if len(approvalIDs) > 0 {
-		rows, err := tx.Query(ctx, `SELECT id,request_id,task_id,action_request_id,decision FROM approvals WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE SKIP LOCKED`, idStrings(approvalIDs))
+		rows, err := tx.Query(ctx, `SELECT id,request_id,task_id,action_request_id,decision FROM approvals WHERE id=ANY($1::uuid[]) AND COALESCE(to_jsonb(approvals)->>'approval_kind','workflow_step')='workflow_step' ORDER BY id FOR UPDATE SKIP LOCKED`, idStrings(approvalIDs))
 		if err != nil {
 			return staleLineage{}, false, err
 		}
@@ -724,7 +724,7 @@ func applyStaleLineageReconciliation(ctx context.Context, tx pgx.Tx, entry stale
 			if !containsRecoveryID(plan.eligibleApprovalIDs, approval.id) || approval.decision != "pending" {
 				continue
 			}
-			tag, err := tx.Exec(ctx, `UPDATE approvals SET decision='expired',decided_by='scheduler',decided_at=$2 WHERE id=$1 AND decision='pending'`, approval.id, recoveredAt)
+			tag, err := tx.Exec(ctx, `UPDATE approvals SET decision='expired',decided_by='scheduler',decided_at=$2 WHERE id=$1 AND COALESCE(to_jsonb(approvals)->>'approval_kind','workflow_step')='workflow_step' AND decision='pending'`, approval.id, recoveredAt)
 			if err != nil {
 				return err
 			}
