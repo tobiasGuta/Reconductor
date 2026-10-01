@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { readFile } from "node:fs/promises";
+import { createContext, runInContext } from "node:vm";
 import test from "node:test";
 
 class FakeClassList {
@@ -599,6 +600,316 @@ function tabEvent(target, shiftKey = false) {
     preventDefault() { this.prevented = true; },
   };
 }
+
+test("operator credential verification keeps bearer in page memory only", async () => {
+  const document = installDocument();
+  document.register("operator-credential-status");
+  const originalFetch = globalThis.fetch;
+  const originalSetItem = globalThis.localStorage.setItem;
+  const calls = [];
+  globalThis.localStorage.setItem = (...args) => { calls.push(["storage", ...args]); };
+  globalThis.fetch = async (...args) => {
+    calls.push(["fetch", ...args]);
+    return response(200, { status: "ok" });
+  };
+  try {
+    const credential = "0123456789abcdef0123456789abcdef";
+    assert.equal(await app.verifyOperatorCredential(credential), true);
+    assert.equal(calls[0][1], "/api/v1/operator/check");
+    assert.equal(calls[0][2].headers.Authorization, `Bearer ${credential}`);
+    assert.equal(calls[0][2].cache, "no-store");
+    assert.equal(app.operatorMutationHeaders().Authorization, `Bearer ${credential}`);
+    assert.equal(app.state.operatorCredential, credential);
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions unlocked for this page");
+    assert.equal(calls.some((call) => call[0] === "storage"), false);
+
+    globalThis.fetch = async () => response(401, {});
+    assert.equal(await app.verifyOperatorCredential("wrong-credential"), false);
+    assert.equal(app.state.operatorCredential, "");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions locked");
+  } finally {
+    app.state.operatorCredential = "";
+    globalThis.fetch = originalFetch;
+    globalThis.localStorage.setItem = originalSetItem;
+  }
+});
+
+function operatorCredentialDocument() {
+  const document = installDocument();
+  document.register("operator-credential");
+  document.register("operator-credential-status");
+  app.state.operatorCredential = "";
+  return document;
+}
+
+function submitCredential(document, credential) {
+  const input = document.querySelector("#operator-credential");
+  input.value = credential;
+  const pending = app.submitOperatorCredential({ preventDefault() {} });
+  assert.equal(input.value, "", "password field clears before the response");
+  return pending;
+}
+
+async function boundOperatorCredentialPage() {
+  const [source, markup] = await Promise.all([
+    readFile(new URL("./static/app.js", import.meta.url), "utf8"),
+    readFile(new URL("./static/index.html", import.meta.url), "utf8"),
+  ]);
+  const document = new FakeDocument();
+  for (const match of markup.matchAll(/\bid="([^"]+)"/g)) document.register(match[1]);
+  const requests = [];
+  const pending = [];
+  const context = createContext({
+    document, requests, pending, module: { exports: {} },
+    localStorage: { getItem() { return ""; }, setItem() { assert.fail("credential must not persist"); } },
+    window: { addEventListener() {} }, setTimeout() {},
+  });
+  // Fetch promises must share the handler's realm to exercise its exact microtask ordering.
+  runInContext(`fetch = (url, options) => new Promise((resolve, reject) => {
+    requests.push({ url, options });
+    pending.push({ resolve, reject });
+  });`, context);
+  runInContext(source, context);
+  runInContext("bindEvents();", context);
+  const [handler] = document.querySelector("#operator-credential-form").listeners.get("submit");
+  return {
+    document, requests, pending, state: runInContext("state", context),
+    submit(credential) {
+      const input = document.querySelector("#operator-credential");
+      input.value = credential;
+      const result = handler({ preventDefault() {} });
+      assert.equal(input.value, "", "bound form clears the password synchronously");
+      return result;
+    },
+    status() { return document.querySelector("#operator-credential-status").textContent; },
+    feedback() { return document.querySelector("#toast-region").textContent; },
+  };
+}
+
+for (const outcome of ["401", "network", "success"]) {
+  test(`bound credential form ignores stale ${outcome} feedback across its own await`, async () => {
+    const page = await boundOperatorCredentialPage();
+    const pendingA = page.submit("token-A");
+    if (outcome === "network") page.pending[0].reject(new Error("offline A"));
+    else page.pending[0].resolve(response(outcome === "401" ? 401 : 200, {}));
+    let pendingB;
+    queueMicrotask(() => { pendingB = page.submit("token-B"); });
+    await pendingA;
+    assert.ok(pendingB, "B starts before A's form continuation finishes");
+    assert.equal(page.state.operatorVerificationGeneration, 2);
+    assert.equal(page.state.operatorCredential, "");
+    assert.equal(page.status(), "Actions locked");
+    const staleFeedback = page.feedback();
+    page.pending[1].resolve(response(200, { status: "ok" }));
+    await pendingB;
+    assert.equal(staleFeedback, "", "A must not present feedback after B starts");
+    assert.equal(page.feedback(), "");
+    assert.equal(page.state.operatorCredential, "token-B");
+    assert.equal(page.status(), "Actions unlocked for this page");
+    assert.equal(page.requests[1].options.headers.Authorization, "Bearer token-B");
+  });
+}
+
+for (const outcome of ["401", "network"]) {
+  test(`bound credential form still displays current ${outcome} feedback`, async () => {
+    const page = await boundOperatorCredentialPage();
+    const current = page.submit("invalid-current");
+    if (outcome === "network") page.pending[0].reject(new Error("offline"));
+    else page.pending[0].resolve(response(401, {}));
+    await current;
+    assert.equal(page.state.operatorCredential, "");
+    assert.equal(page.status(), "Actions locked");
+    assert.equal(page.feedback(), outcome === "network"
+      ? "Could not check the operator credential." : "Operator credential was not accepted.");
+  });
+}
+
+test("bound credential form gives only C ownership for every A/B/C completion order", async () => {
+  const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+  for (const outcome of ["success", "401", "network"]) {
+    for (const order of orders) {
+      const page = await boundOperatorCredentialPage();
+      const jobs = ["token-A", "token-B", "token-C"].map((token) => page.submit(token));
+      let currentFinished = false;
+      for (const index of order) {
+        if (index === 1 || (index === 2 && outcome === "network")) page.pending[index].reject(new Error("offline"));
+        else page.pending[index].resolve(response(index === 2 && outcome === "success" ? 200 : 401, {}));
+        await jobs[index];
+        if (index === 2) currentFinished = true;
+        const unlocked = currentFinished && outcome === "success";
+        assert.equal(page.state.operatorCredential, unlocked ? "token-C" : "");
+        assert.equal(page.status(), unlocked ? "Actions unlocked for this page" : "Actions locked");
+        assert.equal(page.feedback(), !currentFinished || outcome === "success" ? ""
+          : outcome === "network" ? "Could not check the operator credential." : "Operator credential was not accepted.");
+      }
+    }
+  }
+});
+
+test("newer rejected credential stays locked after an older success", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const first = deferred();
+  const second = deferred();
+  const requests = [];
+  globalThis.fetch = (url, options) => {
+    requests.push({ url, options });
+    return requests.length === 1 ? first.promise : second.promise;
+  };
+  try {
+    const pendingA = submitCredential(document, "valid-A");
+    const pendingB = submitCredential(document, "invalid-B");
+    assert.equal(app.state.operatorCredential, "");
+    second.resolve(response(401, {}));
+    await pendingB;
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions locked");
+    assert.equal(document.querySelector("#toast-region").textContent, "Operator credential was not accepted.");
+    first.resolve(response(200, { status: "ok" }));
+    await pendingA;
+    assert.equal(app.state.operatorCredential, "");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions locked");
+    assert.equal(document.querySelector("#toast-region").children.length, 1);
+    assert.deepEqual(requests.map(({ options }) => options.headers.Authorization), ["Bearer valid-A", "Bearer invalid-B"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
+
+test("newer accepted credential survives an older rejection", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const first = deferred();
+  const second = deferred();
+  let count = 0;
+  globalThis.fetch = () => (++count === 1 ? first.promise : second.promise);
+  try {
+    const pendingA = submitCredential(document, "invalid-A");
+    const pendingB = submitCredential(document, "valid-B");
+    second.resolve(response(200, { status: "ok" }));
+    await pendingB;
+    first.resolve(response(401, {}));
+    await pendingA;
+    assert.equal(app.state.operatorCredential, "valid-B");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions unlocked for this page");
+    assert.equal(document.querySelector("#toast-region").children.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
+
+test("older verification network failure is silent after newer success", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const first = deferred();
+  const second = deferred();
+  let count = 0;
+  globalThis.fetch = () => (++count === 1 ? first.promise : second.promise);
+  try {
+    const pendingA = submitCredential(document, "valid-A");
+    const pendingB = submitCredential(document, "valid-B");
+    second.resolve(response(200, { status: "ok" }));
+    await pendingB;
+    first.resolve(Promise.reject(new Error("offline")));
+    await pendingA;
+    assert.equal(app.state.operatorCredential, "valid-B");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions unlocked for this page");
+    assert.equal(document.querySelector("#toast-region").children.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
+
+test("failed replacement clears an earlier accepted credential immediately", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const replacement = deferred();
+  let count = 0;
+  globalThis.fetch = () => (++count === 1 ? Promise.resolve(response(200, { status: "ok" })) : replacement.promise);
+  try {
+    await submitCredential(document, "valid-A");
+    assert.equal(app.state.operatorCredential, "valid-A");
+    const pendingB = submitCredential(document, "invalid-B");
+    assert.equal(app.state.operatorCredential, "");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions locked");
+    replacement.resolve(response(401, {}));
+    await pendingB;
+    assert.equal(app.state.operatorCredential, "");
+    assert.equal(document.querySelector("#toast-region").textContent, "Operator credential was not accepted.");
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
+
+test("repeated accepted replacements retain only the latest token for mutations", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const first = deferred();
+  const second = deferred();
+  const third = deferred();
+  const verifications = [first, second, third];
+  const mutationCalls = [];
+  globalThis.fetch = (url, options) => {
+    if (url === "/api/v1/operator/check") return verifications.shift().promise;
+    mutationCalls.push({ url, options });
+    return Promise.resolve(response(409, { error: "expected test rejection" }));
+  };
+  try {
+    const pendingA = submitCredential(document, "valid-A");
+    const pendingB = submitCredential(document, "valid-B");
+    second.resolve(response(200, { status: "ok" }));
+    await pendingB;
+    first.resolve(response(200, { status: "ok" }));
+    await pendingA;
+    assert.equal(app.state.operatorCredential, "valid-B");
+    const pendingC = submitCredential(document, "valid-C");
+    assert.equal(app.state.operatorCredential, "");
+    third.resolve(response(200, { status: "ok" }));
+    await pendingC;
+    assert.equal(app.state.operatorCredential, "valid-C");
+    assert.equal(app.operatorMutationHeaders().Authorization, "Bearer valid-C");
+    app.state.data.scheduled_executions = [execution("paused-1", "paused_operator")];
+    app.renderSchedules();
+    const [resume] = findButtons(document.querySelector("#scheduled-execution-list"), "Resume");
+    await resume.click();
+    assert.equal(mutationCalls.length, 1);
+    assert.equal(mutationCalls[0].options.headers.Authorization, "Bearer valid-C");
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
+
+test("older mutation rejection cannot clear a newer verified credential", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const oldMutation = deferred();
+  const mutationCalls = [];
+  globalThis.fetch = (url, options) => {
+    if (url === "/api/v1/operator/check") return Promise.resolve(response(200, { status: "ok" }));
+    mutationCalls.push({ url, options });
+    return oldMutation.promise;
+  };
+  try {
+    await submitCredential(document, "valid-A");
+    app.state.data.scheduled_executions = [execution("paused-1", "paused_operator")];
+    app.renderSchedules();
+    const [resume] = findButtons(document.querySelector("#scheduled-execution-list"), "Resume");
+    const pendingMutation = resume.click();
+    assert.equal(mutationCalls[0].options.headers.Authorization, "Bearer valid-A");
+    await submitCredential(document, "valid-B");
+    oldMutation.resolve(response(401, { error: "expired" }));
+    await pendingMutation;
+    assert.equal(app.state.operatorCredential, "valid-B");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions unlocked for this page");
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
 
 test("drawer focus containment keeps one control for Tab and Shift+Tab", () => {
   const document = installDocument();
@@ -1858,10 +2169,15 @@ test("resume remains independent and workflow-run detail still uses the drawer",
   assert.ok(details);
 
   await resume.click();
+  assert.equal(calls.length, 0, "locked actions do not send mutation requests");
+  app.state.operatorCredential = "test-operator-token";
+  await resume.click();
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "/api/v1/scheduled-executions/paused-1/resume");
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.headers["X-Reconductor-Request"], "operator-console");
+  assert.equal(calls[0].options.headers.Authorization, "Bearer test-operator-token");
+  app.state.operatorCredential = "";
 
   app.state.data.steps = [{ workflow_run_id: "run-1", step_definition_id: "probe", capability: "http.probe", status: "succeeded", attempt_count: 1 }];
   app.openRunDrawer({ id: "run-1", objective: "Existing workflow detail", workflow_name: "baseline", workflow_version: "1", status: "succeeded", trigger_source: "operator" });

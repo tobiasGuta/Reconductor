@@ -28,6 +28,12 @@
         <button class="nav-item" data-view="logs"><span class="nav-glyph">›_</span>Provider logs</button>
       </nav>
       <div class="sidebar-foot">
+		<form id="operator-credential-form" class="operator-credential-form" autocomplete="off">
+		  <label for="operator-credential">Operator credential</label>
+		  <input id="operator-credential" type="password" maxlength="256" autocomplete="off" spellcheck="false" required>
+		  <button id="operator-credential-submit" type="submit" class="secondary-button">Unlock actions</button>
+		  <small id="operator-credential-status" role="status">Actions locked</small>
+		</form>
         <div class="connection"><span id="connection-dot" class="connection-dot"></span><div><strong id="connection-label">Connecting</strong><small>Loopback control plane</small></div></div>
         <p>Scope, policy, and approval checks remain authoritative.</p>
       </div>

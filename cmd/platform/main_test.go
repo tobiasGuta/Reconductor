@@ -43,6 +43,36 @@ func TestScopePlanCLIProducesJSONWithoutRuntimeConfiguration(t *testing.T) {
 	}
 }
 
+func TestConsoleCommandRequiresOperatorConfigurationBeforeConnecting(t *testing.T) {
+	err := consoleCommand(context.Background(), config.Config{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "CONSOLE_OPERATOR_TOKEN") {
+		t.Fatalf("console startup error=%v; want missing operator credential", err)
+	}
+}
+
+func TestConsoleCommandRejectsIPv4MappedIPv6BeforeConnecting(t *testing.T) {
+	// Valid operator credentials and an unusable database isolate listen validation:
+	// reaching database startup would return a different error.
+	cfg := config.Config{
+		Database: config.Database{URL: "postgres://%"},
+		Console: config.Console{
+			OperatorToken: strings.Repeat("a", 64), OperatorActor: "configured-operator",
+		},
+	}
+	for _, address := range []string{
+		"[::ffff:127.0.0.1]:80", "[::ffff:127.0.0.1]:8080",
+		"[::ffff:7f00:1]:80", "[::ffff:7f00:1]:8080",
+		"[0:0:0:0:0:FFFF:7f00:1]:80", "[0:0:0:0:0:FFFF:7f00:1]:8080",
+	} {
+		t.Run(address, func(t *testing.T) {
+			err := consoleCommand(context.Background(), cfg, []string{"--listen", address})
+			if err == nil || err.Error() != "IPv4-mapped IPv6 console addresses are unsupported" {
+				t.Fatalf("console startup error=%v; want mapped IPv6 rejection before database startup", err)
+			}
+		})
+	}
+}
+
 func TestArtifactStoreInitCLIHasOnlyFrozenFlagsAndRequiresStoreID(t *testing.T) {
 	cfg := config.Config{ArtifactStorage: config.ArtifactStorage{Driver: "local", Root: t.TempDir()}}
 	if err := artifactStoreCommand(context.Background(), cfg, []string{"init"}); err == nil || !strings.Contains(err.Error(), "ARTIFACT_STORE_ID is required") {
@@ -326,7 +356,7 @@ func TestS2002ExactHostRegressionScopePlanIsNarrow(t *testing.T) {
 }
 
 func TestConsoleListenAddressRequiresLoopback(t *testing.T) {
-	for _, address := range []string{"127.0.0.1:8088", "localhost:8090", "[::1]:8088"} {
+	for _, address := range []string{"127.0.0.1:8088", "localhost:8090", "[::1]:8088", "127.0.0.1:80", "127.0.0.1:8080", "localhost:80", "localhost:8080", "[::1]:80", "[::1]:8080"} {
 		if err := requireLoopbackAddress(address); err != nil {
 			t.Fatalf("loopback address %q rejected: %v", address, err)
 		}

@@ -7,6 +7,8 @@ const state = {
   loading: false,
   timer: null,
   modalAction: null,
+	operatorCredential: "",
+	operatorVerificationGeneration: 0,
   drawer: {
     returnFocus: null,
     returnTarget: null,
@@ -1315,7 +1317,7 @@ function renderChangeInbox() {
     const actions = element("div", "card-actions");
     for (const disposition of ["interesting", "investigating", "expected_change", "not_relevant", "resolved"]) {
       const button = element("button", disposition === "interesting" ? "primary-button" : "secondary-button", disposition.replaceAll("_", " "));
-      button.addEventListener("click", () => postAction(`/api/v1/change-items/${encodeURIComponent(item.id)}/review`, { disposition, note: note.value.trim(), actor: "console-operator" }, "Change review saved."));
+      button.addEventListener("click", () => postAction(`/api/v1/change-items/${encodeURIComponent(item.id)}/review`, { disposition, note: note.value.trim() }, "Change review saved."));
       actions.append(button);
     }
     card.append(copy, meta, statusBadge(item.disposition || "unreviewed"), actions);
@@ -1519,7 +1521,7 @@ function confirmApproval(item, decision) {
     details: [["Risk", item.risk], ["Reason", item.reason], ["Objective", item.objective], ["Request", shortID(item.request_id)]],
     confirmLabel: decision === "approved" ? "Approve step" : "Reject step",
     danger: decision === "rejected",
-    action: () => postAction(`/api/v1/approvals/${encodeURIComponent(item.id)}/decision`, { decision, actor: "console-operator" }, `Approval ${decision}.`),
+    action: () => postAction(`/api/v1/approvals/${encodeURIComponent(item.id)}/decision`, { decision }, `Approval ${decision}.`),
   });
 }
 
@@ -1965,11 +1967,14 @@ async function postAction(path, body, successMessage) {
   const button = $("#modal-confirm");
   button.disabled = true;
   try {
+	if (!state.operatorCredential) throw new Error("Unlock operator actions first.");
+	const verificationGeneration = state.operatorVerificationGeneration;
     const response = await fetch(path, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Reconductor-Request": "operator-console", Accept: "application/json" },
+      headers: operatorMutationHeaders(),
       body: JSON.stringify(body),
     });
+	if (response.status === 401 && verificationGeneration === state.operatorVerificationGeneration) lockOperatorActions();
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(result.error || "The operator action was not accepted.");
     closeModal();
@@ -1982,13 +1987,55 @@ async function postAction(path, body, successMessage) {
   }
 }
 
+function operatorMutationHeaders() {
+	return { "Content-Type": "application/json", "X-Reconductor-Request": "operator-console", Accept: "application/json", Authorization: `Bearer ${state.operatorCredential}` };
+}
+
+function lockOperatorActions() {
+	state.operatorCredential = "";
+	const status = $("#operator-credential-status");
+	if (status) status.textContent = "Actions locked";
+}
+
+async function verifyOperatorCredential(credential) {
+	const generation = ++state.operatorVerificationGeneration;
+	lockOperatorActions();
+	try {
+		const response = await fetch("/api/v1/operator/check", {
+			headers: { Authorization: `Bearer ${credential}`, Accept: "application/json" }, cache: "no-store",
+		});
+		if (generation !== state.operatorVerificationGeneration) return null;
+		if (!response.ok) return false;
+		state.operatorCredential = credential;
+		const status = $("#operator-credential-status");
+		if (status) status.textContent = "Actions unlocked for this page";
+		return true;
+	} catch {
+		return generation === state.operatorVerificationGeneration ? "unavailable" : null;
+	}
+}
+
 function toast(message, isError = false) {
   const item = element("div", `toast ${isError ? "error" : ""}`.trim(), message);
   $("#toast-region").append(item);
   setTimeout(() => item.remove(), 4500);
 }
 
+async function submitOperatorCredential(event) {
+	event.preventDefault();
+	const input = $("#operator-credential");
+	const credential = input.value;
+	input.value = "";
+	const verification = verifyOperatorCredential(credential);
+	const generation = state.operatorVerificationGeneration;
+	const result = await verification;
+	if (generation !== state.operatorVerificationGeneration) return;
+	if (result === false) toast("Operator credential was not accepted.", true);
+	if (result === "unavailable") toast("Could not check the operator credential.", true);
+}
+
 function bindEvents() {
+	$("#operator-credential-form").addEventListener("submit", submitOperatorCredential);
   $$(".nav-item").forEach((item) => item.addEventListener("click", () => showView(item.dataset.view)));
   $$('[data-go-view]').forEach((item) => item.addEventListener("click", () => showView(item.dataset.goView)));
   $("#program-select").addEventListener("change", (event) => {
@@ -2022,12 +2069,14 @@ function bindEvents() {
       cron_expression: String(form.get("cron") || ""),
       timezone: String(form.get("timezone") || ""),
       headless: form.get("headless") === "on",
-      actor: "console-operator",
     };
     if (!scheduleID) body.program_id = state.data?.selected_program_id || state.selectedProgram;
     try {
+	  if (!state.operatorCredential) throw new Error("Unlock operator actions first.");
+	  const verificationGeneration = state.operatorVerificationGeneration;
       const path = scheduleID ? `/api/v1/schedules/${encodeURIComponent(scheduleID)}/update` : "/api/v1/schedules";
-      const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Reconductor-Request": "operator-console", Accept: "application/json" }, body: JSON.stringify(body) });
+      const response = await fetch(path, { method: "POST", headers: operatorMutationHeaders(), body: JSON.stringify(body) });
+	  if (response.status === 401 && verificationGeneration === state.operatorVerificationGeneration) lockOperatorActions();
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.error || "Schedule was not accepted.");
       resetScheduleForm();
@@ -2060,6 +2109,9 @@ if (typeof module !== "undefined" && module.exports) {
 	latestRunSteps,
     partitionRunRelationships,
     state,
+	verifyOperatorCredential,
+	submitOperatorCredential,
+	operatorMutationHeaders,
     closeDrawer,
     openExecutionWorkspace,
     openExecutionDetail,

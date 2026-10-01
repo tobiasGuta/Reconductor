@@ -57,6 +57,10 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .connection-dot.online { border-color: var(--green); background: var(--green); box-shadow: 0 0 0 5px rgba(101,215,163,.08); }
 .connection-dot.offline { border-color: var(--red); background: var(--red); }
 .sidebar-foot p { margin: 16px 0 0; color: var(--quiet); font-size: 10px; line-height: 1.55; }
+.operator-credential-form { display: grid; gap: 7px; margin-bottom: 18px; }
+.operator-credential-form label, .operator-credential-form small { color: var(--quiet); font-size: 11px; }
+.operator-credential-form input { min-width: 0; width: 100%; height: 36px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--surface); }
+.operator-credential-form button { width: 100%; }
 
 .main { min-width: 0; }
 .topbar { position: sticky; top: 0; z-index: 20; height: 76px; padding: 0 clamp(22px, 4vw, 56px); display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); background: rgba(8, 17, 15, .82); backdrop-filter: blur(18px); }

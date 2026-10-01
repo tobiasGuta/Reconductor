@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -298,6 +299,9 @@ func consoleCommand(ctx context.Context, cfg config.Config, args []string) error
 	if err := requireLoopbackAddress(*listen); err != nil {
 		return err
 	}
+	if err := cfg.Console.Validate(); err != nil {
+		return err
+	}
 	store, err := readyStore(ctx, cfg)
 	if err != nil {
 		return err
@@ -310,7 +314,11 @@ func consoleCommand(ctx context.Context, cfg config.Config, args []string) error
 		return fmt.Errorf("initialize console queue view: %w", err)
 	}
 	validator := &schedulecron.ScheduleValidator{Programs: store, Registry: providers.Registry(cfg), ScopeRoot: cfg.Scope.Root}
-	server := console.HTTPServer(*listen, console.New(store, workQueue, validator))
+	handler, err := console.NewOperator(store, workQueue, *listen, cfg.Console, validator)
+	if err != nil {
+		return err
+	}
+	server := console.HTTPServer(*listen, handler)
 	slog.Info("Reconductor operator console ready", "url", "http://"+*listen)
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
@@ -327,9 +335,12 @@ func requireLoopbackAddress(address string) error {
 	if strings.EqualFold(host, "localhost") {
 		return nil
 	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("console refuses non-loopback address %q because authentication is not configured", address)
+	ip, err := netip.ParseAddr(host)
+	if err == nil && ip.Is4In6() {
+		return errors.New("IPv4-mapped IPv6 console addresses are unsupported")
+	}
+	if err != nil || !ip.IsLoopback() || ip.Zone() != "" {
+		return fmt.Errorf("console refuses non-loopback address %q", address)
 	}
 	return nil
 }
