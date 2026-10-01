@@ -115,24 +115,6 @@ func TestPolicyMaterialPreservesEmptyAuthorityLists(t *testing.T) {
 	}
 }
 
-func TestActionFixtureClosedAndStable(t *testing.T) {
-	raw := json.RawMessage(`{"version":"exact-dispatch-fixture/v1","method":"GET","url":"https://example.test/allowed/one"}`)
-	_, hash, err := DecodeActionFixture(raw)
-	if err != nil || len(hash) != 64 {
-		t.Fatalf("hash=%q err=%v", hash, err)
-	}
-	for _, candidate := range []string{
-		`{"version":"exact-dispatch-fixture/v1","method":"GET","url":"https://example.test/allowed/one","headers":{}}`,
-		`{"version":"exact-dispatch-fixture/v1","method":"POST","url":"https://example.test/allowed/one"}`,
-		`{"version":"exact-dispatch-fixture/v1","method":"GET","url":"http://example.test/allowed/one"}`,
-		`{"version":"exact-dispatch-fixture/v1","method":"GET","url":"https://example.test/allowed/one","url":"https://other.test/"}`,
-	} {
-		if _, _, err := DecodeActionFixture(json.RawMessage(candidate)); err == nil {
-			t.Errorf("accepted %s", candidate)
-		}
-	}
-}
-
 func TestAuthoritativeMaterialRejectsAliasesAndMissingFields(t *testing.T) {
 	policyRaw, _, err := PolicyFromPolicy(policy.Policy{AllowedCapabilities: []string{"http.request"},
 		DeniedCapabilities: []string{"http.request"}, AllowedHTTPMethods: []string{"GET"},

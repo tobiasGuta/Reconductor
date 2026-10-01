@@ -18,7 +18,7 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) != 22 {
+	if len(versions) != 23 {
 		t.Fatalf("migrations=%v", versions)
 	}
 	wantVersions := []string{
@@ -44,6 +44,7 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 		"0020_prepared_evidence_ownership.sql",
 		"0021_provider_output_authority_ceiling.sql",
 		"0022_exact_launch_authority_foundation.sql",
+		"0023_exact_action_contract.sql",
 	}
 	for index := range wantVersions {
 		if versions[index] != wantVersions[index] {

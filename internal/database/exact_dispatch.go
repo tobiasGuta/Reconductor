@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/exactaction"
 	"github.com/tobiasGuta/Reconductor/internal/launchauthority"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 )
@@ -48,8 +49,8 @@ func (p *ExactDispatchPermit) ConsumeAt(at time.Time) bool {
 	return p.used.CompareAndSwap(false, true)
 }
 
-// AdmitExactDispatch re-derives the fixture action from the locked step row,
-// checks only current PostgreSQL authority, and commits intent for X once.
+// AdmitExactDispatch loads the frozen contract, checks current PostgreSQL
+// authority, and commits intent for X once.
 // It deliberately has no queue-policy or transport parameters.
 func (s *Store) AdmitExactDispatch(ctx context.Context, programID domain.ID, step domain.StepRun, providerAttemptID domain.ID) (*ExactDispatchPermit, error) {
 	return s.admitExactDispatch(ctx, programID, step, providerAttemptID, nil)
@@ -89,15 +90,6 @@ func (s *Store) admitExactDispatch(ctx context.Context, programID domain.ID, ste
 		return nil, err
 	}
 
-	var input json.RawMessage
-	if err := tx.QueryRow(ctx, `SELECT input FROM step_runs WHERE id=$1`, step.ID).Scan(&input); err != nil {
-		return nil, err
-	}
-	fixture, actionSHA, err := launchauthority.DecodeActionFixture(input)
-	if err != nil {
-		return nil, fmt.Errorf("%w: invalid stored action fixture: %v", ErrExactDispatchDenied, err)
-	}
-
 	var approvalID, approvalTaskID, approvalActionID, approvalAttemptID domain.ID
 	var approvalKind, decision, approvedSHA, reviewSHA string
 	var revokedAt, expiresAt, decidedAt *time.Time
@@ -114,7 +106,7 @@ func (s *Store) admitExactDispatch(ctx context.Context, programID domain.ID, ste
 		return nil, err
 	}
 	if approvalKind != "exact_action" || decision != "approved" || revokedAt != nil ||
-		approvedSHA != actionSHA || reviewSHA == "" || approvalTaskID != lineage.taskID ||
+		reviewSHA == "" || approvalTaskID != lineage.taskID ||
 		approvalAttemptID != providerAttemptID || decidedAt == nil || decidedBy == nil || strings.TrimSpace(*decidedBy) == "" {
 		return nil, fmt.Errorf("%w: exact approval is invalid", ErrExactDispatchDenied)
 	}
@@ -129,6 +121,34 @@ func (s *Store) admitExactDispatch(ctx context.Context, programID domain.ID, ste
 	}
 	if err != nil {
 		return nil, err
+	}
+	var contractBytes, reviewBytes []byte
+	var contractSchema, capabilityRevision, reviewSchema, actionSHA, frozenReviewSHA string
+	var frozenActionID, frozenProviderAttemptID, frozenProgramID, frozenTaskID, frozenRunID, frozenStepID domain.ID
+	var frozenAttempt int
+	err = tx.QueryRow(ctx, `SELECT action_request_id,bound_provider_attempt_id,program_id,task_id,workflow_run_id,step_run_id,step_attempt,
+		contract_schema,capability_semantic_revision,canonical_contract,action_sha256,review_schema,
+		canonical_review_context,review_context_sha256 FROM exact_actions WHERE action_request_id=$1 FOR KEY SHARE NOWAIT`, approvalActionID).
+		Scan(&frozenActionID, &frozenProviderAttemptID, &frozenProgramID, &frozenTaskID, &frozenRunID, &frozenStepID, &frozenAttempt,
+			&contractSchema, &capabilityRevision, &contractBytes, &actionSHA, &reviewSchema, &reviewBytes, &frozenReviewSHA)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: frozen action missing", ErrExactDispatchDenied)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if contractSchema != exactaction.ContractVersion || capabilityRevision != exactaction.CapabilityRevision || reviewSchema != exactaction.ReviewVersion || frozenActionID != approvalActionID || frozenProviderAttemptID != providerAttemptID || frozenProgramID != programID || frozenTaskID != lineage.taskID || frozenRunID != step.WorkflowRunID || frozenStepID != step.ID || frozenAttempt != lineage.attemptCount || approvedSHA != actionSHA || reviewSHA != frozenReviewSHA {
+		return nil, fmt.Errorf("%w: frozen action/approval lineage invalid", ErrExactDispatchDenied)
+	}
+	contract, err := exactaction.DecodeContract(contractBytes, actionSHA)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid frozen contract: %v", ErrExactDispatchDenied, err)
+	}
+	if _, err = exactaction.DecodeReview(reviewBytes, frozenReviewSHA); err != nil {
+		return nil, fmt.Errorf("%w: invalid frozen review: %v", ErrExactDispatchDenied, err)
+	}
+	if contract.ActionID != approvalActionID || contract.Ownership != (exactaction.Ownership{ProgramID: programID, TaskID: lineage.taskID, WorkflowRunID: step.WorkflowRunID, StepRunID: step.ID, StepAttempt: lineage.attemptCount}) {
+		return nil, fmt.Errorf("%w: contract ownership mismatch", ErrExactDispatchDenied)
 	}
 	if dispatchState != "UNDISPATCHED" || dispatchApprovalID != approvalID || dispatchProgramID != programID ||
 		dispatchActionID != approvalActionID || dispatchSHA != actionSHA {
@@ -256,11 +276,14 @@ func (s *Store) admitExactDispatch(ctx context.Context, programID domain.ID, ste
 	if decidedAt.After(checkedAt) || (expiresAt != nil && !expiresAt.After(checkedAt)) {
 		return nil, fmt.Errorf("%w: approval is not currently valid", ErrExactDispatchDenied)
 	}
-	scopeDecision := sc.Evaluate(fixture.URL)
+	scopeTarget := fmt.Sprintf("https://%s:%d%s", contract.Request.Hostname, contract.Request.EffectivePort, contract.Request.RequestTarget)
+	scopeDecision := sc.Evaluate(scopeTarget)
 	if !scopeDecision.Allowed {
 		return nil, fmt.Errorf("%w: current scope denied action (%s)", ErrExactDispatchDenied, scopeDecision.Reason)
 	}
-	policyInput, err := json.Marshal(fixture)
+	policyInput, err := json.Marshal(struct {
+		Method string `json:"method"`
+	}{Method: contract.Request.Method})
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +316,7 @@ func (s *Store) admitExactDispatch(ctx context.Context, programID domain.ID, ste
 		workflow_run_id,step_run_id,scheduled_execution_id,scheduler_attempt,action_request_id,
 		step_attempt,provider_attempt_id,capability,provider,safe_message,details)
 		SELECT $1,'exact_dispatch_intent','platform','exact-dispatch',$2,$3,$4,$5,$6,$7,$8,$9,$10,
-		'http.request','fixture','exact dispatch intent committed',$11`,
+		'http.request','exact-action','exact dispatch intent committed',$11`,
 		domain.NewID(), lineage.taskID, programID, step.WorkflowRunID, step.ID,
 		optionalIDPointer(lineage.scheduledID), lineage.schedulerAttempt, approvalActionID, attemptStep,
 		providerAttemptID, mustJSON(map[string]any{

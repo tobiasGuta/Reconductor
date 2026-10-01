@@ -49,6 +49,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	store.ConfigureExactReviewEvidenceReader(artifacts)
 	prepared, err := store.RequirePreparedEvidenceReady(ctx, storeID)
 	if err != nil {
 		return fmt.Errorf("prepared evidence readiness: %w", err)

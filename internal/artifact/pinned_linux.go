@@ -273,6 +273,28 @@ func (r *guardedArtifactReader) Close() error {
 	return errors.Join(r.ReadCloser.Close(), r.guard.Close())
 }
 
+// OpenVerified uses authority already held by this guard; acquiring another
+// filesystem lock here would reverse recovery's store-before-database order.
+func (g *localPublisherGuard) OpenVerified(ctx context.Context, reference domain.ResultArtifactRefV1) (io.ReadCloser, error) {
+	if g == nil || g.marker == nil || g.rootFD < 0 || reference.ArtifactStoreID != g.identity.ArtifactStoreID {
+		return nil, fmt.Errorf("semantic artifact store identity mismatch")
+	}
+	if err := reference.Validate(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validatePinnedMarker(g.rootFD, g.marker); err != nil {
+		return nil, err
+	}
+	digest, err := decodePreparedDigest(reference.ContentSHA256)
+	if err != nil {
+		return nil, err
+	}
+	return openPreparedVerified(ctx, g.rootFD, reference.StorageKey, reference.ContentSizeBytes, digest)
+}
+
 func (l *Local) openAuthoritativeArtifact(ctx context.Context, reference domain.ResultArtifactRefV1) (io.ReadCloser, error) {
 	guard, err := l.AcquirePublisher(ctx, l.identity)
 	if err != nil {

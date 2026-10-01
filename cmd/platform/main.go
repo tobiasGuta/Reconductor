@@ -773,6 +773,7 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 	if err != nil {
 		return err
 	}
+	s.ConfigureExactReviewEvidenceReader(artifacts)
 	if _, err := s.RequirePreparedEvidenceReady(ctx, storeID); err != nil {
 		return fmt.Errorf("prepared evidence readiness: %w", err)
 	}

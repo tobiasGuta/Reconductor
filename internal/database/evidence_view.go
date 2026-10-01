@@ -37,7 +37,32 @@ func (s *Store) AuthorizeEvidenceView(ctx context.Context, workflowRunID, artifa
 		return artifact.AuthorizedEvidenceArtifactV1{}, err
 	}
 	defer tx.Rollback(ctx)
+	authorized, err := authorizeEvidenceViewTx(ctx, tx, workflowRunID, artifactID)
+	if err != nil {
+		return artifact.AuthorizedEvidenceArtifactV1{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return artifact.AuthorizedEvidenceArtifactV1{}, err
+	}
+	return authorized, nil
+}
 
+// authorizeEvidenceViewTx is the single evidence-authorization implementation.
+// Callers that already own a transaction use it directly so authorization is
+// coherent with their locked state without checking out another connection.
+func authorizeEvidenceViewTx(ctx context.Context, tx pgx.Tx, workflowRunID, artifactID domain.ID) (artifact.AuthorizedEvidenceArtifactV1, error) {
+	unavailable := func() (artifact.AuthorizedEvidenceArtifactV1, error) {
+		return artifact.AuthorizedEvidenceArtifactV1{}, artifact.ErrEvidenceUnavailable
+	}
+	if tx == nil {
+		return unavailable()
+	}
+	if _, err := domain.ParseID(string(workflowRunID)); err != nil {
+		return unavailable()
+	}
+	if _, err := domain.ParseID(string(artifactID)); err != nil {
+		return unavailable()
+	}
 	var (
 		programID, workflowTaskID, artifactTaskID                        domain.ID
 		artifactRunID, artifactStepID, stepRunID, stepWorkflowRunID      domain.ID
@@ -68,7 +93,7 @@ func (s *Store) AuthorizeEvidenceView(ctx context.Context, workflowRunID, artifa
 		publicationContentPresent, publicationCleanupHealthy             bool
 	)
 
-	err = tx.QueryRow(ctx, `SELECT
+	err := tx.QueryRow(ctx, `SELECT
 		t.program_id,wr.task_id,a.task_id,
 		a.workflow_run_id,a.step_run_id,sr.id,sr.workflow_run_id,
 		a.tool_run_id,tr.id,tr.step_run_id,
@@ -94,7 +119,7 @@ func (s *Store) AuthorizeEvidenceView(ctx context.Context, workflowRunID, artifa
 		   AND members.publication_state='adopted'),
 		COALESCE(pes.member_count,-1),
 		a.sensitive,a.storage_location IS NULL,
-		(a.expires_at IS NULL OR a.expires_at>statement_timestamp()),
+		(a.expires_at IS NULL OR a.expires_at>statement_timestamp() OR exact_review_evidence_protected(a.id)),
 		a.content_deleted_at IS NULL,a.cleanup_quarantined_at IS NULL,
 		ap.content_deleted_at IS NULL,ap.cleanup_quarantined_at IS NULL
 	FROM artifacts a
@@ -214,9 +239,6 @@ func (s *Store) AuthorizeEvidenceView(ctx context.Context, workflowRunID, artifa
 	}
 	if err := storeIdentity.Validate(); err != nil {
 		return unavailable()
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return artifact.AuthorizedEvidenceArtifactV1{}, err
 	}
 	return artifact.AuthorizedEvidenceArtifactV1{
 		Reference:            reference,

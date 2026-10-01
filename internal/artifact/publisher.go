@@ -64,6 +64,13 @@ type SemanticArtifactReader interface {
 	OpenVerified(context.Context, domain.ResultArtifactRefV1) (io.ReadCloser, error)
 }
 
+// VerifiedEvidenceGuard keeps shared store authority across a database
+// decision. Recovery takes the corresponding exclusive authority first.
+type VerifiedEvidenceGuard interface {
+	SemanticArtifactReader
+	Close() error
+}
+
 type AuthorizedSemanticArtifactV1 struct {
 	Reference          domain.ResultArtifactRefV1
 	StoreIdentity      StoreIdentity

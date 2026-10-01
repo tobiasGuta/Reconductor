@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -25,7 +27,29 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
-type Store struct{ Pool *pgxpool.Pool }
+type ExactReviewEvidenceReader interface {
+	OpenVerified(context.Context, domain.ResultArtifactRefV1) (io.ReadCloser, error)
+}
+
+type Store struct {
+	Pool                *pgxpool.Pool
+	exactReviewReaderMu sync.RWMutex
+	exactReviewReader   ExactReviewEvidenceReader
+}
+
+// ConfigureExactReviewEvidenceReader installs the existing verified artifact
+// reader. Cited exact reviews fail closed until a reader is configured.
+func (s *Store) ConfigureExactReviewEvidenceReader(reader ExactReviewEvidenceReader) {
+	s.exactReviewReaderMu.Lock()
+	defer s.exactReviewReaderMu.Unlock()
+	s.exactReviewReader = reader
+}
+
+func (s *Store) exactReviewEvidenceReader() ExactReviewEvidenceReader {
+	s.exactReviewReaderMu.RLock()
+	defer s.exactReviewReaderMu.RUnlock()
+	return s.exactReviewReader
+}
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)

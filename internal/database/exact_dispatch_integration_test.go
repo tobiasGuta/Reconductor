@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,7 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
-	"github.com/tobiasGuta/Reconductor/internal/launchauthority"
+	"github.com/tobiasGuta/Reconductor/internal/exactaction"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/scope"
 	"github.com/tobiasGuta/Reconductor/internal/targeting"
@@ -20,12 +21,13 @@ import (
 )
 
 type exactDispatchFixture struct {
-	result    scheduledResultFixture
-	step      domain.StepRun
-	attemptID domain.ID
-	authority ProgramLaunchAuthority
-	include   []scope.Rule
-	policy    policy.Policy
+	result     scheduledResultFixture
+	step       domain.StepRun
+	attemptID  domain.ID
+	approvalID domain.ID
+	authority  ProgramLaunchAuthority
+	include    []scope.Rule
+	policy     policy.Policy
 }
 
 func newExactDispatchFixture(t *testing.T, name string) exactDispatchFixture {
@@ -71,6 +73,10 @@ func exactFixtureContext(result scheduledResultFixture) context.Context {
 }
 
 func buildExactDispatchFixture(t *testing.T, result scheduledResultFixture, targetURL string) exactDispatchFixture {
+	return buildExactDispatchFixtureDecision(t, result, targetURL, true)
+}
+
+func buildExactDispatchFixtureDecision(t *testing.T, result scheduledResultFixture, targetURL string, approve bool) exactDispatchFixture {
 	t.Helper()
 	include := []scope.Rule{{Protocol: "https", Host: "example\\.test", Port: "443", File: "/allowed/.*", Enabled: true}}
 	compiled, err := scope.Compile(include, nil)
@@ -89,37 +95,29 @@ func buildExactDispatchFixture(t *testing.T, result scheduledResultFixture, targ
 	if err != nil {
 		t.Fatal(err)
 	}
-	input, err := json.Marshal(launchauthority.ActionFixture{Version: launchauthority.ActionFixtureV1, Method: "GET", URL: targetURL})
+	target, err := url.Parse(targetURL)
 	if err != nil {
-		t.Fatal(err)
-	}
-	_, hash, err := launchauthority.DecodeActionFixture(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := result.env.store.Pool.Exec(result.env.ctx, `UPDATE step_runs SET input=$2 WHERE id=$1`, result.stepID, input); err != nil {
 		t.Fatal(err)
 	}
 	action := scheduledProviderAction(result, 1)
 	admission := recordScheduledProviderAdmission(t, result, exactFixtureContext(result), result.env.programID, action, nil, "fixture")
-	approvalID := domain.NewID()
-	_, err = result.env.store.Pool.Exec(result.env.ctx, `INSERT INTO approvals(
-		id,request_id,task_id,action_request_id,requested_risk_level,reason,decision,decided_by,
-		decided_at,expires_at,approval_kind,action_sha256,review_context_sha256,bound_provider_attempt_id)
-		VALUES($1,$2,$3,$4,'low','exact fixture review','approved','integration-reviewer',
-		clock_timestamp()-interval '1 second',clock_timestamp()+interval '5 minutes','exact_action',$5,$6,$7)`,
-		approvalID, domain.NewID(), result.lineage.task.ID, action.ID, hash, strings.Repeat("b", 64), admission.ProviderAttemptID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = result.env.store.Pool.Exec(result.env.ctx, `INSERT INTO exact_dispatch_attempts(
-		provider_attempt_id,approval_id,program_id,action_request_id,action_sha256)
-		VALUES($1,$2,$3,$4,$5)`, admission.ProviderAttemptID, approvalID, result.env.programID, action.ID, hash)
-	if err != nil {
-		t.Fatal(err)
-	}
 	step := domain.StepRun{ID: result.stepID, WorkflowRunID: result.lineage.runID, Capability: "http.request", IdempotencyKey: result.idempotencyKey}
-	return exactDispatchFixture{result: result, step: step, attemptID: admission.ProviderAttemptID, authority: authority, include: include, policy: pol}
+	review := exactaction.ReviewContextV1{ReviewVersion: exactaction.ReviewVersion, ProposalSource: exactaction.ProposalSource{Kind: "integration"}, Purpose: "verify exact gate", ExpectedPositiveOutcome: "one dispatch intent", ExpectedNegativeOutcome: "scope or policy denial", Assumptions: []string{}, MissingEvidence: []string{}, SupportingEvidence: []exactaction.Citation{}, ContradictoryEvidence: []exactaction.Citation{}}
+	approvalID, err := result.env.store.PrepareExactActionApproval(exactFixtureContext(result), result.env.programID, step, admission.ProviderAttemptID,
+		exactaction.ProposedRequest{Method: "GET", Scheme: "https", Hostname: target.Hostname(), EffectivePort: 443, RequestTarget: target.RequestURI()}, review, "integration-reviewer", time.Now().Add(5*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := result.env.store.GetExactApprovalReview(result.env.ctx, approvalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approve {
+		if err := result.env.store.DecideExactApproval(result.env.ctx, approvalID, projection.ActionSHA256, projection.ReviewContextSHA256, "approved", "integration-reviewer"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return exactDispatchFixture{result: result, step: step, attemptID: admission.ProviderAttemptID, approvalID: approvalID, authority: authority, include: include, policy: pol}
 }
 
 func (f exactDispatchFixture) admit() (*ExactDispatchPermit, error) {
@@ -300,6 +298,13 @@ func TestExactDispatchApprovalAndCurrentPolicy(t *testing.T) {
 			a, err := f.result.env.store.PublishLaunchAuthority(f.result.env.ctx, f.result.env.programID, f.authority.Epoch, "reviewer", f.include, nil, p)
 			if err != nil || a.Status != "READY" {
 				t.Fatalf("publication=%v %v", a, err)
+			}
+		}},
+		{"method restriction", func(t *testing.T, f exactDispatchFixture) {
+			p := f.policy
+			p.AllowedHTTPMethods = []string{"HEAD"}
+			if _, err := f.result.env.store.PublishLaunchAuthority(f.result.env.ctx, f.result.env.programID, f.authority.Epoch, "reviewer", f.include, nil, p); err != nil {
+				t.Fatal(err)
 			}
 		}},
 		{"payload limit", func(t *testing.T, f exactDispatchFixture) {
@@ -960,6 +965,9 @@ func TestWorkflowStepApprovalStillWorks(t *testing.T) {
 	if err := f.result.env.store.Pool.QueryRow(f.result.env.ctx,
 		`SELECT id FROM approvals WHERE request_id=$1 AND approval_kind='workflow_step'`, f.step.ID).Scan(&approvalID); err != nil {
 		t.Fatal(err)
+	}
+	if err := f.result.env.store.DecideExactApproval(f.result.env.ctx, approvalID, "", "", "approved", "exact-operator"); err == nil {
+		t.Fatal("exact decision mutated legacy workflow approval")
 	}
 	if err := f.result.env.store.DecideApproval(f.result.env.ctx, approvalID, "approved", "workflow-reviewer"); err != nil {
 		t.Fatal(err)

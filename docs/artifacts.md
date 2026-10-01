@@ -31,6 +31,8 @@ Normal logs and notifications must never contain credentials, authorization head
 
 Artifact records are permanent and never deleted from the database. When an artifact reaches retention expiration (`expires_at <= statement_timestamp()`) and cleanup is executed, only the physical payload on the filesystem is deleted. The metadata row transitions to the tombstoned state (`content_deleted_at IS NOT NULL`).
 
+A frozen exact-action review temporarily protects each cited artifact while its exact approval is pending, unexpired, and not revoked. Cleanup skips those artifacts; the trusted evidence viewer may still read an expired cited artifact during that interval. Preparation and APPROVE verify access and the physical digest through the configured local store. APPROVE fails if any citation is unavailable or restricted; REJECT remains possible. Approval, rejection, expiry, or revocation ends the protection, and ordinary retention cleanup can then remove expired bytes. The frozen review hash does not change when current availability changes.
+
 This design preserves evidence lineage integrity:
 - `candidate_findings`, `asset_observations`, `change_items`, and audit event records can reference evidence artifact IDs indefinitely without risking foreign key violations or dangling IDs.
 - Downstream read models (such as execution projections) exclude expired and tombstoned artifacts from user-facing result sets, preventing access to purged payloads while leaving historical lineage verifiable in database audit logs.

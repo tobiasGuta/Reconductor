@@ -23,7 +23,7 @@ func TestLargeResultFoundationMigrationsAreOrderedAndClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) < 5 || versions[len(versions)-5] != "0018_large_result_publication_journal.sql" || versions[len(versions)-4] != "0019_large_result_recovery_foundation.sql" || versions[len(versions)-3] != "0020_prepared_evidence_ownership.sql" || versions[len(versions)-2] != "0021_provider_output_authority_ceiling.sql" || versions[len(versions)-1] != "0022_exact_launch_authority_foundation.sql" {
+	if len(versions) < 6 || versions[len(versions)-6] != "0018_large_result_publication_journal.sql" || versions[len(versions)-5] != "0019_large_result_recovery_foundation.sql" || versions[len(versions)-4] != "0020_prepared_evidence_ownership.sql" || versions[len(versions)-3] != "0021_provider_output_authority_ceiling.sql" || versions[len(versions)-2] != "0022_exact_launch_authority_foundation.sql" || versions[len(versions)-1] != "0023_exact_action_contract.sql" {
 		t.Fatalf("large-result migration order=%v", versions)
 	}
 

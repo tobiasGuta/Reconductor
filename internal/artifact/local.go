@@ -150,6 +150,24 @@ func (l *Local) OpenVerified(ctx context.Context, reference domain.ResultArtifac
 	return l.openAuthoritativeArtifact(ctx, reference)
 }
 
+// AcquireVerifiedEvidence obtains shared store authority before callers take
+// database lineage locks. The guard must remain open through their commit.
+func (l *Local) AcquireVerifiedEvidence(ctx context.Context) (VerifiedEvidenceGuard, error) {
+	if l == nil || !l.initialized {
+		return nil, fmt.Errorf("artifact store is not initialized")
+	}
+	guard, err := l.AcquirePublisher(ctx, l.identity)
+	if err != nil {
+		return nil, err
+	}
+	verified, ok := guard.(VerifiedEvidenceGuard)
+	if !ok {
+		_ = guard.Close()
+		return nil, fmt.Errorf("verified evidence authority is unavailable")
+	}
+	return verified, nil
+}
+
 type verifiedArtifactReader struct {
 	file           *os.File
 	limited        io.Reader
