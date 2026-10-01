@@ -86,6 +86,7 @@ func (s *Server) operatorGate(next http.Handler) http.Handler {
 			return
 		}
 		protected := r.URL.Path == "/api/v1/operator/check" ||
+			r.URL.Path == "/api/v1/exact-approvals" || strings.HasPrefix(r.URL.Path, "/api/v1/exact-approvals/") ||
 			(strings.HasPrefix(r.URL.Path, "/api/v1/") && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions)
 		if protected && s.operator == nil {
 			writeError(w, http.StatusServiceUnavailable, "operator mutations are not configured")

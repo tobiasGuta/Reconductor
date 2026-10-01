@@ -23,6 +23,7 @@
         <button class="nav-item" data-view="assets"><span class="nav-glyph">◇</span>Assets</button>
         <button class="nav-item" data-view="changes"><span class="nav-glyph">≠</span>Change inbox <span id="changes-nav-count" class="nav-count hidden">0</span></button>
         <button class="nav-item" data-view="findings"><span class="nav-glyph">△</span>Findings</button>
+        <button class="nav-item" data-view="exact-approvals"><span class="nav-glyph">◇</span>Exact approvals</button>
         <button class="nav-item" data-view="approvals"><span class="nav-glyph">✓</span>Approvals <span id="approval-nav-count" class="nav-count hidden">0</span></button>
         <button class="nav-item" data-view="queue"><span class="nav-glyph">≋</span>Failed jobs <span id="queue-nav-count" class="nav-count hidden">0</span></button>
         <button class="nav-item" data-view="logs"><span class="nav-glyph">›_</span>Provider logs</button>
@@ -151,6 +152,14 @@
         <section class="view" data-view-panel="findings" aria-labelledby="findings-title">
           <div class="page-heading"><div><p class="eyebrow">Evidence lifecycle</p><h1 id="findings-title">Findings</h1><p>Scanner candidates remain separate from independently verified findings.</p></div></div>
           <div class="finding-columns"><article class="panel"><div class="panel-heading"><div><p class="eyebrow">Unverified</p><h2>Candidate findings</h2></div><span id="candidate-count" class="count-pill">0</span></div><div id="candidate-list" class="stack-list compact"></div></article><article class="panel"><div class="panel-heading"><div><p class="eyebrow">Confirmed</p><h2>Verified findings</h2></div><span id="verified-count" class="count-pill">0</span></div><div id="verified-list" class="stack-list compact"></div></article></div>
+        </section>
+
+        <section class="view" data-view-panel="exact-approvals" aria-labelledby="exact-approvals-title">
+          <div class="page-heading"><div><p class="eyebrow">Frozen authorization</p><h1 id="exact-approvals-title">Exact approvals</h1><p>Review frozen proposals and record a decision. No request executes here.</p></div></div>
+          <div class="exact-review-grid">
+            <aside class="panel" aria-label="Exact approval reviews"><h2>Reviews</h2><p>Newest first, 100 per page. Refresh to obtain current state.</p><div id="exact-approval-list" class="stack-list compact" aria-live="polite"></div></aside>
+            <article id="exact-approval-detail" tabindex="-1" class="panel exact-review-detail" aria-live="polite"></article>
+          </div>
         </section>
 
         <section class="view" data-view-panel="approvals" aria-labelledby="approvals-title">

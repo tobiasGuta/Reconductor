@@ -45,3 +45,13 @@ Approving a paused step records the human decision. It does not silently resume 
 ## Current boundary
 
 This console makes existing local operation usable, including persistent scheduling and change review. It is not a remote authenticated console, role system, multi-operator system, high-availability scheduler, or distributed workflow coordinator.
+
+## Exact action reviews
+
+**Exact approvals** is a credential-protected view of frozen proposals, separate from the legacy workflow-step approval inbox. Reviews are listed newest first with cursor pagination (100 per page). Select a review to inspect its frozen method, explicit origin and port, literal request target, full action hash H, full review hash RH, and review context. Query ordering, repeated query keys, percent-encoding spelling, and trailing `?` are preserved. There are no editable request or review fields.
+
+Each citation shows its frozen role, artifact ID, SHA-256 and locator alongside **current availability**. Availability never changes the frozen review or RH. This console exposes no raw evidence download. Configure the existing `ARTIFACT_ROOT` and `ARTIFACT_STORE_ID` to let the console use the verified local artifact reader. If that reader is unavailable, cited evidence is unavailable and Allow Once remains blocked; uncited review and denial remain subject to the existing decision rules.
+
+**ALLOW ONCE** and **DENY** require confirmation and submit only the decision plus the full H/RH guards. The server supplies the configured actor and uses `DecideExactApproval`, including its current evidence and terminal-state checks. Both success and rejection trigger authoritative refetches. Approved, rejected, expired and revoked reviews are read-only. Expiry and revocation may make a still-recorded pending or approved decision inert; the lifecycle status and recorded decision are displayed separately.
+
+Allow Once records authorization only. It does not execute the request, create dispatch intent or a permit, invoke a provider, resume a scheduler, or send target traffic. Execution remains a separate future surface.

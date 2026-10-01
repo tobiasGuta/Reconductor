@@ -99,6 +99,9 @@ func newServer(store Store, workQueue Queue, operator *operatorBoundary, validat
 	s.mux.HandleFunc("GET /api/v1/operator/check", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	s.mux.HandleFunc("GET /api/v1/exact-approvals", s.exactApprovals)
+	s.mux.HandleFunc("GET /api/v1/exact-approvals/{id}", s.exactApprovalDetail)
+	s.mux.HandleFunc("POST /api/v1/exact-approvals/{id}/decision", s.decideExactApproval)
 	s.mux.HandleFunc("GET /api/v1/snapshot", s.snapshot)
 	s.mux.HandleFunc("GET /api/v1/scheduled-executions/{id}", s.executionDetail)
 	s.mux.HandleFunc("POST /api/v1/approvals/{id}/decision", s.decideApproval)

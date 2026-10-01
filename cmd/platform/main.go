@@ -307,6 +307,14 @@ func consoleCommand(ctx context.Context, cfg config.Config, args []string) error
 		return err
 	}
 	defer store.Close()
+	if cfg.ArtifactStorage.StoreID != "" {
+		reader, err := artifact.OpenLocal(ctx, cfg.ArtifactStorage.Root, domain.ID(cfg.ArtifactStorage.StoreID), store, redaction.New(cfg.Logging.SecretNames...))
+		if err == nil {
+			store.ConfigureExactReviewEvidenceReader(reader)
+		} else {
+			slog.Warn("console evidence reader unavailable; cited exact approvals remain blocked")
+		}
+	}
 	rdb := redisClient(cfg)
 	defer rdb.Close()
 	workQueue := queue.New(rdb, cfg.Worker.ConsumerGroup, cfg.Worker.ConsumerName, cfg.Worker.MaxRetries, cfg.Worker.RetryBase)

@@ -2198,3 +2198,240 @@ test("server-controlled strings remain text-only", async () => {
     assert.equal(source.includes(forbidden), false, `app.js must not contain ${forbidden}`);
   }
 });
+
+function exactReviewFixture(status = "pending") {
+  return {
+    approval_id: "exact-1", status, decision: status, decisionable: status === "pending", created_at: "2026-10-01T12:00:00Z", expires_at: "2026-10-02T12:00:00Z",
+    action_id: "action-1", program_id: "program-1", task_id: "task-1", workflow_run_id: "run-1", step_run_id: "step-1", step_attempt: 1, provider_attempt_id: "X-1", capability: "http.request", capability_revision: "v1", contract_version: "exact-action-contract/v1",
+    action_hash: "a".repeat(64), review_hash: "b".repeat(64), evidence_available: true,
+    request: { method: "GET", scheme: "https", host: "example.test", port: 443, request_target: "/item/%2f?id=2&id=1?", identity: "anonymous", headers: [], body: "none", max_requests: 1, redirects: false, retries: false },
+    review: { purpose: "compare <img src=x>", expected_positive_outcome: "positive", expected_negative_outcome: "negative", assumptions: ["frozen assumption"], missing_evidence: ["frozen unknown"], source_kind: "test", source_provider: "model", source_model: "revision",
+      citations: [{ role: "supporting", artifact_id: "support-1", frozen_sha256: "c".repeat(64), locator: "line 1", current_availability: "available" }, { role: "contradictory", artifact_id: "against-1", frozen_sha256: "d".repeat(64), locator: "line 2", current_availability: "available" }] },
+  };
+}
+function exactReviewDocument() {
+  const document = installDocument();
+  for (const id of ["exact-approval-list", "exact-approval-detail", "modal-eyebrow", "modal-title", "modal-description", "modal-details", "modal-cancel", "operator-credential-status"]) document.register(id);
+  app.state.view = "exact-approvals";
+  app.state.operatorCredential = "current-operator-token";
+  app.state.operatorVerificationGeneration++;
+  app.state.selectedProgram = "program-1";
+  app.state.exactApprovals = { items: [], nextCursor: "", id: "", detail: null, status: "ready", error: "", listGeneration: 0, detailGeneration: 0, decisionGeneration: 0, busy: false, modalOwner: false, returnFocus: null };
+  return document;
+}
+
+test("exact approval navigation uses a protected list and reads detail separately", async () => {
+  const document = exactReviewDocument();
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return response(200, url.includes("/exact-1") ? exactReviewFixture() : { items: [exactReviewFixture()], next_cursor: "" });
+  };
+  const markup = await readFile(new URL("./static/index.html", import.meta.url), "utf8");
+  assert.match(markup, /data-view="exact-approvals"/);
+  assert.match(markup, /data-view-panel="exact-approvals"/);
+  const nav = document.register("exact-test-nav", "nav-item");
+  nav.dataset.view = "exact-approvals";
+  const view = document.register("exact-test-view", "view");
+  view.dataset.viewPanel = "exact-approvals";
+  await app.showView("exact-approvals");
+  assert.equal(app.state.view, "exact-approvals");
+  assert.equal(nav.classList.contains("active"), true);
+  assert.equal(view.classList.contains("active"), true);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /exact-approvals\?program_id=program-1/);
+  assert.equal(calls[0].options.headers.Authorization, "Bearer current-operator-token");
+  assert.equal(calls[0].options.cache, "no-store");
+  const [review] = document.querySelector("#exact-approval-list").querySelectorAll("button:not([disabled])");
+  assert.match(review.textContent, /exact-1.*pending/);
+  await review.click();
+  assert.equal(calls[1].url, "/api/v1/exact-approvals/exact-1");
+  assert.equal(app.state.exactApprovals.detail.approval_id, "exact-1");
+});
+
+test("exact detail preserves raw target, full H/RH, roles and separate availability as text", () => {
+  const document = exactReviewDocument();
+  const detail = exactReviewFixture();
+  app.state.exactApprovals.detail = detail;
+  app.renderExactApprovals();
+  const text = document.querySelector("#exact-approval-detail").textContent;
+  for (const value of ["GET", "https://example.test:443", "/item/%2f?id=2&id=1?", detail.action_hash, detail.review_hash, "supporting evidence", "contradictory evidence", "Frozen SHA-256", "Current availability", "anonymous", "disabled", "none", detail.review.purpose]) assert.ok(text.includes(value), value);
+  assert.equal(document.createdElements.some((item) => item.tagName === "IMG" || item.tagName === "A" || item.tagName === "INPUT"), false);
+  assert.deepEqual(findButtons(document.querySelector("#exact-approval-detail"), "ALLOW ONCE").length, 1);
+  const hash = detail.review_hash;
+  detail.review.citations[0].current_availability = "restricted";
+  detail.evidence_available = false;
+  app.renderExactApprovals();
+  assert.equal(findButtons(document.querySelector("#exact-approval-detail"), "ALLOW ONCE")[0].disabled, true);
+  assert.equal(findButtons(document.querySelector("#exact-approval-detail"), "DENY")[0].disabled, false);
+  assert.equal(detail.review_hash, hash);
+  assert.match(document.querySelector("#exact-approval-detail").textContent, /restricted/);
+});
+
+for (const status of ["approved", "rejected", "expired", "revoked"]) {
+  test(`exact ${status} state is read-only`, () => {
+    const document = exactReviewDocument();
+    app.state.exactApprovals.detail = exactReviewFixture(status);
+    app.renderExactApprovals();
+    assert.equal(findButtons(document.querySelector("#exact-approval-detail"), "ALLOW ONCE").length, 0);
+    assert.equal(findButtons(document.querySelector("#exact-approval-detail"), "DENY").length, 0);
+    assert.match(document.querySelector("#exact-approval-detail").textContent, /read-only/);
+  });
+}
+
+for (const decision of ["approved", "rejected"]) {
+  test(`exact ${decision} requires confirmation and sends only intent plus H/RH before refetch`, async () => {
+    const document = exactReviewDocument();
+    const original = exactReviewFixture();
+    app.state.exactApprovals.id = "exact-1";
+    app.state.exactApprovals.detail = original;
+    app.renderExactApprovals();
+    const calls = [];
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url, options });
+      if (options?.method === "POST") return response(200, { message: "Authorization decision recorded. No request was executed." });
+      return response(200, url.includes("/exact-1") ? exactReviewFixture(decision) : { items: [exactReviewFixture(decision)], next_cursor: "" });
+    };
+    const label = decision === "approved" ? "ALLOW ONCE" : "DENY";
+    const [button] = findButtons(document.querySelector("#exact-approval-detail"), label);
+    await button.click();
+    assert.equal(calls.length, 0, "opening confirmation never sends a decision");
+    assert.equal(document.querySelector("#action-modal").classList.contains("hidden"), false);
+    assert.equal(document.activeElement, document.querySelector("#modal-cancel"), "Enter initially targets Cancel");
+    assert.match(document.querySelector("#modal-description").textContent, /does not execute/);
+    for (const [name, value] of app.exactRequestFacts(original)) assert.ok(document.querySelector("#modal-details").textContent.includes(String(value)), name);
+    await app.state.modalAction();
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0].url, "/api/v1/exact-approvals/exact-1/decision");
+    assert.equal(calls[0].options.headers.Authorization, "Bearer current-operator-token");
+    assert.deepEqual(JSON.parse(calls[0].options.body), { decision, action_hash: original.action_hash, review_hash: original.review_hash });
+    assert.match(calls[1].url, /^\/api\/v1\/exact-approvals\?/);
+    assert.equal(calls[2].url, "/api/v1/exact-approvals/exact-1");
+    assert.equal(app.state.exactApprovals.detail.status, decision);
+    assert.equal(app.state.exactApprovals.detail.decisionable, false);
+    assert.equal(calls.some(({ url }) => /dispatch|permit|https:\/\/example/.test(url)), false);
+  });
+}
+
+for (const reason of ["stale decision", "evidence unavailable", "network failure"]) {
+  test(`exact ${reason} refetches authoritative state and displays rejection`, async () => {
+    const document = exactReviewDocument();
+    app.state.exactApprovals.id = "exact-1";
+    app.state.exactApprovals.detail = exactReviewFixture();
+    const calls = [];
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url, options });
+      if (options?.method === "POST") {
+        if (reason === "network failure") throw new Error("offline");
+        return response(409, { message: reason });
+      }
+      const current = exactReviewFixture(reason === "stale decision" ? "rejected" : "pending");
+      if (reason === "evidence unavailable") { current.evidence_available = false; current.review.citations[0].current_availability = "unavailable"; }
+      return response(200, url.includes("/exact-1") ? current : { items: [current], next_cursor: "" });
+    };
+    await app.submitExactDecision("exact-1", "approved", "a".repeat(64), "b".repeat(64));
+    assert.equal(calls.length, 3);
+    assert.notEqual(app.state.exactApprovals.detail.status, "approved");
+    assert.ok(document.querySelector("#toast-region").textContent.includes(reason === "network failure" ? "could not" : reason));
+    if (reason === "evidence unavailable") assert.equal(findButtons(document.querySelector("#exact-approval-detail"), "ALLOW ONCE")[0].disabled, true);
+  });
+}
+
+test("exact sensitive response cannot restore detail after credential replacement", async () => {
+  const document = exactReviewDocument();
+  const late = deferred();
+  globalThis.fetch = () => late.promise;
+  const read = app.openExactApproval("exact-1");
+  globalThis.fetch = async () => response(200, { status: "ok" });
+  await app.verifyOperatorCredential("replacement-B");
+  late.resolve(response(200, exactReviewFixture()));
+  await read;
+  assert.equal(app.state.exactApprovals.detail, null);
+  assert.equal(app.state.operatorCredential, "replacement-B");
+  assert.equal(document.querySelector("#exact-approval-detail").textContent.includes("/item/"), false);
+});
+
+test("late exact mutation 401 cannot clear newer credential or display stale feedback", async () => {
+  const document = exactReviewDocument();
+  const late = deferred();
+  globalThis.fetch = () => late.promise;
+  const decision = app.submitExactDecision("exact-1", "approved", "a".repeat(64), "b".repeat(64));
+  globalThis.fetch = async () => response(200, { status: "ok" });
+  await app.verifyOperatorCredential("replacement-B");
+  late.resolve(response(401, { error: "old credential" }));
+  await decision;
+  assert.equal(app.state.operatorCredential, "replacement-B");
+  assert.equal(document.querySelector("#toast-region").textContent, "");
+});
+
+test("exact pagination fetches the server cursor and retains distinct items", async () => {
+  exactReviewDocument();
+  let call = 0;
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(url);
+    const item = exactReviewFixture();
+    if (++call === 2) item.approval_id = "exact-2";
+    return response(200, { items: [item], next_cursor: call === 1 ? "exact-1" : "" });
+  };
+  await app.refreshExactApprovals();
+  await app.refreshExactApprovals({ more: true });
+  assert.match(urls[1], /after=exact-1/);
+  assert.deepEqual(app.state.exactApprovals.items.map((item) => item.approval_id), ["exact-1", "exact-2"]);
+});
+
+test("late exact decision cannot close or enable a newer unrelated confirmation", async () => {
+  const document = exactReviewDocument();
+  const detail = exactReviewFixture();
+  app.state.exactApprovals.id = detail.approval_id;
+  app.state.exactApprovals.detail = detail;
+  const late = deferred();
+  globalThis.fetch = async (url, options) => options?.method === "POST" ? late.promise
+    : response(200, url.includes("/exact-1") ? exactReviewFixture("approved") : { items: [], next_cursor: "" });
+  app.confirmExactDecision(detail, "approved");
+  const pending = app.state.modalAction();
+  app.closeModal();
+  const newerAction = () => {};
+  app.openModal({ action: newerAction, eyebrow: "Other review", title: "Other confirmation", description: "Other action", confirmLabel: "Confirm", details: [] });
+  document.querySelector("#modal-confirm").disabled = true;
+  late.resolve(response(200, { message: "Recorded" }));
+  await pending;
+  assert.equal(document.querySelector("#action-modal").classList.contains("hidden"), false);
+  assert.equal(app.state.modalAction, newerAction);
+  assert.equal(document.querySelector("#modal-confirm").disabled, true);
+});
+
+test("program switch clears exact detail and makes the old decision continuation inert", async () => {
+  const document = exactReviewDocument();
+  const detail = exactReviewFixture();
+  app.state.exactApprovals.id = detail.approval_id;
+  app.state.exactApprovals.detail = detail;
+  const late = deferred();
+  let calls = 0;
+  globalThis.fetch = () => { calls++; return late.promise; };
+  app.confirmExactDecision(detail, "approved");
+  const pending = app.state.modalAction();
+  app.state.selectedProgram = "program-2";
+  app.state.exactApprovals.id = "";
+  app.clearExactReviews();
+  late.resolve(response(200, { message: "Old program decision" }));
+  await pending;
+  assert.equal(calls, 1, "obsolete continuation must not refetch over the new view");
+  assert.equal(app.state.exactApprovals.detail, null);
+  assert.equal(app.state.exactApprovals.busy, false);
+  assert.equal(document.querySelector("#toast-region").textContent, "");
+  assert.equal(document.querySelector("#exact-approval-detail").textContent.includes(detail.request.request_target), false);
+});
+
+for (const target of ["/item?id=1&id=2", "/item?id=2&id=1", "/item/%2F?id=1&id=1", "/item/%2f?", "/item?"]) {
+  test(`exact request target displays literally: ${target}`, () => {
+    const document = exactReviewDocument();
+    const detail = exactReviewFixture();
+    detail.request.request_target = target;
+    app.state.exactApprovals.detail = detail;
+    app.renderExactApprovals();
+    assert.ok(document.querySelector("#exact-approval-detail").textContent.includes(target));
+    app.confirmExactDecision(detail, "approved");
+    assert.ok(document.querySelector("#modal-details").textContent.includes(target));
+  });
+}

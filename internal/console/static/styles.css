@@ -419,3 +419,12 @@ input[type="search"] { width: 230px; padding: 0 12px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+.exact-review-grid { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(0, 2fr); gap: 20px; align-items: start; }
+.exact-review-grid > .panel { padding: 24px; min-width: 0; }
+.exact-review-item { text-align: left; overflow-wrap: anywhere; }
+.exact-review-detail h3 { margin-top: 28px; }
+.exact-review-detail h4 { margin: 18px 0 8px; }
+.exact-review-detail p, .exact-review-detail dd, #modal-details dd { white-space: pre-wrap; overflow-wrap: anywhere; }
+.exact-citation { margin: 16px 0; border-top: 1px solid var(--line); }
+@media (max-width: 900px) { .exact-review-grid { grid-template-columns: minmax(0, 1fr); } }
