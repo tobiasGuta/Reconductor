@@ -6,6 +6,50 @@ import (
 	"time"
 )
 
+func TestConsoleOperatorConfiguration(t *testing.T) {
+	tests := []struct {
+		name, token, actor string
+		valid              bool
+	}{
+		{"missing credential", "", "operator", false},
+		{"empty credential", "   ", "operator", false},
+		{"short credential", "guessable", "operator", false},
+		{"invalid bearer character", strings.Repeat("a", 32) + " ", "operator", false},
+		{"missing actor", strings.Repeat("a", 64), "", false},
+		{"blank actor", strings.Repeat("a", 64), " ", false},
+		{"actor control character", strings.Repeat("a", 64), "operator\nforged", false},
+		{"actor NUL", strings.Repeat("a", 64), "operator\x00forged", false},
+		{"actor bidirectional control", strings.Repeat("a", 64), "operator\u202eforged", false},
+		{"actor too long", strings.Repeat("a", 64), strings.Repeat("b", 81), false},
+		{"valid", strings.Repeat("a", 64), "local-operator", true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := LoadWith(func(key string) string {
+				switch key {
+				case "DATABASE_URL":
+					return "postgres://local/db"
+				case "CONSOLE_OPERATOR_TOKEN":
+					return test.token
+				case "CONSOLE_OPERATOR_ACTOR":
+					return test.actor
+				default:
+					return ""
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Console.Validate() == nil; got != test.valid {
+				t.Fatalf("console validation succeeded=%v, want=%v", got, test.valid)
+			}
+			if strings.Contains(cfg.String(), test.token) && test.token != "" {
+				t.Fatal("configuration summary leaked console credential")
+			}
+		})
+	}
+}
+
 func TestLoadAndSecretSafeString(t *testing.T) {
 	env := map[string]string{"DATABASE_URL": "postgres://user:secret@localhost/db", "REDIS_ADDR": "localhost:6379", "REDIS_PASSWORD": "redis-secret", "SCOPE_ROOT": `D:\Reconductor`, "NUCLEI_RATE_LIMIT": "17", "HTTPX_EXECUTABLE": `C:\tools\projectdiscovery\httpx.exe`}
 	c, err := LoadWith(func(k string) string { return env[k] })

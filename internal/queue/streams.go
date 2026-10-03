@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +13,34 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/scope"
 )
+
+const pumpRetriesScript = `
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+local moved = 0
+for _, raw in ipairs(due) do
+  if redis.call('ZREM', KEYS[1], raw) == 1 then
+    local ok, job = pcall(cjson.decode, raw)
+    if ok and type(job) == 'table' and job['id'] and type(job['action']) == 'table' then
+      local idempotency = job['action']['idempotency_key'] or ''
+      redis.call('XADD', KEYS[2], '*', 'payload', raw, 'job_id', job['id'], 'idempotency_key', idempotency)
+      moved = moved + 1
+    end
+  end
+end
+return moved
+`
+
+const touchLeaseScript = `
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)
+if #pending ~= 1 or pending[1][1] ~= ARGV[2] or pending[1][2] ~= ARGV[3] then
+  return 0
+end
+local claimed = redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[3], 0, ARGV[2], 'JUSTID')
+if #claimed == 1 and claimed[1] == ARGV[2] then
+  return 1
+end
+return 0
+`
 
 const (
 	JobsStream       = "platform.capability.jobs"
@@ -110,23 +137,51 @@ func (s *Streams) ClaimStale(ctx context.Context, minIdle time.Duration, count i
 	return decode([]redis.XStream{{Stream: s.names.Jobs, Messages: messages}})
 }
 func (s *Streams) Touch(ctx context.Context, messageID string) error {
-	_, err := s.client.XClaim(ctx, &redis.XClaimArgs{Stream: s.names.Jobs, Group: s.group, Consumer: s.consumer, MinIdle: 0, Messages: []string{messageID}}).Result()
-	return err
+	refreshed, err := s.client.Eval(ctx, touchLeaseScript, []string{s.names.Jobs}, s.group, messageID, s.consumer).Int()
+	if err != nil {
+		return err
+	}
+	if refreshed != 1 {
+		return fmt.Errorf("queue delivery %s lease could not be refreshed", messageID)
+	}
+	return nil
 }
-func (s *Streams) Ack(ctx context.Context, messageID string, result domain.ActionResult) error {
+func (s *Streams) Ack(ctx context.Context, messageID string, result any) error {
+	requestID := domain.ID("")
+	switch value := result.(type) {
+	case domain.ResultEnvelopeV1:
+		if err := value.Validate(); err != nil {
+			return err
+		}
+		requestID = value.ActionRequestID
+	case domain.QueueResultV1:
+		if value.Version != "queue-result/v1" || (value.Status != "succeeded" && value.Status != "failed" && value.Status != "retryable" && value.Status != "cancelled") {
+			return fmt.Errorf("invalid bounded queue result")
+		}
+		if _, err := domain.ParseID(string(value.ActionRequestID)); err != nil {
+			return fmt.Errorf("invalid bounded queue result")
+		}
+		if err := domain.ValidateUTF8Bytes("queue result summary", value.Summary, domain.SafeMessageMaxBytes); err != nil {
+			return fmt.Errorf("invalid bounded queue result")
+		}
+		requestID = value.ActionRequestID
+	default:
+		return fmt.Errorf("queue acknowledgement requires a bounded result envelope or projection")
+	}
 	b, err := json.Marshal(result)
 	if err != nil {
 		return err
 	}
 	pipe := s.client.TxPipeline()
-	pipe.XAdd(ctx, &redis.XAddArgs{Stream: s.names.Results, Values: map[string]any{"payload": string(b), "request_id": string(result.RequestID)}})
+	pipe.XAdd(ctx, &redis.XAddArgs{Stream: s.names.Results, Values: map[string]any{"payload": string(b), "request_id": string(requestID)}})
 	pipe.XAck(ctx, s.names.Jobs, s.group, messageID)
 	pipe.XDel(ctx, s.names.Jobs, messageID)
-	pipe.XAdd(ctx, &redis.XAddArgs{Stream: s.names.Events, Values: map[string]any{"event": "job_completed", "request_id": string(result.RequestID), "message_id": messageID}})
+	pipe.XAdd(ctx, &redis.XAddArgs{Stream: s.names.Events, Values: map[string]any{"event": "job_completed", "request_id": string(requestID), "message_id": messageID}})
 	_, err = pipe.Exec(ctx)
 	return err
 }
 func (s *Streams) Fail(ctx context.Context, messageID string, j Job, classified string, retryable bool) error {
+	classified = domain.BoundUTF8(classified, domain.SafeMessageMaxBytes)
 	j.Attempt++
 	if retryable && j.Attempt <= s.maxRetries {
 		delay := s.retryBase * time.Duration(1<<min(j.Attempt-1, 10))
@@ -156,27 +211,10 @@ func (s *Streams) Fail(ctx context.Context, messageID string, j Job, classified 
 	return err
 }
 func (s *Streams) PumpRetries(ctx context.Context, limit int64) (int, error) {
-	items, err := s.client.ZRangeByScore(ctx, s.names.Retry, &redis.ZRangeBy{Min: "-inf", Max: strconv.FormatInt(time.Now().UnixMilli(), 10), Offset: 0, Count: limit}).Result()
-	if err != nil {
-		return 0, err
+	if limit < 1 {
+		return 0, nil
 	}
-	moved := 0
-	for _, raw := range items {
-		var j Job
-		if json.Unmarshal([]byte(raw), &j) != nil {
-			_ = s.client.ZRem(ctx, s.names.Retry, raw).Err()
-			continue
-		}
-		b, _ := json.Marshal(j)
-		pipe := s.client.TxPipeline()
-		pipe.XAdd(ctx, &redis.XAddArgs{Stream: s.names.Jobs, Values: map[string]any{"payload": string(b), "job_id": string(j.ID), "idempotency_key": j.Action.IdempotencyKey}})
-		pipe.ZRem(ctx, s.names.Retry, raw)
-		if _, err := pipe.Exec(ctx); err != nil {
-			return moved, err
-		}
-		moved++
-	}
-	return moved, nil
+	return s.client.Eval(ctx, pumpRetriesScript, []string{s.names.Retry, s.names.Jobs}, time.Now().UnixMilli(), limit).Int()
 }
 func (s *Streams) Pending(ctx context.Context) (*redis.XPending, error) {
 	return s.client.XPending(ctx, s.names.Jobs, s.group).Result()

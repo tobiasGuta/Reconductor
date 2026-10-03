@@ -2,6 +2,7 @@ package migrations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/tobiasGuta/Reconductor/internal/domain"
 )
 
 func TestLargeResultFoundationMigrationsAreOrderedAndClosed(t *testing.T) {
@@ -20,7 +23,7 @@ func TestLargeResultFoundationMigrationsAreOrderedAndClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) < 2 || versions[len(versions)-2] != "0018_large_result_publication_journal.sql" || versions[len(versions)-1] != "0019_large_result_recovery_foundation.sql" {
+	if len(versions) < 6 || versions[len(versions)-6] != "0018_large_result_publication_journal.sql" || versions[len(versions)-5] != "0019_large_result_recovery_foundation.sql" || versions[len(versions)-4] != "0020_prepared_evidence_ownership.sql" || versions[len(versions)-3] != "0021_provider_output_authority_ceiling.sql" || versions[len(versions)-2] != "0022_exact_launch_authority_foundation.sql" || versions[len(versions)-1] != "0023_exact_action_contract.sql" {
 		t.Fatalf("large-result migration order=%v", versions)
 	}
 
@@ -94,6 +97,160 @@ func TestLargeResultFoundationMigrationsAreOrderedAndClosed(t *testing.T) {
 		if strings.Contains(recovery, futureID) {
 			t.Fatalf("preallocated future identity received a premature foreign key: %q", futureID)
 		}
+	}
+	preparedBody, err := files.ReadFile("sql/0020_prepared_evidence_ownership.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := strings.ToLower(string(preparedBody))
+	for _, required := range []string{
+		"create table artifact_store_prepared_limits",
+		"create table prepared_evidence_sets",
+		"'allocated','sealed','resolved_adopted','resolved_abandoned','quarantined','cleaned'",
+		"prepared_evidence_sets_owner_shape_ck",
+		"prepared_evidence_sets_state_shape_ck",
+		"prepared_evidence_sets_manifest_key_ck",
+		"enforce_prepared_evidence_set_transition",
+		"old.lifecycle_state in ('resolved_adopted','resolved_abandoned') and new.lifecycle_state='cleaned'",
+	} {
+		if !strings.Contains(prepared, required) {
+			t.Fatalf("0020 missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"create table prepared_evidence_members", "insert into prepared_evidence_sets", "update artifact_publications"} {
+		if strings.Contains(prepared, forbidden) {
+			t.Fatalf("0020 contains prohibited historical/member mutation %q", forbidden)
+		}
+	}
+
+	ceilingBody, err := files.ReadFile("sql/0021_provider_output_authority_ceiling.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ceiling := strings.ToLower(string(ceilingBody))
+	limit := strconv.FormatInt(domain.PreparedSetOutputAuthorityMaxBytes, 10)
+	for _, required := range []string{
+		"lock table artifact_store_prepared_limits in access exclusive mode",
+		"where max_set_bytes > " + limit,
+		"check (max_set_bytes between 1 and " + limit + ")",
+		"platform artifact-store prepared-limits-remediate-0021 --max-set-bytes 8388608 --confirm-artifact-runtimes-stopped",
+		"oversized legacy prepared evidence remains",
+		"execution or publication state is active",
+	} {
+		if !strings.Contains(ceiling, required) {
+			t.Fatalf("0021 missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"update artifact_store_prepared_limits", "delete from artifact_store_prepared_limits", "max_unresolved_bytes between 1 and " + limit} {
+		if strings.Contains(ceiling, forbidden) {
+			t.Fatalf("0021 contains prohibited configuration rewrite/aggregate ceiling %q", forbidden)
+		}
+	}
+}
+
+func TestProviderOutputAuthorityCeilingMigration(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.Close)
+	schema := "migration_output_ceiling_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	identifier := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP SCHEMA "+identifier+" CASCADE"); err != nil {
+			t.Errorf("drop migration test schema: %v", err)
+		}
+	})
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	pool, err := pgxpool.New(ctx, parsed.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	applyEmbeddedMigrationsThrough(t, ctx, pool, 20)
+
+	const (
+		compatibleStore = "00000000-0000-4000-8000-000000021001"
+		compatibleNonce = "00000000-0000-4000-8000-000000021002"
+		oversizedStore  = "00000000-0000-4000-8000-000000021003"
+		oversizedNonce  = "00000000-0000-4000-8000-000000021004"
+	)
+	if _, err := pool.Exec(ctx, `INSERT INTO artifact_stores(id,incarnation_nonce,backend_kind,marker_format,marker_version) VALUES
+		($1,$2,'local-v1','reconductor-artifact-store',1),($3,$4,'local-v1','reconductor-artifact-store',1)`, compatibleStore, compatibleNonce, oversizedStore, oversizedNonce); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO artifact_store_prepared_limits(artifact_store_id,max_open_sets,max_set_bytes,max_unresolved_bytes) VALUES
+		($1,128,$2,$3),($4,128,$5,$6)`,
+		compatibleStore, int64(1<<20), int64(128<<20),
+		oversizedStore, domain.PreparedSetOutputAuthorityMaxBytes+1, int64(128<<20)); err != nil {
+		t.Fatal(err)
+	}
+
+	err = Up(ctx, pool)
+	if err == nil || !strings.Contains(err.Error(), "contains max_set_bytes above 8388608 bytes") {
+		t.Fatalf("oversized migration error=%v", err)
+	}
+	var appliedCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations WHERE version=21`).Scan(&appliedCount); err != nil || appliedCount != 0 {
+		t.Fatalf("rolled-back migration count=%d error=%v", appliedCount, err)
+	}
+	var storedOversized int64
+	if err := pool.QueryRow(ctx, `SELECT max_set_bytes FROM artifact_store_prepared_limits WHERE artifact_store_id=$1`, oversizedStore).Scan(&storedOversized); err != nil || storedOversized != domain.PreparedSetOutputAuthorityMaxBytes+1 {
+		t.Fatalf("oversized configuration changed to %d error=%v", storedOversized, err)
+	}
+	var oldConstraint string
+	if err := pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='artifact_store_prepared_limits_set_ck' AND conrelid='artifact_store_prepared_limits'::regclass`).Scan(&oldConstraint); err != nil || !strings.Contains(oldConstraint, "1099511627776") {
+		t.Fatalf("old constraint=%q error=%v", oldConstraint, err)
+	}
+
+	if _, err := RemediateProviderOutputAuthority0021(ctx, pool, domain.ID(oversizedStore), domain.PreparedSetOutputAuthorityMaxBytes+1); err == nil || !strings.Contains(err.Error(), "must be between") {
+		t.Fatalf("plus-one remediation error=%v", err)
+	}
+	if _, err := RemediateProviderOutputAuthority0021(ctx, pool, "00000000-0000-4000-8000-000000021099", domain.PreparedSetOutputAuthorityMaxBytes); err == nil || !strings.Contains(err.Error(), "existing prepared-limit configuration") {
+		t.Fatalf("missing-store remediation error=%v", err)
+	}
+	result, err := RemediateProviderOutputAuthority0021(ctx, pool, domain.ID(oversizedStore), domain.PreparedSetOutputAuthorityMaxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PreviousMaxSetBytes != domain.PreparedSetOutputAuthorityMaxBytes+1 || result.MaxSetBytes != domain.PreparedSetOutputAuthorityMaxBytes || result.MaxOpenSets != 128 || result.MaxUnresolvedBytes != 128<<20 || result.SchemaFrontierVersion != 20 {
+		t.Fatalf("remediation result=%+v", result)
+	}
+	if err := RequireCurrent(ctx, pool); err == nil || !errors.Is(err, ErrSchemaNotCurrent) {
+		t.Fatalf("execution became ready before migration retry: %v", err)
+	}
+	if err := Up(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := RequireCurrent(ctx, pool); err != nil {
+		t.Fatalf("current-schema readiness after retry: %v", err)
+	}
+	if _, err := RemediateProviderOutputAuthority0021(ctx, pool, domain.ID(oversizedStore), domain.PreparedSetOutputAuthorityMaxBytes); err == nil || !strings.Contains(err.Error(), "requires exact schema frontier 20") {
+		t.Fatalf("current-schema remediation error=%v", err)
+	}
+	var compatibleValue int64
+	if err := pool.QueryRow(ctx, `SELECT max_set_bytes FROM artifact_store_prepared_limits WHERE artifact_store_id=$1`, compatibleStore).Scan(&compatibleValue); err != nil || compatibleValue != 1<<20 {
+		t.Fatalf("compatible configuration=%d error=%v", compatibleValue, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE artifact_store_prepared_limits SET max_set_bytes=$2 WHERE artifact_store_id=$1`, oversizedStore, domain.PreparedSetOutputAuthorityMaxBytes+1); err == nil || !strings.Contains(err.Error(), "artifact_store_prepared_limits_set_ck") {
+		t.Fatalf("ceiling constraint error=%v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE artifact_store_prepared_limits SET max_unresolved_bytes=$2 WHERE artifact_store_id=$1`, oversizedStore, int64(1<<50)); err != nil {
+		t.Fatalf("aggregate unresolved capacity was reduced: %v", err)
 	}
 }
 

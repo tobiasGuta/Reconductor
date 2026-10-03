@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/doctor"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/execution"
 	"github.com/tobiasGuta/Reconductor/internal/orchestration"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/providers"
@@ -120,7 +123,7 @@ func artifactStoreCommand(ctx context.Context, cfg config.Config, args []string)
 
 func artifactStoreCommandWithCleanup(ctx context.Context, cfg config.Config, args []string, cleanup func(context.Context, config.Config, domain.ID, int) (artifact.CleanupResult, error)) error {
 	if len(args) == 0 {
-		return fmt.Errorf("artifact-store requires init or cleanup")
+		return fmt.Errorf("artifact-store requires init, cleanup, prepared-limits, prepared-limits-remediate-0021, or prepared-recover")
 	}
 	switch args[0] {
 	case "init":
@@ -170,8 +173,101 @@ func artifactStoreCommandWithCleanup(ctx context.Context, cfg config.Config, arg
 		}
 		return printJSON(result)
 
+	case "prepared-limits":
+		fs := flag.NewFlagSet("artifact-store prepared-limits", flag.ContinueOnError)
+		maxOpen := fs.Int("max-open-sets", 0, "maximum unresolved prepared sets")
+		maxSet := fs.Int64("max-set-bytes", 0, "pessimistic bytes reserved for one prepared set")
+		maxUnresolved := fs.Int64("max-unresolved-bytes", 0, "maximum unresolved prepared bytes")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return fmt.Errorf("artifact-store prepared-limits accepts no positional arguments")
+		}
+		storeID, err := cfg.ArtifactStorage.RequiredStoreID()
+		if err != nil {
+			return err
+		}
+		store, err := readyStore(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		if err := store.RequireCurrentSchema(ctx); err != nil {
+			return err
+		}
+		if err := store.ConfigurePreparedEvidenceLimits(ctx, storeID, *maxOpen, *maxSet, *maxUnresolved); err != nil {
+			return err
+		}
+		return printJSON(map[string]any{"store_id": storeID, "max_open_sets": *maxOpen, "max_set_bytes": *maxSet, "max_unresolved_bytes": *maxUnresolved, "status": "configured"})
+
+	case "prepared-limits-remediate-0021":
+		fs := flag.NewFlagSet("artifact-store prepared-limits-remediate-0021", flag.ContinueOnError)
+		maxSet := fs.Int64("max-set-bytes", 0, "explicit corrected per-set authority at or below 8388608 bytes")
+		confirmedStopped := fs.Bool("confirm-artifact-runtimes-stopped", false, "confirm that workers, schedulers, and direct workflow processes are stopped")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return fmt.Errorf("artifact-store prepared-limits-remediate-0021 accepts no positional arguments")
+		}
+		if !*confirmedStopped {
+			return fmt.Errorf("artifact-store prepared-limits-remediate-0021 requires --confirm-artifact-runtimes-stopped after stopping artifact-producing runtimes")
+		}
+		if *maxSet < 1 || *maxSet > domain.PreparedSetOutputAuthorityMaxBytes {
+			return fmt.Errorf("max-set-bytes must be between 1 and %d", domain.PreparedSetOutputAuthorityMaxBytes)
+		}
+		storeID, err := cfg.ArtifactStorage.RequiredStoreID()
+		if err != nil {
+			return err
+		}
+		store, err := database.Open(ctx, cfg.Database.URL)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		result, err := store.RemediateProviderOutputAuthority0021(ctx, storeID, *maxSet)
+		if err != nil {
+			return err
+		}
+		return printJSON(map[string]any{"store_id": result.ArtifactStoreID, "previous_max_set_bytes": result.PreviousMaxSetBytes, "max_set_bytes": result.MaxSetBytes, "max_open_sets": result.MaxOpenSets, "max_unresolved_bytes": result.MaxUnresolvedBytes, "schema_frontier_version": result.SchemaFrontierVersion, "status": "migration_0021_remediated"})
+
+	case "prepared-recover":
+		fs := flag.NewFlagSet("artifact-store prepared-recover", flag.ContinueOnError)
+		batchSize := fs.Int("batch-size", 100, "maximum prepared sets to reconcile or clean (1..1000)")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 || *batchSize < 1 || *batchSize > 1000 {
+			return fmt.Errorf("artifact-store prepared-recover requires batch-size between 1 and 1000 and accepts no positional arguments")
+		}
+		storeID, err := cfg.ArtifactStorage.RequiredStoreID()
+		if err != nil {
+			return err
+		}
+		store, err := readyStore(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		if err := store.RequireCurrentSchema(ctx); err != nil {
+			return err
+		}
+		localStore, err := artifact.OpenLocal(ctx, cfg.ArtifactStorage.Root, storeID, store, nil)
+		if err != nil {
+			return err
+		}
+		if err := (execution.Service{Store: store, Artifacts: localStore}).RecoverPreparedEvidence(ctx, *batchSize); err != nil {
+			return err
+		}
+		prepared, err := store.PreparedEvidenceStatus(ctx, storeID)
+		if err != nil {
+			return err
+		}
+		return printJSON(map[string]any{"store_id": storeID, "batch_size": *batchSize, "status": "reconciled", "open_sets": prepared.OpenSets, "max_open_sets": prepared.MaxOpenSets, "unresolved_bytes": prepared.UnresolvedBytes, "max_unresolved_bytes": prepared.MaxUnresolvedBytes, "max_set_bytes": prepared.MaxSetBytes})
+
 	default:
-		return fmt.Errorf("artifact-store requires init or cleanup")
+		return fmt.Errorf("artifact-store requires init, cleanup, prepared-limits, prepared-limits-remediate-0021, or prepared-recover")
 	}
 }
 
@@ -203,11 +299,22 @@ func consoleCommand(ctx context.Context, cfg config.Config, args []string) error
 	if err := requireLoopbackAddress(*listen); err != nil {
 		return err
 	}
+	if err := cfg.Console.Validate(); err != nil {
+		return err
+	}
 	store, err := readyStore(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	if cfg.ArtifactStorage.StoreID != "" {
+		reader, err := artifact.OpenLocal(ctx, cfg.ArtifactStorage.Root, domain.ID(cfg.ArtifactStorage.StoreID), store, redaction.New(cfg.Logging.SecretNames...))
+		if err == nil {
+			store.ConfigureExactReviewEvidenceReader(reader)
+		} else {
+			slog.Warn("console evidence reader unavailable; cited exact approvals remain blocked")
+		}
+	}
 	rdb := redisClient(cfg)
 	defer rdb.Close()
 	workQueue := queue.New(rdb, cfg.Worker.ConsumerGroup, cfg.Worker.ConsumerName, cfg.Worker.MaxRetries, cfg.Worker.RetryBase)
@@ -215,7 +322,11 @@ func consoleCommand(ctx context.Context, cfg config.Config, args []string) error
 		return fmt.Errorf("initialize console queue view: %w", err)
 	}
 	validator := &schedulecron.ScheduleValidator{Programs: store, Registry: providers.Registry(cfg), ScopeRoot: cfg.Scope.Root}
-	server := console.HTTPServer(*listen, console.New(store, workQueue, validator))
+	handler, err := console.NewOperator(store, workQueue, *listen, cfg.Console, validator)
+	if err != nil {
+		return err
+	}
+	server := console.HTTPServer(*listen, handler)
 	slog.Info("Reconductor operator console ready", "url", "http://"+*listen)
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
@@ -232,9 +343,12 @@ func requireLoopbackAddress(address string) error {
 	if strings.EqualFold(host, "localhost") {
 		return nil
 	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("console refuses non-loopback address %q because authentication is not configured", address)
+	ip, err := netip.ParseAddr(host)
+	if err == nil && ip.Is4In6() {
+		return errors.New("IPv4-mapped IPv6 console addresses are unsupported")
+	}
+	if err != nil || !ip.IsLoopback() || ip.Zone() != "" {
+		return fmt.Errorf("console refuses non-loopback address %q", address)
 	}
 	return nil
 }
@@ -414,6 +528,18 @@ type stringFlags []string
 
 func (s *stringFlags) String() string         { return strings.Join(*s, ",") }
 func (s *stringFlags) Set(value string) error { *s = append(*s, value); return nil }
+
+type positiveIntFlag struct{ value int }
+
+func (f *positiveIntFlag) String() string { return strconv.Itoa(f.value) }
+func (f *positiveIntFlag) Set(value string) error {
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 1 {
+		return fmt.Errorf("must be a positive integer")
+	}
+	f.value = n
+	return nil
+}
 
 func scopeCommand(ctx context.Context, cfg config.Config, args []string) error {
 	if len(args) == 0 {
@@ -641,6 +767,8 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 	resumeID := fs.String("resume", "", "workflow run UUID to resume")
 	approve := fs.Bool("approve-moderate", false, "explicitly approve the safe moderate Nuclei step for this run")
 	headless := fs.Bool("headless", cfg.Recon.Headless, "enable policy-approved Katana headless mode")
+	var maxStepAttempts positiveIntFlag
+	fs.Var(&maxStepAttempts, "max-step-attempts", "optional positive ceiling for workflow-authorized attempts per step")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -664,6 +792,10 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 	if err != nil {
 		return err
 	}
+	s.ConfigureExactReviewEvidenceReader(artifacts)
+	if _, err := s.RequirePreparedEvidenceReady(ctx, storeID); err != nil {
+		return fmt.Errorf("prepared evidence readiness: %w", err)
+	}
 	if *programID == "" && *resumeID != "" {
 		state, err := s.LoadWorkflowState(ctx, domain.ID(*resumeID))
 		if err != nil {
@@ -678,7 +810,7 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 	if *programID == "" {
 		return fmt.Errorf("--program-id is required")
 	}
-	req := orchestration.WorkflowRequest{ProgramID: domain.ID(*programID), WorkflowName: *workflowName, Objective: *objective, RequestedBy: "cli", ScopeReference: *scopePath, ManualDiscoveryRoots: manual, AcknowledgeScopeExpansion: *ackScopeExpansion, ResumeRunID: domain.ID(*resumeID), ExistingTaskID: domain.ID(*taskID), ApproveModerate: *approve, Headless: *headless}
+	req := orchestration.WorkflowRequest{ProgramID: domain.ID(*programID), WorkflowName: *workflowName, Objective: *objective, RequestedBy: "cli", ScopeReference: *scopePath, ManualDiscoveryRoots: manual, AcknowledgeScopeExpansion: *ackScopeExpansion, ResumeRunID: domain.ID(*resumeID), ExistingTaskID: domain.ID(*taskID), ApproveModerate: *approve, Headless: *headless, OperatorAttemptCeiling: maxStepAttempts.value}
 	result, err := (orchestration.Service{Config: cfg, Store: s, Registry: registry, Artifacts: artifacts}).Run(ctx, req)
 	_ = printJSON(result.State)
 	if errors.Is(err, orchestration.ErrScopeExpansion) {
@@ -710,6 +842,8 @@ func watchTaskControlsInterval(ctx context.Context, store taskReader, taskID dom
 				return
 			case domain.TaskPaused:
 				controls.Pause()
+			case domain.TaskRunning:
+				controls.Resume()
 			}
 		}
 	}
@@ -717,11 +851,14 @@ func watchTaskControlsInterval(ctx context.Context, store taskReader, taskID dom
 
 func runCommand(ctx context.Context, cfg config.Config, args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("run show|retry <run-id>")
+		return fmt.Errorf("run show|retry|evidence <run-id> [artifact-id]")
 	}
 	if args[0] == "retry" {
 		forward := append([]string{"--resume", args[1]}, args[2:]...)
 		return workflowRun(ctx, cfg, providers.Registry(cfg), forward)
+	}
+	if args[0] == "evidence" {
+		return runEvidenceCommand(ctx, cfg, args[1:])
 	}
 	s, err := readyStore(ctx, cfg)
 	if err != nil {

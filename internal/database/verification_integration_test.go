@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tobiasGuta/Reconductor/internal/canonicaljson"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
@@ -20,20 +21,6 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/providers"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
-
-type consoleProviderOutputCapability struct{}
-
-func (consoleProviderOutputCapability) Manifest() capability.Manifest {
-	return capability.Manifest{Name: "test.console-provider-output", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true, SupportedProviders: []string{"sentinel-provider"}}
-}
-
-func (consoleProviderOutputCapability) Validate(context.Context, capability.Request) error {
-	return nil
-}
-
-func (consoleProviderOutputCapability) Execute(_ context.Context, req capability.Request) (capability.Result, error) {
-	return capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "provider output persisted", Output: json.RawMessage(`{"marker":"PROVIDER_OUTPUT_SENTINEL"}`)}}, nil
-}
 
 func TestVerificationVerdictsPersistAndGatePromotion(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
@@ -283,9 +270,10 @@ func TestConsoleProjectionOmitsProviderDerivedPersistencePayloads(t *testing.T) 
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	task := createIntegrationTask(t, env.ctx, env.store, env.programID, env.definitionID, "console provider-derived projection")
 	definition, scopeVersionID := syntheticWorkflowDefinition(t, env.store, env.ctx, task.ID)
+	providerOutputInput := json.RawMessage(`{"changes":[],"endpoints":[],"candidate_matches":[],"target_plan_digest":"PROVIDER_OUTPUT_SENTINEL"}`)
 	reportInput := json.RawMessage(`{"changes":[],"endpoints":[],"candidate_matches":[],"target_plan_digest":"WORKFLOW_SUMMARY_SENTINEL"}`)
 	definition.Steps = []workflow.Step{
-		{ID: "provider-output", Capability: "test.console-provider-output", Provider: "sentinel-provider", Input: json.RawMessage(`{}`), Retry: workflow.RetryPolicy{MaxAttempts: 1}},
+		{ID: "provider-output", Capability: "report.changes", Provider: "platform", Input: providerOutputInput, Retry: workflow.RetryPolicy{MaxAttempts: 1}},
 		{ID: "report", Capability: "report.changes", Provider: "platform", DependsOn: []string{"provider-output"}, Input: reportInput, Retry: workflow.RetryPolicy{MaxAttempts: 1}},
 	}
 	cfg, err := config.LoadWith(func(key string) string {
@@ -298,14 +286,11 @@ func TestConsoleProjectionOmitsProviderDerivedPersistencePayloads(t *testing.T) 
 		t.Fatal(err)
 	}
 	registry := providers.Registry(cfg)
-	if err := registry.Register(consoleProviderOutputCapability{}); err != nil {
-		t.Fatal(err)
-	}
 	engine := workflow.Engine{
 		Registry:  registry,
 		Executor:  execution.Service{Registry: registry, Store: env.store, Artifacts: postgresWorkflowRetryArtifacts{}, ProgramID: env.programID},
 		Persister: WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: t.TempDir()}},
-		Policy:    policy.Policy{ID: "console-projection", AllowedCapabilities: []string{"test.console-provider-output", "report.changes"}},
+		Policy:    policy.Policy{ID: "console-projection", AllowedCapabilities: []string{"report.changes"}},
 		Scope:     integrationAllowScope{}, OriginalScopeVersionID: scopeVersionID,
 	}
 	state, err := engine.Run(env.ctx, definition, nil, task, nil)
@@ -317,25 +302,57 @@ func TestConsoleProjectionOmitsProviderDerivedPersistencePayloads(t *testing.T) 
 	}
 	if _, err := env.store.RecordPolicyDecision(env.ctx, capability.PolicyDecisionRecord{
 		ProgramID: env.programID,
-		Action:    domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: state.Run.ID, RequestedBy: "integration", Capability: "test.console-provider-output", StepAttempt: 1},
-		Provider:  "sentinel-provider", PolicyID: "console-projection", Phase: "execution",
+		Action:    domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: state.Run.ID, RequestedBy: "integration", Capability: "report.changes", StepAttempt: 1},
+		Provider:  "platform", PolicyID: "console-projection", Phase: "execution",
 		Evaluation: policy.Evaluation{Decision: policy.Allow, Reason: "AUDIT_DETAILS_SENTINEL"},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	var providerAuditRows, arbitraryAuditRows int
-	var storedSummary json.RawMessage
+	var providerStepRows, reportStepRows, arbitraryAuditRows int
+	var storedSummary, reportOutput json.RawMessage
 	if err := env.store.Pool.QueryRow(env.ctx, `SELECT summary FROM workflow_runs WHERE id=$1`, state.Run.ID).Scan(&storedSummary); err != nil {
 		t.Fatal(err)
 	}
-	if err := env.store.Pool.QueryRow(env.ctx, `SELECT count(*) FROM audit_events WHERE workflow_run_id=$1 AND event_type='tool_execution' AND details::text LIKE '%PROVIDER_OUTPUT_SENTINEL%'`, state.Run.ID).Scan(&providerAuditRows); err != nil {
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT count(*) FROM step_runs WHERE workflow_run_id=$1 AND output::text LIKE '%PROVIDER_OUTPUT_SENTINEL%'`, state.Run.ID).Scan(&providerStepRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT output FROM step_runs WHERE id=$1`, state.Steps["report"].Run.ID).Scan(&reportOutput); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT count(*) FROM step_runs WHERE workflow_run_id=$1 AND output::text LIKE '%WORKFLOW_SUMMARY_SENTINEL%'`, state.Run.ID).Scan(&reportStepRows); err != nil {
 		t.Fatal(err)
 	}
 	if err := env.store.Pool.QueryRow(env.ctx, `SELECT count(*) FROM audit_events WHERE workflow_run_id=$1 AND details::text LIKE '%AUDIT_DETAILS_SENTINEL%'`, state.Run.ID).Scan(&arbitraryAuditRows); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(storedSummary), "WORKFLOW_SUMMARY_SENTINEL") || providerAuditRows != 1 || arbitraryAuditRows != 1 {
-		t.Fatalf("persistence evidence summary=%s provider_audits=%d arbitrary_audits=%d", storedSummary, providerAuditRows, arbitraryAuditRows)
+	_, canonicalReportOutput, _, _, err := canonicaljson.ParseStrict(reportOutput)
+	if err != nil {
+		t.Fatalf("canonicalize persisted report envelope: %v", err)
+	}
+	reportEnvelope, err := domain.DecodeResultEnvelopeV1(canonicalReportOutput)
+	if err != nil {
+		t.Fatalf("decode persisted report envelope: %v", err)
+	}
+	var reference domain.ResultSummaryReferenceV1
+	if err := json.Unmarshal(storedSummary, &reference); err != nil {
+		t.Fatalf("decode persisted report summary reference: %v", err)
+	}
+	var semanticStepID domain.ID
+	var semanticType, semanticSHA256 string
+	var semanticSize int64
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT step_run_id,type,sha256,size FROM artifacts WHERE id=$1`, reference.SemanticArtifactID).Scan(&semanticStepID, &semanticType, &semanticSHA256, &semanticSize); err != nil {
+		t.Fatal(err)
+	}
+	if reference.Version != domain.ResultSummaryReferenceVersionV1 || reference.SourceStepRunID != state.Steps["report"].Run.ID || reference.ActionRequestID != reportEnvelope.ActionRequestID || reference.ResultOccurrenceID != reportEnvelope.ResultOccurrenceID || reference.SemanticArtifactID != reportEnvelope.SemanticOutput.ArtifactID || reference.SemanticSHA256 != reportEnvelope.SemanticOutput.ContentSHA256 || reference.SemanticSizeBytes != reportEnvelope.SemanticOutput.ContentSizeBytes || reference.SafeSummary != reportEnvelope.Summary || semanticStepID != state.Steps["report"].Run.ID || semanticType != "normalized-result" || semanticSHA256 != reference.SemanticSHA256 || semanticSize != reference.SemanticSizeBytes {
+		t.Fatalf("summary reference=%#v envelope=%#v semantic=%s/%s/%d/%s", reference, reportEnvelope, semanticStepID, semanticType, semanticSize, semanticSHA256)
+	}
+	for _, forbidden := range []string{"PROVIDER_OUTPUT_SENTINEL", "WORKFLOW_SUMMARY_SENTINEL", "AUDIT_DETAILS_SENTINEL", "storage_key"} {
+		if strings.Contains(string(storedSummary), forbidden) {
+			t.Fatalf("summary reference leaked %q: %s", forbidden, storedSummary)
+		}
+	}
+	if providerStepRows != 1 || reportStepRows != 1 || arbitraryAuditRows != 1 {
+		t.Fatalf("persistence evidence summary=%s provider_steps=%d report_steps=%d arbitrary_audits=%d", storedSummary, providerStepRows, reportStepRows, arbitraryAuditRows)
 	}
 
 	snapshot, err := env.store.ConsoleSnapshot(env.ctx, env.programID)

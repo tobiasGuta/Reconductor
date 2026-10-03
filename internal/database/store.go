@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -25,7 +27,29 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
-type Store struct{ Pool *pgxpool.Pool }
+type ExactReviewEvidenceReader interface {
+	OpenVerified(context.Context, domain.ResultArtifactRefV1) (io.ReadCloser, error)
+}
+
+type Store struct {
+	Pool                *pgxpool.Pool
+	exactReviewReaderMu sync.RWMutex
+	exactReviewReader   ExactReviewEvidenceReader
+}
+
+// ConfigureExactReviewEvidenceReader installs the existing verified artifact
+// reader. Cited exact reviews fail closed until a reader is configured.
+func (s *Store) ConfigureExactReviewEvidenceReader(reader ExactReviewEvidenceReader) {
+	s.exactReviewReaderMu.Lock()
+	defer s.exactReviewReaderMu.Unlock()
+	s.exactReviewReader = reader
+}
+
+func (s *Store) exactReviewEvidenceReader() ExactReviewEvidenceReader {
+	s.exactReviewReaderMu.RLock()
+	defer s.exactReviewReaderMu.RUnlock()
+	return s.exactReviewReader
+}
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
@@ -56,6 +80,10 @@ func (s *Store) CreateProgram(ctx context.Context, p domain.Program, snapshot do
 	}
 	defer tx.Rollback(ctx)
 	if _, err = tx.Exec(ctx, `INSERT INTO programs(id,name,platform,description,scope_reference,policy_reference,scope_digest,include_rule_digests,exclude_rule_digests,target_plan_digest,scope_plan_warnings,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, p.ID, p.Name, p.Platform, p.Description, p.ScopeReference, p.PolicyReference, p.ScopeDigest, p.IncludeRuleDigests, p.ExcludeRuleDigests, p.TargetPlanDigest, p.ScopePlanWarnings, p.CreatedAt, p.UpdatedAt); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO program_launch_authority(program_id,status,authority_epoch,updated_by,reason)
+		VALUES($1,'BLOCKED',0,'program-creator','launch material has not been published')`, p.ID); err != nil {
 		return err
 	}
 	if snapshot.ID == "" {
@@ -212,6 +240,17 @@ func (s *Store) CheckAndRecordScopeSnapshot(ctx context.Context, snapshot domain
 	if change.Acknowledged {
 		_, err = tx.Exec(ctx, `UPDATE programs SET scope_reference=$2,scope_digest=$3,include_rule_digests=$4,exclude_rule_digests=$5,target_plan_digest=$6,scope_plan_warnings=$7,updated_at=now() WHERE id=$1`, snapshot.ProgramID, snapshot.ScopeReference, snapshot.ScopeDigest, snapshot.IncludeRuleDigests, snapshot.ExcludeRuleDigests, snapshot.TargetPlanDigest, snapshot.PlanningWarnings)
 		if err != nil {
+			return change, err
+		}
+	} else {
+		// A pending expansion may also contain a tighter exclusion. The
+		// program row stays on its acknowledged scope, so explicitly block
+		// exact launch in the same snapshot transaction.
+		var lockedProgramID domain.ID
+		if err := tx.QueryRow(ctx, `SELECT id FROM programs WHERE id=$1 FOR UPDATE`, snapshot.ProgramID).Scan(&lockedProgramID); err != nil {
+			return change, err
+		}
+		if err := invalidateLaunchAuthorityTx(ctx, tx, snapshot.ProgramID, actor, "scope change awaits acknowledgement"); err != nil {
 			return change, err
 		}
 	}
@@ -582,7 +621,7 @@ type ApprovalListItem struct {
 }
 
 func (s *Store) ListApprovals(ctx context.Context) ([]ApprovalListItem, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id,request_id,task_id,action_request_id,requested_risk_level,reason,requested_at,decision,decided_by,decided_at,expires_at FROM approvals ORDER BY requested_at DESC`)
+	rows, err := s.Pool.Query(ctx, `SELECT id,request_id,task_id,action_request_id,requested_risk_level,reason,requested_at,decision,decided_by,decided_at,expires_at FROM approvals WHERE approval_kind='workflow_step' ORDER BY requested_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -677,13 +716,18 @@ func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, acto
 		return err
 	}
 	defer tx.Rollback(ctx)
+	return decideApprovalTx(ctx, tx, id, decision, actor)
+}
+
+func decideApprovalTx(ctx context.Context, tx pgx.Tx, id domain.ID, decision, actor string) error {
+	var err error
 	var stepID, workflowRunID, taskID, programID domain.ID
 	if err := tx.QueryRow(ctx, `SELECT a.request_id,sr.workflow_run_id,wr.task_id,t.program_id
 		FROM approvals a
 		JOIN step_runs sr ON sr.id=a.request_id
 		JOIN workflow_runs wr ON wr.id=sr.workflow_run_id
 		JOIN tasks t ON t.id=wr.task_id
-		WHERE a.id=$1`, id).Scan(&stepID, &workflowRunID, &taskID, &programID); err != nil {
+		WHERE a.id=$1 AND a.approval_kind='workflow_step'`, id).Scan(&stepID, &workflowRunID, &taskID, &programID); err != nil {
 		return err
 	}
 	var scheduledExecution domain.ScheduledExecution
@@ -694,10 +738,21 @@ func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, acto
 		if err != nil {
 			return err
 		}
+		// Serialize with allocation/adoption before touching approval or lineage.
+		if err := lockApprovalWorkflow(ctx, tx, workflowRunID); err != nil {
+			return err
+		}
 	}
-	tag, err := tx.Exec(ctx, `UPDATE approvals SET decision=$2,decided_by=$3,decided_at=now() WHERE id=$1 AND decision='pending'`, id, decision, actor)
+	tag, err := tx.Exec(ctx, `UPDATE approvals SET decision=$2,decided_by=$3,decided_at=now()
+		WHERE id=$1 AND approval_kind='workflow_step' AND decision='pending'`, id, decision, actor)
 	if err == nil && tag.RowsAffected() == 0 {
-		return fmt.Errorf("pending approval %s not found", id)
+		var existing string
+		if err := tx.QueryRow(ctx, `SELECT decision FROM approvals WHERE id=$1 AND approval_kind='workflow_step'`, id).Scan(&existing); err != nil {
+			return err
+		}
+		if decision != "rejected" || existing != decision {
+			return fmt.Errorf("pending approval %s not found", id)
+		}
 	}
 	if err != nil {
 		return err
@@ -706,10 +761,27 @@ func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, acto
 	if decision == "approved" {
 		eventType = "moderate_approval_accepted"
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,safe_message,details) VALUES($1,$2,'platform',$3,$4,$5,$6,$7,'moderate approval decided',$8)`, domain.NewID(), eventType, actor, taskID, programID, workflowRunID, stepID, mustJSON(map[string]string{"decision": decision})); err != nil {
-		return err
+	if tag.RowsAffected() == 1 {
+		if _, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,safe_message,details) VALUES($1,$2,'platform',$3,$4,$5,$6,$7,'moderate approval decided',$8)`, domain.NewID(), eventType, actor, taskID, programID, workflowRunID, stepID, mustJSON(map[string]string{"decision": decision})); err != nil {
+			return err
+		}
 	}
 	if decision == "rejected" {
+		pending, err := hasUnresolvedWorkflowPrepared(ctx, tx, workflowRunID)
+		if err != nil {
+			return err
+		}
+		if pending {
+			// The human decision commits; every execution-lineage field stays put.
+			return commitApprovalDecision(ctx, tx)
+		}
+		var status domain.StepStatus
+		if err := tx.QueryRow(ctx, `SELECT status FROM step_runs WHERE id=$1`, stepID).Scan(&status); err != nil {
+			return err
+		}
+		if status == domain.StepFailed {
+			return commitApprovalDecision(ctx, tx)
+		}
 		now := time.Now().UTC()
 		stepTag, updateErr := tx.Exec(ctx, `UPDATE step_runs
 			SET status='failed',
@@ -750,16 +822,16 @@ func (s *Store) DecideApproval(ctx context.Context, id domain.ID, decision, acto
 			}
 		}
 	}
-	return tx.Commit(ctx)
+	return commitApprovalDecision(ctx, tx)
 }
 func (s *Store) StepApproved(ctx context.Context, stepID domain.ID) (bool, error) {
 	var approved bool
-	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM approvals WHERE request_id=$1 AND decision='approved' AND (expires_at IS NULL OR expires_at>now()))`, stepID).Scan(&approved)
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM approvals WHERE request_id=$1 AND approval_kind='workflow_step' AND decision='approved' AND (expires_at IS NULL OR expires_at>now()))`, stepID).Scan(&approved)
 	return approved, err
 }
 func (s *Store) StepApprovalDecision(ctx context.Context, stepID domain.ID) (string, error) {
 	var decision string
-	err := s.Pool.QueryRow(ctx, `SELECT decision FROM approvals WHERE request_id=$1`, stepID).Scan(&decision)
+	err := s.Pool.QueryRow(ctx, `SELECT decision FROM approvals WHERE request_id=$1 AND approval_kind='workflow_step'`, stepID).Scan(&decision)
 	return decision, err
 }
 
@@ -1689,6 +1761,9 @@ func (s *Store) LoadEffectiveStepInput(ctx context.Context, programID domain.ID,
 }
 
 func (s *Store) PersistEffectiveStepInput(ctx context.Context, programID domain.ID, action domain.ActionRequest, proposed json.RawMessage) (json.RawMessage, error) {
+	if _, recovering := domain.PreparedRecoveryRequestFromContext(ctx); recovering {
+		return nil, fmt.Errorf("recovery admission cannot allocate attempts")
+	}
 	if action.StepAttempt < 1 || len(proposed) == 0 || !json.Valid(proposed) {
 		return nil, fmt.Errorf("%w: effective input or attempt is invalid", workflow.ErrEffectiveStepInputConflict)
 	}
@@ -1699,6 +1774,9 @@ func (s *Store) PersistEffectiveStepInput(ctx context.Context, programID domain.
 	defer tx.Rollback(ctx)
 	step := effectiveInputStep(action)
 	if _, err := lockResultLineage(ctx, tx, programID, step); err != nil {
+		return nil, err
+	}
+	if err := ensureNoUnresolvedPrepared(ctx, tx, action.StepRunID); err != nil {
 		return nil, err
 	}
 	var persisted json.RawMessage
@@ -1832,9 +1910,13 @@ func (s *Store) saveWorkflowState(ctx context.Context, state *workflow.State, li
 				decidedBy = "workflow-operator"
 				decidedAt = time.Now().UTC()
 			}
-			_, err = tx.Exec(ctx, `INSERT INTO approvals(id,request_id,task_id,action_request_id,requested_risk_level,reason,decision,decided_by,decided_at) VALUES($1,$2,$3,$2,'moderate',$4,$5,$6,$7) ON CONFLICT(request_id) DO UPDATE SET decision=CASE WHEN approvals.decision IN ('approved','rejected') THEN approvals.decision ELSE EXCLUDED.decision END,decided_by=COALESCE(approvals.decided_by,EXCLUDED.decided_by),decided_at=COALESCE(approvals.decided_at,EXCLUDED.decided_at)`, domain.NewID(), x.ID, state.Run.TaskID, "workflow step "+x.StepDefinitionID, decision, decidedBy, decidedAt)
+			tag, approvalErr := tx.Exec(ctx, `INSERT INTO approvals(id,request_id,task_id,action_request_id,requested_risk_level,reason,decision,decided_by,decided_at) VALUES($1,$2,$3,$2,'moderate',$4,$5,$6,$7) ON CONFLICT(request_id) DO UPDATE SET decision=CASE WHEN approvals.decision IN ('approved','rejected') THEN approvals.decision ELSE EXCLUDED.decision END,decided_by=COALESCE(approvals.decided_by,EXCLUDED.decided_by),decided_at=COALESCE(approvals.decided_at,EXCLUDED.decided_at) WHERE approvals.approval_kind='workflow_step'`, domain.NewID(), x.ID, state.Run.TaskID, "workflow step "+x.StepDefinitionID, decision, decidedBy, decidedAt)
+			err = approvalErr
 			if err != nil {
 				return err
+			}
+			if tag.RowsAffected() != 1 {
+				return fmt.Errorf("workflow approval conflicts with exact approval")
 			}
 			if x.ApprovalState == "pending" {
 				_, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,capability,safe_message,details) SELECT $1,'moderate_approval_requested','workflow','workflow',$2,t.program_id,$3,$4,$5,'moderate approval requested',$6 FROM tasks t WHERE t.id=$2`, domain.NewID(), state.Run.TaskID, state.Run.ID, x.ID, x.Capability, mustJSON(map[string]string{"step": x.StepDefinitionID}))

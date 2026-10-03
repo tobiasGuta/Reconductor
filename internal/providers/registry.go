@@ -18,7 +18,10 @@ func Registry(cfg config.Config) *capability.Registry {
 	r := capability.NewRegistry()
 	red := redaction.New(cfg.Logging.SecretNames...)
 	probes := providerSpecsByName(cfg)
-	subfinder := commandprovider.New(commandprovider.Definition{Name: "discover.subdomains", Description: "Discover candidate subdomains from passive roots", Provider: "subfinder", Executable: cfg.Tools.Subfinder, Version: "2", Risk: policy.Passive, ScopeType: "discovery-root", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, PassiveInput: true, OutputAdapter: "subfinder", Probe: probes["subfinder"], BuildArgs: subfinderArgs}, nil, red)
+	subfinder := commandprovider.New(commandprovider.Definition{Name: "discover.subdomains", Description: "Discover candidate subdomains from passive roots", Provider: "subfinder", Executable: cfg.Tools.Subfinder, Version: "2", Risk: policy.Passive, ScopeType: "discovery-root", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, PassiveInput: true, OutputAdapter: "subfinder", Probe: probes["subfinder"], BuildArgs: func(i commandprovider.Input, p policy.Policy) ([]string, error) {
+		args, err := subfinderArgs(i, p)
+		return providerUpdateArgs(args, cfg.Recon.ProviderUpdate), err
+	}}, nil, red)
 	chaos := commandprovider.New(commandprovider.Definition{Name: "discover.subdomains", Description: "Enrich candidate subdomains from ProjectDiscovery Chaos", Provider: "chaos", Executable: cfg.Tools.Chaos, Version: "2", Risk: policy.Passive, ScopeType: "discovery-root", RetrySafe: true, Idempotent: true, RequiredSecrets: []string{"CHAOS_KEY"}, Timeout: cfg.Recon.Timeout, PassiveInput: true, OutputAdapter: "chaos", Probe: probes["chaos"], BuildArgs: func(i commandprovider.Input, _ policy.Policy) ([]string, error) {
 		return chaosArgs(i, cfg.Recon.ChaosKey)
 	}}, nil, red)
@@ -30,19 +33,30 @@ func Registry(cfg config.Config) *capability.Registry {
 		panic(err)
 	}
 	defs := []commandprovider.Definition{
-		{Name: "resolve.dns", Description: "Resolve scope-authorized names", Provider: "dnsx", Executable: cfg.Tools.DNSx, Version: "3", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "dnsx", Probe: probes["dnsx"], BuildInvocation: dnsxInvocation},
-		{Name: "scan.ports", Description: "Discover scope-authorized network ports", Provider: "naabu", Executable: cfg.Tools.Naabu, Version: "2", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "naabu", Probe: probes["naabu"], BuildArgs: func(i commandprovider.Input, p policy.Policy) ([]string, error) { return naabuArgs(i, p, cfg.Recon) }},
+		{Name: "resolve.dns", Description: "Resolve scope-authorized names", Provider: "dnsx", Executable: cfg.Tools.DNSx, Version: "3", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "dnsx", Probe: probes["dnsx"], BuildInvocation: func(i commandprovider.Input, p policy.Policy) (commandprovider.Invocation, error) {
+			invocation, err := dnsxInvocation(i, p)
+			invocation.Args = providerUpdateArgs(invocation.Args, cfg.Recon.ProviderUpdate)
+			return invocation, err
+		}},
+		{Name: "scan.ports", Description: "Discover scope-authorized network ports", Provider: "naabu", Executable: cfg.Tools.Naabu, Version: "2", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "naabu", Probe: probes["naabu"], BuildArgs: func(i commandprovider.Input, p policy.Policy) ([]string, error) {
+			args, err := naabuArgs(i, p, cfg.Recon)
+			return providerUpdateArgs(args, cfg.Recon.ProviderUpdate), err
+		}},
 		{Name: "probe.http", Description: "Probe authorized HTTP services", Provider: "httpx", Executable: cfg.Tools.HTTPX, Version: "4", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "httpx", Probe: probes["httpx"], BuildInvocation: func(i commandprovider.Input, p policy.Policy) (commandprovider.Invocation, error) {
-			return httpxInvocation(i, p, cfg.Recon)
+			invocation, err := httpxInvocation(i, p, cfg.Recon)
+			invocation.Args = providerUpdateArgs(invocation.Args, cfg.Recon.ProviderUpdate)
+			return invocation, err
 		}},
 		{Name: "crawl.web", Description: "Crawl an authorized web target", Provider: "katana", Executable: cfg.Tools.Katana, Version: "2", Risk: policy.Low, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, OutputAdapter: "katana", Probe: probes["katana"], BuildArgs: func(i commandprovider.Input, p policy.Policy) ([]string, error) {
-			return katanaArgs(i, p, cfg.Recon)
+			args, err := katanaArgs(i, p, cfg.Recon)
+			return providerUpdateArgs(args, cfg.Recon.ProviderUpdate), err
 		}},
 		{Name: "discover.archive_urls", Description: "Discover passive archive URLs", Provider: "gau", Executable: cfg.Tools.GAU, Version: "2", Risk: policy.Passive, ScopeType: "discovery-root", RetrySafe: true, Idempotent: true, Timeout: cfg.Recon.Timeout, PassiveInput: true, OutputAdapter: "gau", Probe: probes["gau"], BuildArgs: func(i commandprovider.Input, _ policy.Policy) ([]string, error) {
 			return gauArgs(i)
 		}},
 		{Name: "scan.nuclei", Description: "Run a policy-constrained safe Nuclei profile", Provider: "nuclei", Executable: cfg.Tools.Nuclei, Version: "2", Risk: policy.Moderate, ScopeType: "url", RetrySafe: true, Idempotent: true, Timeout: cfg.Nuclei.Timeout, OutputAdapter: "nuclei", Probe: probes["nuclei"], BuildArgs: func(i commandprovider.Input, p policy.Policy) ([]string, error) {
-			return nucleiArgs(i, p, cfg.Nuclei)
+			args, err := nucleiArgs(i, p, cfg.Nuclei)
+			return providerUpdateArgs(args, cfg.Recon.ProviderUpdate), err
 		}},
 	}
 	for _, d := range defs {
@@ -56,6 +70,13 @@ func Registry(cfg config.Config) *capability.Registry {
 		}
 	}
 	return r
+}
+
+func providerUpdateArgs(args []string, enabled bool) []string {
+	if enabled || args == nil {
+		return args
+	}
+	return append(args, "-duc")
 }
 
 func subfinderArgs(i commandprovider.Input, _ policy.Policy) ([]string, error) {
@@ -93,7 +114,7 @@ func httpxInvocation(i commandprovider.Input, p policy.Policy, c config.Recon) (
 	if len(i.Targets) == 0 {
 		return commandprovider.Invocation{}, fmt.Errorf("targets are required")
 	}
-	args := []string{"-silent", "-json", "-status-code", "-content-type", "-location", "-tech-detect", "-threads", fmt.Sprint(bounded(c.Concurrency, p.Concurrency))}
+	args := []string{"-silent", "-json", "-nfs", "-status-code", "-content-type", "-location", "-tech-detect", "-threads", fmt.Sprint(bounded(c.Concurrency, p.Concurrency))}
 	if method := strings.ToUpper(strings.TrimSpace(i.Method)); method != "" {
 		args = append(args, "-x", method)
 	}

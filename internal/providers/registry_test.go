@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -244,6 +245,34 @@ func TestCompareAssetsStatusRouting(t *testing.T) {
 	}
 	if got, want := strings.Join(output.Scan, ","), "http://127.0.0.1:33000/,https://x.test/moved,https://x.test/login"; got != want {
 		t.Fatalf("scan_targets=%q want=%q", got, want)
+	}
+}
+
+func TestInternalProviderOverBudgetIsRejectedByRegistry(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := platformscope.Compile([]platformscope.Rule{{Protocol: `^http$`, Host: `^127\.0\.0\.1$`, Port: `^8080$`, File: `^/.*`, Enabled: true}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	urls := make([]string, 500)
+	for i := range urls {
+		urls[i] = fmt.Sprintf("http://127.0.0.1:8080/resource/%06d/%s", i, strings.Repeat("x", 64))
+	}
+	input, err := json.Marshal(TargetingPrepareInput{ExactURLs: urls, DiscoveredURLs: []string{}, Ports: []int{8080}, TargetPlanDigest: "internal-output-limit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executeProviderTest(Registry(cfg), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "targeting.prepare", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"targeting.prepare"}}, Scope: sc})
+	if err == nil || result.Action.Error == nil || result.Action.Error.Classification != "result_contract_limit" || result.Action.Error.Retryable || len(result.Action.Output) != 0 || result.OutputLimit == nil || result.OutputLimit.Limit != domain.ResultEnvelopeMaxBytes {
+		t.Fatalf("result=%#v error=%v input_bytes=%d", result, err, len(input))
 	}
 }
 
@@ -555,7 +584,7 @@ func TestAuditedProviderFlagMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := strings.Join(httpx.Args, " "), "-silent -json -status-code -content-type -location -tech-detect -threads 5"; got != want {
+	if got, want := strings.Join(httpx.Args, " "), "-silent -json -nfs -status-code -content-type -location -tech-detect -threads 5"; got != want {
 		t.Fatalf("httpx args=%q want=%q", got, want)
 	}
 	if got, want := string(httpx.Stdin), "https://app.example.test/path\n"; got != want {
@@ -567,6 +596,18 @@ func TestAuditedProviderFlagMatrix(t *testing.T) {
 	}
 	if got := strings.Join(invocation.Args, " "); got != "-silent" || string(invocation.Stdin) != "app.example.test\n" {
 		t.Fatalf("dnsx args=%q stdin=%q", got, invocation.Stdin)
+	}
+}
+
+func TestProviderUpdateArgs(t *testing.T) {
+	original := []string{"-silent"}
+	disabled := providerUpdateArgs(append([]string(nil), original...), false)
+	if got := strings.Join(disabled, " "); got != "-silent -duc" {
+		t.Fatalf("disabled provider updates args=%q", got)
+	}
+	enabled := providerUpdateArgs(append([]string(nil), original...), true)
+	if got := strings.Join(enabled, " "); got != "-silent" {
+		t.Fatalf("enabled provider updates args=%q", got)
 	}
 }
 
@@ -612,7 +653,7 @@ func TestHTTPXInvocationKeepsLargeTargetListsOffCommandLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := len(invocation.Args), 8; got != want {
+	if got, want := len(invocation.Args), 9; got != want {
 		t.Fatalf("args=%d want=%d", got, want)
 	}
 	if len(invocation.Stdin) == 0 {
@@ -627,6 +668,51 @@ func TestHTTPXInvocationRejectsEmptyTargets(t *testing.T) {
 	_, err := httpxInvocation(commandprovider.Input{}, policy.Policy{}, config.Recon{})
 	if err == nil || err.Error() != "targets are required" {
 		t.Fatalf("err=%v want=%q", err, "targets are required")
+	}
+}
+
+type unsupportedHTTPXOptionRunner struct {
+	args  []string
+	stdin []byte
+}
+
+func (r *unsupportedHTTPXOptionRunner) Run(_ context.Context, _ string, args []string, stdin []byte) ([]byte, []byte, int, error) {
+	r.args = append([]string(nil), args...)
+	r.stdin = append([]byte(nil), stdin...)
+	return nil, []byte("unknown flag: -nfs"), 2, errors.New("exit status 2")
+}
+
+func (*unsupportedHTTPXOptionRunner) Version(context.Context, string, []string) (string, error) {
+	return "httpx version 1.12.0", nil
+}
+
+func TestHTTPXUnsupportedNoFallbackSchemeFailsVisibly(t *testing.T) {
+	runner := &unsupportedHTTPXOptionRunner{}
+	provider := commandprovider.New(commandprovider.Definition{
+		Name: "probe.http", Provider: "httpx", Executable: "httpx", Version: "4", Risk: policy.Low, ScopeType: "url", OutputAdapter: "httpx",
+		BuildInvocation: func(input commandprovider.Input, pol policy.Policy) (commandprovider.Invocation, error) {
+			return httpxInvocation(input, pol, config.Recon{Concurrency: 1})
+		},
+	}, runner, nil)
+	registry := capability.NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	target := "http://127.0.0.1:8080/"
+	sc, err := platformscope.Compile([]platformscope.Rule{{Protocol: `^http$`, Host: `^127\.0\.0\.1$`, Port: `^8080$`, File: `^/.*`, Enabled: true}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := json.Marshal(commandprovider.Input{Targets: []string{target}, PlanDigest: "unsupported-option"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, executeErr := executeProviderTest(registry, capability.Request{ProgramID: domain.NewID(), Action: domain.ActionRequest{ID: domain.NewID(), TaskID: domain.NewID(), WorkflowRunID: domain.NewID(), StepRunID: domain.NewID(), RequestedBy: "test", Capability: "probe.http", Input: input, StepAttempt: 1}, Provider: "httpx", Policy: policy.Policy{AllowedCapabilities: []string{"probe.http"}, Concurrency: 1}, Scope: sc})
+	if executeErr == nil || result.Action.Status != "failed" || result.Action.Error == nil || result.Action.Error.Classification != "provider_error" || !strings.Contains(result.Action.Error.Message, "unknown flag: -nfs") {
+		t.Fatalf("result=%#v err=%v, want visible unsupported-option provider failure", result, executeErr)
+	}
+	if !slices.Contains(runner.args, "-nfs") || string(runner.stdin) != target+"\n" {
+		t.Fatalf("args=%v stdin=%q, want -nfs and exact target", runner.args, runner.stdin)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/execution"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
+	"github.com/tobiasGuta/Reconductor/internal/resultadmission"
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
@@ -44,6 +46,92 @@ func (c *workerCaptureCapability) Execute(_ context.Context, req capability.Requ
 	}, nil
 }
 
+func TestWorkerUsesMultiConfiguredDefaultProvider(t *testing.T) {
+	multi, err := capability.NewMulti("z-default", map[string]capability.Capability{
+		"a-alphabetical": workerProviderStub{name: "multi.worker"},
+		"z-default":      workerProviderStub{name: "multi.worker"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := capability.NewRegistry()
+	if err := registry.Register(multi); err != nil {
+		t.Fatal(err)
+	}
+	service := Service{Registry: registry}
+	job := queue.Job{Action: domain.ActionRequest{Capability: "multi.worker"}}
+	if provider := service.resolveProvider(job); provider != "z-default" {
+		t.Fatalf("omitted provider resolved to %q", provider)
+	}
+	job.Provider = "a-alphabetical"
+	if provider := service.resolveProvider(job); provider != "a-alphabetical" {
+		t.Fatalf("explicit provider resolved to %q", provider)
+	}
+}
+
+type leaseFailureQueue struct {
+	touches atomic.Int32
+	acks    atomic.Int32
+	fails   atomic.Int32
+}
+
+func (*leaseFailureQueue) EnsureGroup(context.Context) error { return nil }
+func (*leaseFailureQueue) PumpRetries(context.Context, int64) (int, error) {
+	return 0, nil
+}
+func (*leaseFailureQueue) ClaimStale(context.Context, time.Duration, int64) ([]queue.Delivery, error) {
+	return nil, nil
+}
+func (*leaseFailureQueue) Read(context.Context, time.Duration, int64) ([]queue.Delivery, error) {
+	return nil, nil
+}
+func (q *leaseFailureQueue) Touch(context.Context, string) error {
+	q.touches.Add(1)
+	return errors.New("synthetic lease refresh failure")
+}
+func (q *leaseFailureQueue) Ack(context.Context, string, any) error {
+	q.acks.Add(1)
+	return nil
+}
+func (q *leaseFailureQueue) Fail(context.Context, string, queue.Job, string, bool) error {
+	q.fails.Add(1)
+	return nil
+}
+
+type leaseBlockingStore struct{ *workerStore }
+
+func (*leaseBlockingStore) AlreadySucceeded(ctx context.Context, _ string) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func TestWorkerLeaseRefreshFailureCancelsWorkWithoutQueueFinalization(t *testing.T) {
+	workQueue := &leaseFailureQueue{}
+	service := Service{
+		Queue:        workQueue,
+		Results:      &leaseBlockingStore{workerStore: &workerStore{}},
+		LeaseTimeout: 3 * time.Millisecond,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	err := service.handle(context.Background(), queue.Delivery{MessageID: "lease-loss", Job: queue.Job{Action: domain.ActionRequest{IdempotencyKey: "lease-loss"}}})
+	if !errors.Is(err, ErrDeliveryLeaseLost) {
+		t.Fatalf("error=%v want delivery lease loss", err)
+	}
+	if workQueue.touches.Load() != 1 || workQueue.acks.Load() != 0 || workQueue.fails.Load() != 0 {
+		t.Fatalf("touches=%d acks=%d fails=%d", workQueue.touches.Load(), workQueue.acks.Load(), workQueue.fails.Load())
+	}
+}
+
+type workerProviderStub struct{ name string }
+
+func (c workerProviderStub) Manifest() capability.Manifest {
+	return capability.Manifest{Name: c.name, Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true}
+}
+func (workerProviderStub) Validate(context.Context, capability.Request) error { return nil }
+func (workerProviderStub) Execute(context.Context, capability.Request) (capability.Result, error) {
+	return capability.Result{}, nil
+}
+
 type workerStore struct {
 	previous          []string
 	loadedFor         string
@@ -62,6 +150,20 @@ type workerStore struct {
 	effectiveInputs   map[domain.ID]json.RawMessage
 	effectiveAttempts map[domain.ID]int
 }
+
+func (s *workerStore) AllocateProviderInvocation(_ context.Context, record capability.ProviderInvocationStartRecord, _ artifact.StoreIdentity) (capability.ProviderInvocationAdmission, error) {
+	s.start = record
+	s.startID = domain.NewID()
+	s.startIDs = append(s.startIDs, s.startID)
+	return capability.ProviderInvocationAdmission{ProviderAttemptID: s.startID, PreparedSetID: domain.NewID(), ManifestID: domain.NewID(), ReservedCapacityBytes: domain.PreparedSetOutputAuthorityMaxBytes}, nil
+}
+
+func (s *workerStore) SealPreparedEvidence(_ context.Context, record resultadmission.PreparedSealRecord) error {
+	s.terminal = capability.ProviderInvocationTerminalRecord{ProviderAttemptID: record.Admission.ProviderAttemptID, Outcome: record.Outcome}
+	return s.terminalErr
+}
+
+func (*workerStore) QuarantinePreparedEvidence(context.Context, domain.ID, string) error { return nil }
 
 func (s *workerStore) RecordPolicyDecision(context.Context, capability.PolicyDecisionRecord) (domain.ID, error) {
 	if s.policyID == "" {
@@ -142,9 +244,107 @@ func (s *workerStore) PersistResultWithArtifactPublication(ctx context.Context, 
 	return nil
 }
 
-type workerArtifacts struct {
-	puts []artifact.PutRequest
+func (s *workerStore) PersistPreProviderFailure(_ context.Context, _ domain.ID, step domain.StepRun, summary string) error {
+	s.step = step
+	s.tool = nil
+	s.result = domain.ActionResult{Status: string(step.Status), Summary: summary, Error: &domain.StructuredError{Classification: step.ErrorClassification, Message: step.ErrorDetails}}
+	return nil
 }
+
+func (s *workerStore) ReserveCompiledResult(context.Context, domain.ID, domain.StepRun, resultadmission.CompiledResult, *capability.ResultAdmissionProvenance, artifact.StoreIdentity) error {
+	return nil
+}
+func (*workerStore) MarkCompiledArtifactPublishing(context.Context, resultadmission.CompiledResult, int) error {
+	return nil
+}
+func (*workerStore) SealCompiledArtifact(context.Context, resultadmission.CompiledResult, int) error {
+	return nil
+}
+func (*workerStore) TerminalizeCompiledResult(context.Context, resultadmission.CompiledResult, domain.PublicationState, string) error {
+	return nil
+}
+func (s *workerStore) AdoptCompiledResult(_ context.Context, _ domain.ID, step domain.StepRun, compiled resultadmission.CompiledResult, admission *capability.ResultAdmissionProvenance, _ time.Duration) error {
+	step.Output = append(json.RawMessage(nil), compiled.EnvelopeJSON...)
+	artifacts := make([]domain.Artifact, 0, len(compiled.Artifacts))
+	for _, item := range compiled.Artifacts {
+		storeID, key := item.Reference.ArtifactStoreID, item.Reference.StorageKey
+		artifacts = append(artifacts, domain.Artifact{ID: item.Reference.ArtifactID, TaskID: s.start.TaskID, WorkflowRunID: step.WorkflowRunID, StepRunID: step.ID, ToolRunID: compiled.ToolRun.ID, Type: item.ArtifactType, ContentType: item.Reference.ContentType, Size: item.Reference.ContentSizeBytes, SHA256: item.Reference.ContentSHA256, AddressingVersion: 1, ArtifactStoreID: &storeID, StorageKey: &key})
+	}
+	semanticIDs := []domain.ID{compiled.Envelope.SemanticOutput.ArtifactID}
+	tool := compiled.ToolRun
+	s.step, s.tool, s.artifacts, s.result, s.admission = step, &tool, artifacts, domain.ActionResult{RequestID: compiled.Envelope.ActionRequestID, Status: string(compiled.Envelope.Status), Summary: compiled.Envelope.Summary, Output: compiled.EnvelopeJSON, ArtifactIDs: semanticIDs}, admission
+	s.admissions = append(s.admissions, admission)
+	return nil
+}
+
+type workerArtifacts struct {
+	puts     []artifact.PutRequest
+	req      capability.Request
+	compiled resultadmission.CompiledResult
+	prepared map[string][]byte
+}
+
+var workerPublisherIdentity = artifact.StoreIdentity{ArtifactStoreID: "00000000-0000-4000-8000-000000009001", IncarnationNonce: "00000000-0000-4000-8000-000000009004", BackendKind: artifact.BackendKind, MarkerFormat: artifact.MarkerFormat, MarkerVersion: artifact.MarkerVersion}
+
+func (s *workerArtifacts) Identity() artifact.StoreIdentity { return workerPublisherIdentity }
+func (s *workerArtifacts) CaptureCompiledPublication(req capability.Request, compiled resultadmission.CompiledResult) {
+	s.req, s.compiled = req, compiled
+}
+func (s *workerArtifacts) AcquirePublisher(_ context.Context, expected artifact.StoreIdentity) (artifact.PublisherGuard, error) {
+	if expected != workerPublisherIdentity {
+		return nil, errors.New("identity mismatch")
+	}
+	return &workerPublisherGuard{owner: s}, nil
+}
+
+type workerPublisherGuard struct{ owner *workerArtifacts }
+
+func (g *workerPublisherGuard) Identity() artifact.StoreIdentity { return workerPublisherIdentity }
+func (g *workerPublisherGuard) StagePrepared(_ context.Context, request artifact.PreparedStageRequest) (artifact.PreparedStageReceipt, error) {
+	if g.owner.prepared == nil {
+		g.owner.prepared = map[string][]byte{}
+	}
+	contentBytes := int64(0)
+	for _, object := range append([]artifact.PreparedStageObject{request.Control}, request.Members...) {
+		reader, err := object.Source.Open()
+		if err != nil {
+			return artifact.PreparedStageReceipt{}, err
+		}
+		data, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil || closeErr != nil || int64(len(data)) != object.ExpectedSize || artifact.DigestBytes(data) != object.ExpectedSHA256 {
+			return artifact.PreparedStageReceipt{}, errors.Join(readErr, closeErr, errors.New("invalid prepared stage object"))
+		}
+		g.owner.prepared[object.StorageKey] = data
+		contentBytes += int64(len(data))
+	}
+	g.owner.prepared[request.ManifestKey] = append([]byte(nil), request.ManifestJSON...)
+	return artifact.PreparedStageReceipt{ManifestSize: int64(len(request.ManifestJSON)), ManifestSHA256: artifact.DigestBytes(request.ManifestJSON), MemberCount: len(request.Members), ContentBytes: contentBytes, Durable: true}, nil
+}
+func (g *workerPublisherGuard) OpenPrepared(_ context.Context, key string, size int64, digest [32]byte) (io.ReadCloser, error) {
+	data, ok := g.owner.prepared[key]
+	if !ok || int64(len(data)) != size || artifact.DigestBytes(data) != digest {
+		return nil, errors.New("prepared object unavailable")
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+func (g *workerPublisherGuard) PublishReserved(_ context.Context, reserved artifact.ReservedArtifactV1, reader io.Reader) (artifact.PublishedArtifactV1, error) {
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return artifact.PublishedArtifactV1{}, err
+	}
+	var item resultadmission.PreparedArtifact
+	for _, candidate := range g.owner.compiled.Artifacts {
+		if candidate.Reference.ArtifactID == reserved.ArtifactID {
+			item = candidate
+			break
+		}
+	}
+	name := map[domain.ResultArtifactRoleV1]string{domain.ArtifactRoleProviderStdout: "stdout.jsonl", domain.ArtifactRoleProviderStderr: "stderr.txt", domain.ArtifactRoleProviderDiagnostic: "diagnostic.bin", domain.ArtifactRoleSemanticResult: "result.json"}[item.Reference.Role]
+	g.owner.puts = append(g.owner.puts, artifact.PutRequest{ProgramID: g.owner.req.ProgramID, TaskID: g.owner.req.Action.TaskID, WorkflowRunID: g.owner.req.Action.WorkflowRunID, StepRunID: g.owner.req.Action.StepRunID, ToolRunID: g.owner.compiled.ToolRun.ID, Type: item.ArtifactType, ContentType: item.Reference.ContentType, Name: name, Retention: g.owner.req.Policy.ArtifactRetention, Data: data})
+	return artifact.PublishedArtifactV1{SizeBytes: int64(len(data)), SHA256: reserved.ExpectedSHA256, Durable: true}, nil
+}
+func (g *workerPublisherGuard) Close() error { return nil }
 
 func (s *workerArtifacts) Put(_ context.Context, req artifact.PutRequest) (domain.Artifact, error) {
 	s.puts = append(s.puts, req)
@@ -348,17 +548,19 @@ func TestWorkerRedeliveryRetainsJobAndActionButCreatesNewProviderAttempt(t *test
 	}
 }
 
-func TestWorkerTerminalAuditWarningDoesNotLogInternalError(t *testing.T) {
+func TestWorkerPreparedSealFailureDoesNotAdoptOrLogInternalError(t *testing.T) {
 	const internalMarker = "SECRET_INTERNAL_DATABASE_DETAIL"
 	registry := capability.NewRegistry()
-	if err := registry.Register(parityCapability{}); err != nil {
+	if err := registry.Register(parityCapability{fail: true}); err != nil {
 		t.Fatal(err)
 	}
 	store := &workerStore{terminalErr: errors.New(internalMarker)}
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	var queueCalls atomic.Int32
 	client := redis.NewClient(&redis.Options{
 		Dialer: func(context.Context, string, string) (net.Conn, error) {
+			queueCalls.Add(1)
 			return nil, errors.New("synthetic queue unavailable")
 		},
 		MaxRetries: -1,
@@ -382,21 +584,18 @@ func TestWorkerTerminalAuditWarningDoesNotLogInternalError(t *testing.T) {
 		Logger:       logger,
 		LeaseTimeout: time.Hour,
 	}
-	if err := service.handle(context.Background(), delivery); err == nil {
-		t.Fatal("expected synthetic queue failure after warning")
+	if err := service.handle(context.Background(), delivery); !domain.PersistenceUnresolved(err) {
+		t.Fatalf("prepared uncertainty lost before worker queue handling: %v", err)
+	}
+	if queueCalls.Load() != 0 || len(store.startIDs) != 1 {
+		t.Fatalf("worker retried/finalized unresolved result: queue calls=%d provider attempts=%d", queueCalls.Load(), len(store.startIDs))
 	}
 	output := logs.String()
-	if !strings.Contains(output, "provider invocation terminal audit failed") {
-		t.Fatalf("safe degradation warning missing: %s", output)
-	}
-	if store.startID == "" || !strings.Contains(output, string(store.startID)) {
-		t.Fatalf("safe provider attempt identity missing: start=%s output=%s", store.startID, output)
-	}
 	if strings.Contains(output, internalMarker) || strings.Contains(output, store.terminalErr.Error()) {
-		t.Fatalf("terminal audit error leaked into worker log: %s", output)
+		t.Fatalf("prepared seal error leaked into worker log: %s", output)
 	}
-	if store.step.Status != domain.StepSucceeded || store.result.Status != "succeeded" {
-		t.Fatalf("terminal audit degradation changed provider truth: step=%#v result=%#v", store.step, store.result)
+	if store.startID == "" || store.step.Status != "" || store.result.Status != "" {
+		t.Fatalf("prepared seal failure was adopted: start=%s step=%#v result=%#v", store.startID, store.step, store.result)
 	}
 }
 
@@ -442,7 +641,7 @@ func TestWorkerPeriodicRetryLifecycleNeedsNoRetentionMaintenance(t *testing.T) {
 	result := make(chan error, 1)
 	go func() { result <- service.Run(ctx) }()
 	spy.waitFor(t, "XREADGROUP", time.Second)
-	spy.waitFor(t, "ZRANGEBYSCORE", 2*time.Second)
+	spy.waitFor(t, "EVAL", 2*time.Second)
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("worker shutdown error=%v", err)
@@ -499,6 +698,8 @@ func (s *redisCommandSpy) serve(connection net.Conn) {
 			response = "*-1\r\n"
 		case "ZRANGEBYSCORE":
 			response = "*0\r\n"
+		case "EVAL":
+			response = ":0\r\n"
 		default:
 			response = "+OK\r\n"
 		}
@@ -591,7 +792,11 @@ func parityAction(taskID, runID, stepID domain.ID) domain.ActionRequest {
 
 func assertArtifactRoles(t *testing.T, name string, store *workerStore, artifacts *workerArtifacts) {
 	t.Helper()
-	if len(artifacts.puts) != 3 || len(store.artifacts) != 3 {
+	wantCount := 3
+	if store.step.Status != domain.StepSucceeded {
+		wantCount = 4
+	}
+	if len(artifacts.puts) != wantCount || len(store.artifacts) != wantCount {
 		t.Fatalf("%s artifact count puts=%d persisted=%d", name, len(artifacts.puts), len(store.artifacts))
 	}
 	roles := map[string]string{}
@@ -600,6 +805,9 @@ func assertArtifactRoles(t *testing.T, name string, store *workerStore, artifact
 	}
 	if roles["stdout.jsonl"] != "raw-provider-output|application/x-ndjson" || roles["stderr.txt"] != "raw-provider-output|text/plain" || roles["result.json"] != "normalized-result|application/json" {
 		t.Fatalf("%s artifact roles=%#v", name, roles)
+	}
+	if wantCount == 4 && roles["diagnostic.bin"] != "provider-diagnostic|application/vnd.reconductor.provider-diagnostic-v1" {
+		t.Fatalf("%s diagnostic role=%#v", name, roles)
 	}
 	for _, artifact := range store.artifacts {
 		if artifact.Type == "normalized-result" {

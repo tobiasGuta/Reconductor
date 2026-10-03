@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
@@ -25,6 +26,7 @@ type Config struct {
 	ArtifactStorage         ArtifactStorage
 	Policy                  Policy
 	Logging                 Logging
+	Console                 Console
 	StepAttemptLeaseTimeout time.Duration
 }
 
@@ -107,6 +109,34 @@ type Logging struct {
 	Level       string
 	SecretNames []string
 }
+type Console struct {
+	OperatorToken string
+	OperatorActor string
+}
+
+// Validate is called only when starting the mutation-capable console.
+// Other platform commands do not require a console credential.
+func (c Console) Validate() error {
+	if len(c.OperatorToken) < 32 || len(c.OperatorToken) > 256 {
+		return errors.New("CONSOLE_OPERATOR_TOKEN must contain 32..256 bearer-safe characters")
+	}
+	for _, char := range c.OperatorToken {
+		if !(char >= 'a' && char <= 'z') && !(char >= 'A' && char <= 'Z') &&
+			!(char >= '0' && char <= '9') && !strings.ContainsRune("-._~+/=", char) {
+			return errors.New("CONSOLE_OPERATOR_TOKEN must contain 32..256 bearer-safe characters")
+		}
+	}
+	if len(c.OperatorActor) < 1 || len(c.OperatorActor) > 80 ||
+		strings.TrimSpace(c.OperatorActor) != c.OperatorActor {
+		return errors.New("CONSOLE_OPERATOR_ACTOR must be a non-empty, bounded actor name")
+	}
+	for _, char := range c.OperatorActor {
+		if !unicode.IsPrint(char) {
+			return errors.New("CONSOLE_OPERATOR_ACTOR must be a non-empty, bounded actor name")
+		}
+	}
+	return nil
+}
 
 type Lookup func(string) string
 
@@ -131,6 +161,7 @@ func loadWith(get Lookup, requireDatabase bool) (Config, error) {
 		ArtifactStorage:         ArtifactStorage{Driver: value(get, "ARTIFACT_DRIVER", "local"), Root: value(get, "ARTIFACT_ROOT", "artifacts"), StoreID: strings.TrimSpace(get("ARTIFACT_STORE_ID"))},
 		Policy:                  Policy{DefaultRateLimit: integer(get, "POLICY_RATE_LIMIT", 50), DefaultConcurrency: integer(get, "POLICY_CONCURRENCY", 10), DefaultProviderConcurrency: integer(get, "POLICY_PROVIDER_CONCURRENCY", 2), DefaultHostConcurrency: integer(get, "POLICY_HOST_CONCURRENCY", 1), MaxPayloadBytes: int64(integer(get, "POLICY_MAX_PAYLOAD_BYTES", 1048576)), AllowedMethods: csv(get, "POLICY_ALLOWED_METHODS", "GET,HEAD,OPTIONS"), FollowRedirects: boolean(get, "POLICY_FOLLOW_REDIRECTS", false), ScanWindows: csv(get, "POLICY_SCAN_WINDOWS", ""), AuthenticationUsage: boolean(get, "POLICY_AUTHENTICATION_USAGE", false), DirectoryFuzzing: boolean(get, "POLICY_DIRECTORY_FUZZING", false), CrossOrigin: boolean(get, "POLICY_CROSS_ORIGIN", false), IntrusiveChecks: boolean(get, "POLICY_INTRUSIVE_CHECKS", false), ArtifactRetention: duration(get, "POLICY_ARTIFACT_RETENTION", 720*time.Hour)},
 		Logging:                 Logging{Level: value(get, "LOG_LEVEL", "info"), SecretNames: csv(get, "REDACT_SECRET_NAMES", "")},
+		Console:                 Console{OperatorToken: get("CONSOLE_OPERATOR_TOKEN"), OperatorActor: get("CONSOLE_OPERATOR_ACTOR")},
 		StepAttemptLeaseTimeout: duration(get, "STEP_ATTEMPT_LEASE_TIMEOUT", domain.StepAttemptLeaseDefault),
 	}
 	var parseErrs []error

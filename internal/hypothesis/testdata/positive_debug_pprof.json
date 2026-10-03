@@ -1,0 +1,38 @@
+{
+  "fixture_id": "positive_debug_pprof",
+  "category": "positive",
+  "description": "Exposed Go pprof debugging profile endpoint returning 200 OK",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "https://internal.target.com/debug/pprof",
+        "route_signature": "/debug/pprof",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": [],
+        "labels": ["debug"],
+        "technologies": ["Go"],
+        "interest_score": 7,
+        "evidence_artifact_ids": ["art-debug-001"]
+      }
+    ],
+    "changes": [],
+    "evidence": [
+      {
+        "artifact_id": "art-debug-001",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://internal.target.com/debug/pprof"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http"]
+  },
+  "expected": {
+    "candidate_count": 1,
+    "candidate_types": ["exposed_debug_interface"],
+    "should_admit_all": true
+  }
+}

@@ -81,10 +81,13 @@ func IsScheduledExecutionFenceError(err error) bool {
 }
 
 type lockedResultLineage struct {
-	scheduled    bool
-	taskID       domain.ID
-	stepStatus   domain.StepStatus
-	attemptCount int
+	recovery         bool
+	scheduledID      *domain.ID
+	schedulerAttempt *int
+	scheduled        bool
+	taskID           domain.ID
+	stepStatus       domain.StepStatus
+	attemptCount     int
 }
 
 func lockConflictingResultTools(ctx context.Context, tx pgx.Tx, stepID domain.ID, tool *domain.ToolRun, scheduled bool) error {
@@ -154,6 +157,10 @@ func lockAndValidateResultArtifacts(ctx context.Context, tx pgx.Tx, lineage lock
 
 func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step domain.StepRun) (lockedResultLineage, error) {
 	fence, fenced := scheduledExecutionFenceFromContext(ctx)
+	recovery, recovering := domain.PreparedRecoveryRequestFromContext(ctx)
+	if recovering && fenced {
+		return lockedResultLineage{}, fmt.Errorf("recovery admission must not carry live scheduler credentials")
+	}
 	if step.ID == "" || step.WorkflowRunID == "" {
 		return lockedResultLineage{}, resultConflict(fenced, resultFenceInvalidResultIdentity, "result step identity is incomplete")
 	}
@@ -178,7 +185,7 @@ func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step
 		if err != nil {
 			return lockedResultLineage{}, err
 		}
-		if hasScheduled {
+		if hasScheduled && !recovering {
 			return lockedResultLineage{}, staleResultError(resultFenceInvalidScheduledClaim, "scheduled claim identity is missing")
 		}
 	}
@@ -193,13 +200,16 @@ func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step
 		if scheduled.TaskID == nil || scheduled.WorkflowRunID == nil || *scheduled.WorkflowRunID != step.WorkflowRunID {
 			return lockedResultLineage{}, staleResultError(resultFenceScheduledLineageMismatch, "scheduled workflow lineage does not match")
 		}
-		if scheduled.LeaseOwner != fence.LeaseOwner {
+		if !recovering && scheduled.LeaseOwner != fence.LeaseOwner {
 			return lockedResultLineage{}, staleResultError(resultFenceScheduledClaimMismatch, "scheduler owner does not match")
 		}
-		if scheduled.AttemptCount != fence.Attempt {
+		if !recovering && scheduled.AttemptCount != fence.Attempt {
 			return lockedResultLineage{}, staleResultError(resultFenceScheduledClaimMismatch, "scheduler attempt does not match")
 		}
-		valid, validErr := lockedSchedulerLeaseValid(ctx, tx, scheduled.ID, fence.LeaseOwner, fence.Attempt)
+		valid, validErr := true, error(nil)
+		if !recovering {
+			valid, validErr = lockedSchedulerLeaseValid(ctx, tx, scheduled.ID, fence.LeaseOwner, fence.Attempt)
+		}
 		if validErr != nil {
 			return lockedResultLineage{}, validErr
 		}
@@ -249,7 +259,18 @@ func lockResultLineage(ctx context.Context, tx pgx.Tx, programID domain.ID, step
 	if step.Capability == "" || capabilityName != step.Capability {
 		return lockedResultLineage{}, resultConflict(hasScheduled, resultFenceWorkflowLineageMismatch, "step capability does not match")
 	}
-	return lockedResultLineage{scheduled: hasScheduled, taskID: taskID, stepStatus: status, attemptCount: attemptCount}, nil
+	lineage := lockedResultLineage{scheduled: hasScheduled, taskID: taskID, stepStatus: status, attemptCount: attemptCount, recovery: recovering}
+	if hasScheduled {
+		id, attempt := scheduled.ID, scheduled.AttemptCount
+		lineage.scheduledID = &id
+		lineage.schedulerAttempt = &attempt
+	}
+	if recovering {
+		if err := validateLockedPreparedRecovery(ctx, tx, lineage, programID, step, recovery); err != nil {
+			return lockedResultLineage{}, err
+		}
+	}
+	return lineage, nil
 }
 
 func lockProviderStepAttempt(ctx context.Context, tx pgx.Tx, providerAttemptID domain.ID) (*int, error) {
@@ -406,6 +427,7 @@ func lockAndValidateAuthoritativeStepAttempts(ctx context.Context, tx pgx.Tx, st
 	}
 	defer rows.Close()
 	persisted := make(map[domain.ID]struct{}, len(stepIDs))
+	changedStates := make([]domain.ID, 0)
 	for rows.Next() {
 		var id domain.ID
 		var status domain.StepStatus
@@ -416,6 +438,9 @@ func lockAndValidateAuthoritativeStepAttempts(ctx context.Context, tx pgx.Tx, st
 		}
 		stepState := steps[id]
 		persisted[id] = struct{}{}
+		if stepState.Run.Status != status || stepState.Run.CompletedAt != nil {
+			changedStates = append(changedStates, id)
+		}
 		if stepState.Run.AttemptCount != attemptCount {
 			return fmt.Errorf("%w: StepRun %s has authoritative attempt %d, not %d", workflow.ErrEffectiveStepInputConflict, id, attemptCount, stepState.Run.AttemptCount)
 		}
@@ -431,6 +456,21 @@ func lockAndValidateAuthoritativeStepAttempts(ctx context.Context, tx pgx.Tx, st
 	}
 	if err := rows.Err(); err != nil {
 		return err
+	}
+	rows.Close()
+	for _, id := range changedStates {
+		if err := ensureNoUnresolvedPrepared(ctx, tx, id); err != nil {
+			return err
+		}
+	}
+	if state.Run.Status != domain.RunRunning {
+		unresolved, err := hasUnresolvedWorkflowPrepared(ctx, tx, state.Run.ID)
+		if err != nil {
+			return err
+		}
+		if unresolved {
+			return &domain.UnresolvedPersistenceError{Err: fmt.Errorf("workflow checkpoint would contradict unresolved current result")}
+		}
 	}
 	for _, id := range stepIDs {
 		if _, found := persisted[id]; !found && steps[id].Run.AttemptCount != 0 {

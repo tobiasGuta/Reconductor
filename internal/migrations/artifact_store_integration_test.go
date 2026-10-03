@@ -99,6 +99,9 @@ func TestArtifactStoreOwnershipMigration(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE step_runs SET status='succeeded',completed_at=clock_timestamp() WHERE id=$1`, stepID); err != nil {
+		t.Fatal(err)
+	}
 	var locatorBefore string
 	if err := pool.QueryRow(ctx, `SELECT encode(convert_to(storage_location,'UTF8'),'hex') FROM artifacts WHERE id=$1`, legacyID).Scan(&locatorBefore); err != nil {
 		t.Fatal(err)

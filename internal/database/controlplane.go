@@ -345,7 +345,7 @@ func (s *Store) loadConsoleStats(ctx context.Context, programID domain.ID, out *
 	return s.Pool.QueryRow(ctx, `SELECT
 		(SELECT count(*) FROM assets WHERE program_id=$1),
 		(SELECT count(*) FROM workflow_runs wr JOIN tasks t ON t.id=wr.task_id WHERE t.program_id=$1 AND wr.status IN ('pending','running','paused')),
-		(SELECT count(*) FROM approvals a JOIN tasks t ON t.id=a.task_id WHERE t.program_id=$1 AND a.decision='pending'),
+		(SELECT count(*) FROM approvals a JOIN tasks t ON t.id=a.task_id WHERE t.program_id=$1 AND a.approval_kind='workflow_step' AND a.decision='pending'),
 		(SELECT count(*) FROM candidate_findings cf JOIN tasks t ON t.id=cf.task_id WHERE t.program_id=$1 AND cf.status NOT IN ('rejected','informational')),
 		(SELECT count(*) FROM verified_findings WHERE program_id=$1 AND status='open'),
 		(SELECT count(*) FROM step_runs sr JOIN workflow_runs wr ON wr.id=sr.workflow_run_id JOIN tasks t ON t.id=wr.task_id WHERE t.program_id=$1 AND sr.status IN ('failed','retryable'))`, programID).Scan(&out.Stats.Assets, &out.Stats.ActiveRuns, &out.Stats.PendingApprovals, &out.Stats.Candidates, &out.Stats.VerifiedFindings, &out.Stats.FailedSteps)
@@ -486,7 +486,7 @@ func (s *Store) loadConsoleFindings(ctx context.Context, programID domain.ID, ou
 }
 
 func (s *Store) loadConsoleApprovals(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {
-	rows, err := s.Pool.Query(ctx, `SELECT a.id,a.request_id,a.task_id,t.objective,a.requested_risk_level,a.reason,a.requested_at,a.decision,a.decided_by,a.decided_at,a.expires_at FROM approvals a JOIN tasks t ON t.id=a.task_id WHERE t.program_id=$1 ORDER BY (a.decision='pending') DESC,a.requested_at DESC LIMIT 100`, programID)
+	rows, err := s.Pool.Query(ctx, `SELECT a.id,a.request_id,a.task_id,t.objective,a.requested_risk_level,a.reason,a.requested_at,a.decision,a.decided_by,a.decided_at,a.expires_at FROM approvals a JOIN tasks t ON t.id=a.task_id WHERE t.program_id=$1 AND a.approval_kind='workflow_step' ORDER BY (a.decision='pending') DESC,a.requested_at DESC LIMIT 100`, programID)
 	if err != nil {
 		return err
 	}

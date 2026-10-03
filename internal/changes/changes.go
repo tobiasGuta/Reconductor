@@ -106,6 +106,46 @@ func FromReportRaw(raw json.RawMessage, observedAt time.Time) ([]Item, error) {
 	return dedupe(items), nil
 }
 
+// FromReportItem derives one report-change projection from a single item in
+// one of the closed report.changes source arrays. It keeps the streaming
+// database projector aligned with FromReportRaw without requiring a
+// result-sized reportPayload allocation.
+func FromReportItem(field string, raw json.RawMessage, observedAt time.Time) (Item, bool, error) {
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
+	switch field {
+	case "changes":
+		var change AssetChange
+		if err := json.Unmarshal(raw, &change); err != nil {
+			return Item{}, false, err
+		}
+		if strings.TrimSpace(change.Value) == "" {
+			return Item{}, false, nil
+		}
+		return assetItem(change, observedAt), true, nil
+	case "endpoints":
+		var endpoint endpointClassification
+		if err := json.Unmarshal(raw, &endpoint); err != nil {
+			return Item{}, false, err
+		}
+		if strings.TrimSpace(endpoint.Endpoint.ExactURL) == "" {
+			return Item{}, false, nil
+		}
+		item, ok := endpointItem(endpoint, observedAt)
+		return item, ok, nil
+	case "candidate_matches":
+		var line string
+		if err := json.Unmarshal(raw, &line); err != nil {
+			return Item{}, false, err
+		}
+		item, ok := CandidateFromLine(line, nil, observedAt)
+		return item, ok, nil
+	default:
+		return Item{}, false, fmt.Errorf("unsupported report source field %q", field)
+	}
+}
+
 func CandidateFromLine(line string, evidence []domain.ID, observedAt time.Time) (Item, bool) {
 	var match map[string]any
 	if json.Unmarshal([]byte(line), &match) != nil {

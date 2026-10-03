@@ -128,6 +128,58 @@ func TestProbeHTTPSourcePersistenceIsAtomicAndLineageBound(t *testing.T) {
 	})
 }
 
+func TestProbeHTTPDuplicateRedirectTargetsPreserveEverySourceRecord(t *testing.T) {
+	fixture := newScheduledResultFixture(t, "concrete-http-duplicate-redirect-targets", "probe.http")
+	action := scheduledProviderAction(fixture, 1)
+	admission := recordScheduledProviderAdmission(t, fixture, fixture.context(), fixture.env.programID, action, nil, "httpx")
+	records := []provideroutput.Record{
+		{Provider: "httpx", Kind: provideroutput.URLRecord, Target: "https://intl.example.test/", StatusCode: 200, Fields: map[string]any{"input": "http://intl.example.test", "host_ip": "192.0.2.10"}},
+		{Provider: "httpx", Kind: provideroutput.URLRecord, Target: "https://intl.example.test/", StatusCode: 200, Fields: map[string]any{"input": "https://intl.example.test", "host_ip": "192.0.2.11"}},
+		{Provider: "httpx", Kind: provideroutput.URLRecord, Target: "https://www.example.test/", StatusCode: 200, Fields: map[string]any{"input": "http://www.example.test", "host_ip": "192.0.2.20"}},
+		{Provider: "httpx", Kind: provideroutput.URLRecord, Target: "https://www.example.test/", StatusCode: 200, Fields: map[string]any{"input": "https://www.example.test", "host_ip": "192.0.2.21"}},
+	}
+	sources, err := normalize.BuildProbeHTTPSourceRecords(string(fixture.env.programID), string(admission.ProviderAttemptID), records, normalize.RequestSemantics{
+		Method:      normalize.ValueSemantics{State: normalize.ValueDefaulted, Value: databaseSourceString("GET")},
+		ContentType: normalize.ValueSemantics{State: normalize.ValueUnknown},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := json.Marshal(map[string]any{
+		"lines":                     []string{"https://intl.example.test/", "https://www.example.test/"},
+		"authorized":                []string{"https://intl.example.test/", "https://www.example.test/"},
+		"authorized_urls":           []string{"https://intl.example.test/", "https://www.example.test/"},
+		"authorized_records":        records,
+		"authorized_source_records": sources,
+		"filtered":                  []any{},
+		"records":                   records,
+		"warnings":                  []any{},
+		"accepted_count":            len(records),
+		"filtered_count":            0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, tool, artifacts, result := scheduledResultPayload(fixture, output)
+	tool.ToolVersion = "4"
+	applyScheduledProviderAdmission(tool, &result, admission)
+	if err := fixture.env.store.PersistResult(fixture.context(), fixture.env.programID, step, tool, artifacts, result, admission); err != nil {
+		t.Fatal(err)
+	}
+
+	var observationCount, sourceCount, resourceCount int
+	if err := fixture.env.store.Pool.QueryRow(fixture.env.ctx, `SELECT
+		(SELECT count(*) FROM asset_observations WHERE workflow_run_id=$1 AND source_capability='probe.http'),
+		(SELECT count(*) FROM probe_http_source_records WHERE program_id=$2 AND provider_attempt_id=$3),
+		(SELECT count(*) FROM canonical_concrete_http_resources WHERE program_id=$2)`, fixture.lineage.runID, fixture.env.programID, admission.ProviderAttemptID).Scan(&observationCount, &sourceCount, &resourceCount); err != nil {
+		t.Fatal(err)
+	}
+	if observationCount != 2 || sourceCount != 4 || resourceCount != 2 {
+		t.Fatalf("observations=%d sources=%d resources=%d", observationCount, sourceCount, resourceCount)
+	}
+	assertProbeHTTPSourceProvenance(t, fixture.env, records, sources, admission)
+}
+
 func TestProbeHTTPFailedAndRetryableV4ResultsPersistWithoutTrustedSources(t *testing.T) {
 	for _, test := range []struct {
 		name      string

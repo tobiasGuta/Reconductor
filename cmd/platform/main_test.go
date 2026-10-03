@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
+	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
@@ -39,6 +40,36 @@ func TestScopePlanCLIProducesJSONWithoutRuntimeConfiguration(t *testing.T) {
 	}
 	if len(payload.Exact) == 0 || len(payload.Roots) == 0 {
 		t.Fatalf("incomplete plan: %s", out)
+	}
+}
+
+func TestConsoleCommandRequiresOperatorConfigurationBeforeConnecting(t *testing.T) {
+	err := consoleCommand(context.Background(), config.Config{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "CONSOLE_OPERATOR_TOKEN") {
+		t.Fatalf("console startup error=%v; want missing operator credential", err)
+	}
+}
+
+func TestConsoleCommandRejectsIPv4MappedIPv6BeforeConnecting(t *testing.T) {
+	// Valid operator credentials and an unusable database isolate listen validation:
+	// reaching database startup would return a different error.
+	cfg := config.Config{
+		Database: config.Database{URL: "postgres://%"},
+		Console: config.Console{
+			OperatorToken: strings.Repeat("a", 64), OperatorActor: "configured-operator",
+		},
+	}
+	for _, address := range []string{
+		"[::ffff:127.0.0.1]:80", "[::ffff:127.0.0.1]:8080",
+		"[::ffff:7f00:1]:80", "[::ffff:7f00:1]:8080",
+		"[0:0:0:0:0:FFFF:7f00:1]:80", "[0:0:0:0:0:FFFF:7f00:1]:8080",
+	} {
+		t.Run(address, func(t *testing.T) {
+			err := consoleCommand(context.Background(), cfg, []string{"--listen", address})
+			if err == nil || err.Error() != "IPv4-mapped IPv6 console addresses are unsupported" {
+				t.Fatalf("console startup error=%v; want mapped IPv6 rejection before database startup", err)
+			}
+		})
 	}
 }
 
@@ -195,7 +226,7 @@ func TestOnlyExplicitAdministrativeCommandAppliesMigrations(t *testing.T) {
 	if strings.Count(platformSource, ".Migrate(ctx)") != 1 || !strings.Contains(platformSource, `case "migrate":`) {
 		t.Fatal("platform schema mutation is not confined to the explicit migrate command")
 	}
-	if strings.Count(platformSource, "database.Open(ctx") != 2 || !strings.Contains(platformSource, "s.RequireCurrentSchema(ctx)") {
+	if strings.Count(platformSource, "database.Open(ctx") != 3 || !strings.Contains(platformSource, "s.RequireCurrentSchema(ctx)") || !strings.Contains(platformSource, `case "prepared-limits-remediate-0021":`) {
 		t.Fatal("ordinary platform database startup does not use the fail-closed schema check")
 	}
 	for _, path := range []string{filepath.Join("..", "worker", "main.go"), filepath.Join("..", "scheduler", "main.go")} {
@@ -262,8 +293,70 @@ func TestWorkflowRunScopeDoesNotRequireDomain(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunMaxStepAttemptsRejectsInvalidCeilingsBeforeRuntimeSetup(t *testing.T) {
+	for _, invalid := range []string{"0", "-1", "not-a-number"} {
+		err := workflowRun(context.Background(), config.Config{}, capability.NewRegistry(), []string{"--max-step-attempts", invalid})
+		if err == nil || !strings.Contains(err.Error(), "must be a positive integer") {
+			t.Fatalf("invalid ceiling %q error=%v", invalid, err)
+		}
+	}
+}
+
+func TestS2002ExactHostRegressionScopePlanIsNarrow(t *testing.T) {
+	root := t.TempDir()
+	scopePath := filepath.Join(root, "scope.json")
+	scopeDocument := []byte(`{
+  "target": {
+    "scope": {
+      "advanced_mode": true,
+      "exclude": [],
+      "include": [
+        {"enabled": true, "file": "^/.*", "host": "^www\\.example\\.test$", "port": "^80$", "protocol": "http"},
+        {"enabled": true, "file": "^/.*", "host": "^www\\.example\\.test$", "port": "^443$", "protocol": "https"},
+        {"enabled": true, "file": "^/.*", "host": "^intl\\.example\\.test$", "port": "^80$", "protocol": "http"},
+        {"enabled": true, "file": "^/.*", "host": "^intl\\.example\\.test$", "port": "^443$", "protocol": "https"}
+      ]
+    }
+  }
+}`)
+	if err := os.WriteFile(scopePath, scopeDocument, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadPlanning()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Scope.Root = root
+	out, err := captureStdout(func() error {
+		return scopeCommand(context.Background(), cfg, []string{"plan", "--scope", "scope.json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		ExactActiveSeeds []struct {
+			Host string `json:"host"`
+		} `json:"exact_active_seeds"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, seed := range payload.ExactActiveSeeds {
+		got[seed.Host] = true
+	}
+	if len(got) != 2 || !got["www.example.test"] || !got["intl.example.test"] {
+		t.Fatalf("unexpected regression scope hosts: %s", out)
+	}
+	for _, forbidden := range []string{"example.test", "api.example.test", "admin.example.test"} {
+		if got[forbidden] {
+			t.Fatalf("forbidden host %q appeared in regression scope: %s", forbidden, out)
+		}
+	}
+}
+
 func TestConsoleListenAddressRequiresLoopback(t *testing.T) {
-	for _, address := range []string{"127.0.0.1:8088", "localhost:8090", "[::1]:8088"} {
+	for _, address := range []string{"127.0.0.1:8088", "localhost:8090", "[::1]:8088", "127.0.0.1:80", "127.0.0.1:8080", "localhost:80", "localhost:8080", "[::1]:80", "[::1]:8080"} {
 		if err := requireLoopbackAddress(address); err != nil {
 			t.Fatalf("loopback address %q rejected: %v", address, err)
 		}

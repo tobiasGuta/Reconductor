@@ -69,9 +69,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	store.ConfigureExactReviewEvidenceReader(artifacts)
+	prepared, err := store.RequirePreparedEvidenceReady(ctx, storeID)
+	if err != nil {
+		return fmt.Errorf("prepared evidence readiness: %w", err)
+	}
 	workerPolicy := policy.Policy{RateLimit: cfg.Policy.DefaultRateLimit, Concurrency: cfg.Policy.DefaultConcurrency}
 	limiter := budget.NewLocal(budget.Limits{Program: policy.ProgramParallelism(workerPolicy), Provider: cfg.Policy.DefaultProviderConcurrency, Host: cfg.Policy.DefaultHostConcurrency})
 	service := worker.Service{Queue: queue.New(rdb, cfg.Worker.ConsumerGroup, cfg.Worker.ConsumerName, cfg.Worker.MaxRetries, cfg.Worker.RetryBase), Registry: providers.Registry(cfg), Artifacts: artifacts, Results: store, PoolSize: cfg.Worker.PoolSize, ReadBlock: cfg.Worker.ReadBlock, LeaseTimeout: cfg.Worker.LeaseTimeout, Logger: slog.Default(), Budget: limiter, PolicyAuditor: store}
-	slog.Info("worker started", "config", cfg.String())
+	slog.Info("worker started", "config", cfg.String(), "prepared_open_sets", prepared.OpenSets, "prepared_max_open_sets", prepared.MaxOpenSets, "prepared_unresolved_bytes", prepared.UnresolvedBytes, "prepared_max_unresolved_bytes", prepared.MaxUnresolvedBytes)
 	return service.Run(ctx)
 }

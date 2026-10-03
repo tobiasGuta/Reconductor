@@ -32,6 +32,7 @@ WITH eligible AS (
       AND a.expires_at <= statement_timestamp()
       AND a.content_deleted_at IS NULL
       AND a.cleanup_quarantined_at IS NULL
+      AND NOT exact_review_evidence_protected(a.id)
       AND (a.cleanup_retry_after IS NULL OR a.cleanup_retry_after <= statement_timestamp())
       AND (a.cleanup_claim_token IS NULL OR a.cleanup_claimed_at <= statement_timestamp() - interval '15 minutes')
     ORDER BY a.expires_at ASC, a.id ASC

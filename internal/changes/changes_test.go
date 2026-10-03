@@ -69,6 +69,24 @@ func TestFromReportRawPreservesStructuredAssetEvidence(t *testing.T) {
 	}
 }
 
+func TestFromReportItemMatchesWholeReportDerivation(t *testing.T) {
+	observedAt := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	raw := json.RawMessage(`{"kind":"new_or_changed","value":"https://app.example.test/","reasons":["changed"]}`)
+	streamed, ok, err := FromReportItem("changes", raw, observedAt)
+	if err != nil || !ok {
+		t.Fatalf("streamed item unavailable: ok=%v err=%v", ok, err)
+	}
+	whole, err := FromReportRaw(json.RawMessage(`{"changes":[`+string(raw)+`],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`), observedAt)
+	if err != nil || len(whole) != 1 {
+		t.Fatalf("whole report items=%#v err=%v", whole, err)
+	}
+	left, _ := json.Marshal(streamed)
+	right, _ := json.Marshal(whole[0])
+	if string(left) != string(right) {
+		t.Fatalf("streamed=%s whole=%s", left, right)
+	}
+}
+
 func TestEndpointChangeEntityKeyUsesCorrectedEndpointDigest(t *testing.T) {
 	key, _, err := normalize.CanonicalEndpoint("https://app.example.test/api/users/123?x=1", "GET", "application/json")
 	if err != nil {

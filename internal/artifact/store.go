@@ -220,7 +220,7 @@ func OpenLocal(ctx context.Context, root string, expectedStoreID domain.ID, regi
 	if r == nil {
 		r = redaction.New()
 	}
-	return &Local{root: absRoot, storeID: storeID, redactor: r, newID: domain.NewID, initialized: true}, nil
+	return &Local{root: absRoot, storeID: storeID, identity: StoreIdentityFrom(registered), redactor: r, newID: domain.NewID, initialized: true, rootInfo: info, markerInfo: markerInfo}, nil
 }
 
 func validateRegistration(registration domain.ArtifactStoreRegistration, expectedStoreID domain.ID) error {
@@ -301,7 +301,11 @@ func readMarker(path string) (domain.ArtifactStoreRegistration, error) {
 		return domain.ArtifactStoreRegistration{}, fmt.Errorf("open artifact store marker: %w", err)
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, maximumMarkerLen+1))
+	return readMarkerFrom(file)
+}
+
+func readMarkerFrom(reader io.Reader) (domain.ArtifactStoreRegistration, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, maximumMarkerLen+1))
 	if err != nil {
 		return domain.ArtifactStoreRegistration{}, fmt.Errorf("read artifact store marker: %w", err)
 	}

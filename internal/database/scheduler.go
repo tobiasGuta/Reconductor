@@ -215,6 +215,8 @@ func (s *Store) ClaimPendingScheduledExecution(ctx context.Context, owner string
 		FROM scheduled_executions se
 		JOIN schedules s ON s.id=se.schedule_id
 		WHERE se.status='pending'
+		  AND NOT EXISTS (SELECT 1 FROM prepared_evidence_sets p JOIN step_runs sr ON sr.id=p.step_run_id JOIN audit_events provider ON provider.id=p.provider_attempt_id
+		    WHERE provider.scheduled_execution_id=se.id AND provider.scheduler_attempt=se.attempt_count AND p.step_attempt=sr.attempt_count AND p.lifecycle_state IN ('ALLOCATED','SEALED','QUARANTINED'))
 		  AND NOT EXISTS (
 			SELECT 1 FROM scheduled_executions active
 			WHERE active.schedule_id=se.schedule_id
@@ -378,6 +380,11 @@ func (s *Store) markScheduledExecution(ctx context.Context, id domain.ID, status
 	if !containsExecutionStatus(allowed, item.Status) || !validLease {
 		return invalidScheduledExecutionTransition(item, status)
 	}
+	if pending, err := hasUnresolvedScheduledPrepared(ctx, tx, item.ID, item.AttemptCount); err != nil {
+		return err
+	} else if pending {
+		return &domain.UnresolvedPersistenceError{Err: fmt.Errorf("scheduled result must reconcile before terminalization")}
+	}
 	// Running is the only source status whose scope was assigned by this exact
 	// fenced attempt. A claimed row may retain an earlier attempt's scope after
 	// administrative resume, so claimed terminal transitions record NULL.
@@ -511,6 +518,11 @@ func markScheduledExecutionTaskCreated(ctx context.Context, tx pgx.Tx, id, taskI
 }
 
 func rejectLockedScheduledExecutionForApproval(ctx context.Context, tx pgx.Tx, item domain.ScheduledExecution, programID domain.ID, actor string) error {
+	if pending, err := hasUnresolvedScheduledPrepared(ctx, tx, item.ID, item.AttemptCount); err != nil {
+		return err
+	} else if pending {
+		return &domain.UnresolvedPersistenceError{Err: fmt.Errorf("scheduled result must reconcile before approval terminalization")}
+	}
 	if item.Status == domain.ScheduledExecutionApprovalRejected {
 		return nil
 	}
@@ -669,7 +681,7 @@ func (s *Store) RequestScheduledExecutionResume(ctx context.Context, id domain.I
 			return fmt.Errorf("scheduled execution %s has no workflow lineage", id)
 		}
 		var decision string
-		err = tx.QueryRow(ctx, `SELECT a.decision FROM approvals a JOIN step_runs sr ON sr.id=a.request_id WHERE sr.workflow_run_id=$1 AND sr.status='awaiting_approval' ORDER BY a.requested_at DESC LIMIT 1`, item.WorkflowRunID).Scan(&decision)
+		err = tx.QueryRow(ctx, `SELECT a.decision FROM approvals a JOIN step_runs sr ON sr.id=a.request_id WHERE sr.workflow_run_id=$1 AND sr.status='awaiting_approval' AND a.approval_kind='workflow_step' ORDER BY a.requested_at DESC LIMIT 1`, item.WorkflowRunID).Scan(&decision)
 		if err != nil {
 			return err
 		}

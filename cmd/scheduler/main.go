@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -48,9 +49,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	store.ConfigureExactReviewEvidenceReader(artifacts)
+	prepared, err := store.RequirePreparedEvidenceReady(ctx, storeID)
+	if err != nil {
+		return fmt.Errorf("prepared evidence readiness: %w", err)
+	}
 	registry := providers.Registry(cfg)
 	orchestrator := &orchestration.Service{Config: cfg, Store: store, Registry: registry, Artifacts: artifacts}
 	service := scheduler.New(store, orchestrator, cfg.Scheduler)
-	slog.Info("Reconductor scheduler ready", "poll_interval", cfg.Scheduler.PollInterval, "max_concurrent_runs", cfg.Scheduler.MaxConcurrentRuns)
+	slog.Info("Reconductor scheduler ready", "poll_interval", cfg.Scheduler.PollInterval, "max_concurrent_runs", cfg.Scheduler.MaxConcurrentRuns, "prepared_open_sets", prepared.OpenSets, "prepared_max_open_sets", prepared.MaxOpenSets, "prepared_unresolved_bytes", prepared.UnresolvedBytes, "prepared_max_unresolved_bytes", prepared.MaxUnresolvedBytes)
 	return service.Run(ctx)
 }

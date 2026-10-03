@@ -38,6 +38,9 @@ func ensureTestArtifactStore(t *testing.T, ctx context.Context, store *Store) do
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := store.ConfigurePreparedEvidenceLimits(ctx, item.ID, 128, 1<<20, 128<<20); err != nil {
+		t.Fatal(err)
+	}
 	return item
 }
 
@@ -85,6 +88,18 @@ func TestArtifactStoreRegistrationIsIdentityIdempotent(t *testing.T) {
 	}
 	if time.Since(first.CreatedAt) < 0 {
 		t.Fatalf("created_at is in the future: %v", first.CreatedAt)
+	}
+}
+
+func TestPreparedEvidenceStatusReportsConfiguredEmptyCapacity(t *testing.T) {
+	store, ctx := schedulerIntegrationStore(t)
+	item := ensureTestArtifactStore(t, ctx, store)
+	status, err := store.RequirePreparedEvidenceReady(ctx, item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.MaxOpenSets != 128 || status.MaxSetBytes != 1<<20 || status.MaxUnresolvedBytes != 128<<20 || status.OpenSets != 0 || status.UnresolvedBytes != 0 {
+		t.Fatalf("unexpected prepared evidence status: %+v", status)
 	}
 }
 

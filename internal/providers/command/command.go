@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -76,30 +77,15 @@ type Runner interface {
 type OSRunner struct{}
 
 func (OSRunner) Run(ctx context.Context, name string, args []string, stdin []byte) ([]byte, []byte, int, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Stdin = bytes.NewReader(stdin)
-	var out, errOut bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errOut
-	err := cmd.Run()
-	code := 0
-	if err != nil {
-		var e *exec.ExitError
-		if errors.As(err, &e) {
-			code = e.ExitCode()
-		} else {
-			code = -1
-		}
-	}
-	return out.Bytes(), errOut.Bytes(), code, err
+	return runCaptured(ctx, name, args, stdin, capability.OutputBudget(ctx))
 }
 func (OSRunner) Version(ctx context.Context, name string, args []string) (string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	b, err := cmd.CombinedOutput()
-	if err != nil {
-		return strings.TrimSpace(string(b)), err
+	limit := capability.OutputBudget(ctx)
+	if limit > domain.DiagnosticMaxBytes {
+		limit = domain.DiagnosticMaxBytes
 	}
-	return strings.TrimSpace(string(b)), nil
+	out, stderr, _, err := runCaptured(ctx, name, args, nil, limit)
+	return strings.TrimSpace(string(out) + string(stderr)), err
 }
 
 type Provider struct {
@@ -220,6 +206,16 @@ func (p *Provider) Execute(ctx context.Context, req capability.Request) (capabil
 	}
 	version, versionErr := p.runner.Version(versionCtx, p.def.Executable, versionArgs)
 	versionCancel()
+	var versionLimit *capability.OutputLimitError
+	if errors.As(versionErr, &versionLimit) || len(version) > domain.DiagnosticMaxBytes {
+		result := capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID}}
+		limit := int64(domain.DiagnosticMaxBytes)
+		if versionLimit != nil {
+			limit = versionLimit.Limit
+		}
+		err := capability.RejectOutput(&result, limit)
+		return result, err
+	}
 	if p.def.Probe.Name != "" {
 		versionResult := providercheck.EvaluateExecutable(p.def.Probe, p.def.Executable, version, versionErr)
 		if versionResult.Status != providercheck.Compatible {
@@ -227,15 +223,32 @@ func (p *Provider) Execute(ctx context.Context, req capability.Request) (capabil
 		}
 	}
 	stdout, stderr, exit, runErr := p.runner.Run(runCtx, p.def.Executable, invocation.Args, invocation.Stdin)
+	budget := capability.OutputBudget(ctx)
+	var outputLimit *capability.OutputLimitError
+	if errors.As(runErr, &outputLimit) || int64(len(stdout)) > budget || int64(len(stderr)) > budget-int64(len(stdout)) {
+		result := capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID}}
+		err := capability.RejectOutput(&result, budget)
+		return result, err
+	}
 	completed := time.Now().UTC()
 	domains := append([]string{}, in.Domains...)
 	if in.Domain != "" {
 		domains = append(domains, in.Domain)
 	}
-	safeArgs, _ := json.Marshal(map[string]any{"provider": p.def.Provider, "target_count": len(in.Targets), "discovery_root_count": len(domains), "stdin_bytes": len(invocation.Stdin), "headless": in.Headless, "target_plan_digest": in.PlanDigest})
+	safeArgs, _ := json.Marshal(map[string]any{"provider": p.def.Provider, "target_count": len(in.Targets), "discovery_root_count": len(domains), "stdin_bytes": len(invocation.Stdin), "headless": in.Headless, "target_plan_digest": in.PlanDigest, "update_check_disabled": slices.Contains(invocation.Args, "-duc")})
 	safeStdout := p.redactor.Text(string(stdout))
 	safeStderr := p.redactor.Text(string(stderr))
-	lines := splitLines(safeStdout)
+	if int64(len(safeStdout)) > budget || int64(len(safeStderr)) > budget-int64(len(safeStdout)) {
+		result := capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID}}
+		err := capability.RejectOutput(&result, budget)
+		return result, err
+	}
+	lines, lineLimit := boundedLines(safeStdout)
+	if lineLimit {
+		result := capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID}}
+		err := capability.RejectSemanticItems(&result)
+		return result, err
+	}
 	normalized := ProviderOutput{Lines: lines, Authorized: lines, AuthorizedURLs: []string{}, AuthorizedRecords: []provideroutput.Record{}, Filtered: []targeting.FilterDecision{}, Records: []provideroutput.Record{}, Warnings: []provideroutput.Warning{}, AcceptedCount: len(lines), FilteredCount: 0}
 	if p.def.OutputAdapter != "" {
 		detailed, ok := req.Scope.(targeting.DetailedScope)
@@ -244,6 +257,7 @@ func (p *Provider) Execute(ctx context.Context, req capability.Request) (capabil
 		}
 		batch := provideroutput.Parse(p.def.OutputAdapter, lines)
 		accepted, authorizedURLs, authorizedRecords, filtered := filterRecords(detailed, batch.Records)
+		authorizedRecords = compactAuthorizedRecords(p.def.OutputAdapter, authorizedRecords)
 		normalized = ProviderOutput{Lines: accepted, Authorized: accepted, AuthorizedURLs: authorizedURLs, AuthorizedRecords: authorizedRecords, Filtered: filtered, Records: batch.Records, Warnings: batch.Warnings, AcceptedCount: len(accepted), FilteredCount: len(filtered)}
 		lines = accepted
 	}
@@ -253,21 +267,11 @@ func (p *Provider) Execute(ctx context.Context, req capability.Request) (capabil
 	if err := validateProviderOutput(normalized); err != nil {
 		return capability.Result{}, err
 	}
-	output, _ := json.Marshal(normalized)
-	if p.def.Name == "probe.http" {
-		var envelope map[string]json.RawMessage
-		if err := json.Unmarshal(output, &envelope); err != nil {
-			return capability.Result{}, err
-		}
-		sources, err := json.Marshal(normalized.AuthorizedSourceRecords)
-		if err != nil {
-			return capability.Result{}, err
-		}
-		envelope["authorized_source_records"] = sources
-		output, err = json.Marshal(envelope)
-		if err != nil {
-			return capability.Result{}, err
-		}
+	output, outputErr := marshalProviderOutput(normalized, p.def.Name == "probe.http", budget-int64(len(safeStdout))-int64(len(safeStderr)))
+	if outputErr != nil {
+		result := capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID}}
+		err := capability.RejectOutput(&result, budget)
+		return result, err
 	}
 	tool := &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: p.def.Name, Provider: p.def.Provider, ToolVersion: p.redactor.Text(version), SanitizedArguments: safeArgs, ExecutionEnvironment: json.RawMessage(`{"kind":"local-process","shell":false}`), StartedAt: started, CompletedAt: &completed, ExitCode: &exit, TimedOut: errors.Is(runCtx.Err(), context.DeadlineExceeded)}
 	result := capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: fmt.Sprintf("%s accepted %d normalized records", p.def.Provider, len(lines)), Output: output}, ToolRun: tool, RawStdout: []byte(safeStdout), RawStderr: []byte(safeStderr)}
@@ -295,7 +299,7 @@ func (p *Provider) versionFailure(req capability.Request, in Input, invocation I
 	if in.Domain != "" {
 		domains = append(domains, in.Domain)
 	}
-	safeArgs, _ := json.Marshal(map[string]any{"provider": p.def.Provider, "target_count": len(in.Targets), "discovery_root_count": len(domains), "stdin_bytes": len(invocation.Stdin), "headless": in.Headless, "target_plan_digest": in.PlanDigest})
+	safeArgs, _ := json.Marshal(map[string]any{"provider": p.def.Provider, "target_count": len(in.Targets), "discovery_root_count": len(domains), "stdin_bytes": len(invocation.Stdin), "headless": in.Headless, "target_plan_digest": in.PlanDigest, "update_check_disabled": slices.Contains(invocation.Args, "-duc")})
 	detail := diagnosticSnippet(p.redactor.Text(check.Details), 1024)
 	message := fmt.Sprintf("%s executable verification failed (%s): expected %s; configure %s with its full path", p.def.Provider, check.Status, check.ExpectedVersion, p.def.Probe.ExecutableEnv)
 	if detail != "" {
@@ -469,6 +473,45 @@ func filterRecords(sc targeting.DetailedScope, records []provideroutput.Record) 
 	return accepted, authorizedURLs, authorizedRecords, filtered
 }
 func scopeReason(value string) platformscope.Reason { return platformscope.Reason(value) }
+
+func compactAuthorizedRecords(adapter string, records []provideroutput.Record) []provideroutput.Record {
+	if adapter != "katana" {
+		return records
+	}
+	out := make([]provideroutput.Record, len(records))
+	for index, record := range records {
+		out[index] = record
+		out[index].Fields = compactKatanaFields(record.Fields)
+	}
+	return out
+}
+
+func compactKatanaFields(fields map[string]any) map[string]any {
+	out := make(map[string]any, len(fields))
+	for key, value := range fields {
+		switch strings.ToLower(key) {
+		case "body", "raw":
+			continue
+		}
+		out[key] = compactKatanaValue(value)
+	}
+	return out
+}
+
+func compactKatanaValue(value any) any {
+	switch current := value.(type) {
+	case map[string]any:
+		return compactKatanaFields(current)
+	case []any:
+		out := make([]any, len(current))
+		for index, item := range current {
+			out[index] = compactKatanaValue(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
 
 func validateProviderOutput(output ProviderOutput) error {
 	if output.Lines == nil || output.Authorized == nil || output.AuthorizedURLs == nil || output.AuthorizedRecords == nil || output.Filtered == nil || output.Records == nil || output.Warnings == nil {

@@ -107,6 +107,9 @@ func (s *Store) reconcileStaleScheduledExecutions(ctx context.Context, limit int
 	if limit < 1 {
 		return nil
 	}
+	if err := s.ReconcileDeferredApprovalRejections(ctx, limit); err != nil {
+		return err
+	}
 	excluded := make([]domain.ID, 0, limit)
 	for attempts := 0; attempts < limit; attempts++ {
 		tx, err := s.Pool.Begin(ctx)
@@ -142,6 +145,15 @@ func (s *Store) reconcileStaleScheduledExecutions(ctx context.Context, limit int
 			continue
 		}
 		plan := classifyStaleLineage(entry, &lineage)
+		pending, err := hasUnresolvedScheduledPrepared(ctx, tx, entry.item.ID, entry.item.AttemptCount)
+		if err != nil {
+			tx.Rollback(ctx)
+			return err
+		}
+		if pending {
+			tx.Rollback(ctx)
+			continue
+		}
 		if err := applyStaleLineageReconciliation(ctx, tx, entry, lineage, plan); err != nil {
 			tx.Rollback(ctx)
 			return err
@@ -164,6 +176,8 @@ func lockNextStaleScheduledExecution(ctx context.Context, tx pgx.Tx, excluded []
 		JOIN schedules s ON s.id=se.schedule_id
 		WHERE se.status IN ('claimed','running')
 		  AND se.lease_expires_at<=clock_timestamp()
+		  AND NOT EXISTS (SELECT 1 FROM prepared_evidence_sets p JOIN step_runs sr ON sr.id=p.step_run_id JOIN audit_events provider ON provider.id=p.provider_attempt_id
+		    WHERE provider.scheduled_execution_id=se.id AND provider.scheduler_attempt=se.attempt_count AND p.step_attempt=sr.attempt_count AND p.lifecycle_state IN ('ALLOCATED','SEALED','QUARANTINED'))
 		  AND NOT (se.id=ANY($1::uuid[]))
 		ORDER BY se.lease_expires_at,se.id
 		LIMIT 1
@@ -311,8 +325,8 @@ func lockScheduledExecutionLineage(ctx context.Context, tx pgx.Tx, entry staleRe
 	approvalIDs := []domain.ID{}
 	if len(lineage.steps) > 0 || len(candidateTaskIDs) > 0 {
 		rows, err := tx.Query(ctx, `SELECT id FROM approvals
-			WHERE request_id=ANY($1::uuid[])
-			   OR (task_id=ANY($2::uuid[]) AND decision='pending')
+			WHERE COALESCE(to_jsonb(approvals)->>'approval_kind','workflow_step')='workflow_step' AND (request_id=ANY($1::uuid[])
+			   OR (task_id=ANY($2::uuid[]) AND decision='pending'))
 			ORDER BY id`, idStrings(recoveryStepIDs(lineage.steps)), idStrings(candidateTaskIDs))
 		if err != nil {
 			return staleLineage{}, false, err
@@ -331,7 +345,7 @@ func lockScheduledExecutionLineage(ctx context.Context, tx pgx.Tx, entry staleRe
 		}
 	}
 	if len(approvalIDs) > 0 {
-		rows, err := tx.Query(ctx, `SELECT id,request_id,task_id,action_request_id,decision FROM approvals WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE SKIP LOCKED`, idStrings(approvalIDs))
+		rows, err := tx.Query(ctx, `SELECT id,request_id,task_id,action_request_id,decision FROM approvals WHERE id=ANY($1::uuid[]) AND COALESCE(to_jsonb(approvals)->>'approval_kind','workflow_step')='workflow_step' ORDER BY id FOR UPDATE SKIP LOCKED`, idStrings(approvalIDs))
 		if err != nil {
 			return staleLineage{}, false, err
 		}
@@ -710,7 +724,7 @@ func applyStaleLineageReconciliation(ctx context.Context, tx pgx.Tx, entry stale
 			if !containsRecoveryID(plan.eligibleApprovalIDs, approval.id) || approval.decision != "pending" {
 				continue
 			}
-			tag, err := tx.Exec(ctx, `UPDATE approvals SET decision='expired',decided_by='scheduler',decided_at=$2 WHERE id=$1 AND decision='pending'`, approval.id, recoveredAt)
+			tag, err := tx.Exec(ctx, `UPDATE approvals SET decision='expired',decided_by='scheduler',decided_at=$2 WHERE id=$1 AND COALESCE(to_jsonb(approvals)->>'approval_kind','workflow_step')='workflow_step' AND decision='pending'`, approval.id, recoveredAt)
 			if err != nil {
 				return err
 			}
