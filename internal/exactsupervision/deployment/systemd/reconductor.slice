@@ -1,0 +1,6 @@
+[Unit]
+Description=Reconductor slice
+StopWhenUnneeded=no
+RefuseManualStop=yes
+
+[Slice]

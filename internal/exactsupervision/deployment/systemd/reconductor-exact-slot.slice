@@ -1,0 +1,9 @@
+[Unit]
+Description=Reconductor persistent exact execution slot
+StopWhenUnneeded=no
+RefuseManualStop=yes
+
+[Slice]
+
+[Install]
+WantedBy=multi-user.target

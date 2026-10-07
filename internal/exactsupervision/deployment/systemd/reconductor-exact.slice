@@ -1,0 +1,6 @@
+[Unit]
+Description=Reconductor exact execution slice
+StopWhenUnneeded=no
+RefuseManualStop=yes
+
+[Slice]
