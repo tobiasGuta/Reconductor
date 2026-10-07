@@ -17,7 +17,7 @@ Scan windows are UTC, start-inclusive, and end-exclusive. Accepted forms are `HH
 | `IntrusiveChecks` | trusted capability manifest requirements | `policy_denied` before provider validation |
 | `ArtifactRetention` | artifact creation and database expiry assignment | `artifact_retention_applied` audit |
 
-`POLICY_ARTIFACT_RETENTION` defaults to `720h`. It currently assigns `expires_at` metadata only; automatic content and Artifact-row deletion are disabled, and expired bytes accumulate. Set it to `0s` only when indefinite retention metadata is explicitly intended. Existing artifacts from before the expiry migration retain a null expiry and are not retroactively changed. See [artifact storage ownership](artifact-storage.md).
+`POLICY_ARTIFACT_RETENTION` defaults to `720h` and assigns immutable cleanup eligibility through `expires_at`. Cleanup is an explicit bounded operator action: `platform artifact-store cleanup [--batch-size N]` removes expired physical content and tombstones the retained Artifact row; it never deletes evidence metadata. Retryable filesystem errors enter `RETRY_WAIT`, unsafe entry types enter terminal `QUARANTINED`, and claim-token fencing prevents stale workers from finalizing another claim. Set retention to `0s` only when indefinite retention metadata is explicitly intended. Existing artifacts from before the expiry migration retain a null expiry and are not retroactively changed. See [artifact storage ownership](artifact-storage.md).
 
 Approval records link a request, task, action, risk, reason, decision maker, decision time, and optional expiration. Policy is evaluated before dispatch and again inside the worker immediately before execution.
 

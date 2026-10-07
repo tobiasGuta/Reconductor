@@ -1,0 +1,529 @@
+{
+  "account": {
+    "forbidden_authority": [
+      "generic_cgroup_management",
+      "db_credentials",
+      "redis_credentials",
+      "evidence_credentials",
+      "authority_descriptors"
+    ],
+    "forbidden_memberships": [
+      "wheel",
+      "docker",
+      "operator"
+    ],
+    "numeric_gid": null,
+    "numeric_uid": null,
+    "primary_group": "reconductor-exact",
+    "provisioning": "trusted_administrator_or_package",
+    "requirements": [
+      "non_root",
+      "stable_static_named_identity",
+      "locked_password",
+      "non_login_shell",
+      "no_useful_home",
+      "no_operator_session",
+      "no_authority_identity_sharing",
+      "no_unrelated_supplementary_memberships"
+    ],
+    "supplementary_groups_directive_erases_database_memberships": false,
+    "sysusers_selected": false,
+    "user": "reconductor-exact",
+    "verify_actual_account_and_process_groups": true
+  },
+  "anchor": {
+    "admission": {
+      "boundary": "future_trusted_start_backend_preflight",
+      "fresh_check_required": true,
+      "gid_equals_actual_primary_group": true,
+      "mismatch_prevents_start": true,
+      "privileged_replacement_during_invocation_forbidden": true,
+      "uid_equals_actual_account": true
+    },
+    "age_cleanup": false,
+    "automatic_live_replacement": false,
+    "contents_semantic": false,
+    "identity_source": "st_uid_and_st_gid_only",
+    "mode": "0600",
+    "owner": "reconductor-exact:reconductor-exact",
+    "parent": "/run/reconductor-exact",
+    "parent_mode": "0755",
+    "parent_owner": "root:root",
+    "path": "/run/reconductor-exact/execution.identity",
+    "provisioning": "tmpfiles_intent_only",
+    "requirements": [
+      "regular_file",
+      "one_link",
+      "no_setuid",
+      "no_setgid",
+      "no_group_or_world_write",
+      "protected_ancestors",
+      "validated_full_root_runtime_tmpfs"
+    ],
+    "tmpfiles_attributes": "creation_only",
+    "tmpfiles_creates_when_absent": true,
+    "tmpfiles_is_admission_proof": false,
+    "tmpfiles_repairs_existing_mode_or_ownership": false
+  },
+  "capacity": {
+    "authority": "package_owned_exactsupervision_capacity",
+    "model": "serial_one_execution",
+    "optional_pid1_defense": {
+      "classification": "defense_in_depth_only",
+      "implemented": false,
+      "property": "ConcurrencyHardMax",
+      "replaces_capacity": false
+    },
+    "queuing": false,
+    "release_requires": [
+      "original_invocation_final_milestone",
+      "fresh_later_pinned_slot_populated_zero"
+    ],
+    "soft_concurrency_limit": false
+  },
+  "cleanup_helper": {
+    "arguments": [],
+    "artifact_requirements": [
+      "reviewed_static_artifact",
+      "root_owned_regular_file",
+      "protected_root_owned_ancestors",
+      "no_group_or_world_write",
+      "no_setuid",
+      "no_setgid",
+      "no_file_capabilities",
+      "no_elf_interpreter_or_dynamic_dependencies",
+      "verified_digest_and_provenance",
+      "expected_selinux_label"
+    ],
+    "inherited_fds_above_standard": "helper_closes_fail_closed",
+    "no_nss_lookup": true,
+    "path": "/usr/libexec/reconductor/exact-cleanup",
+    "privileged_mutation": "own_validated_cgroup_kill_only_after_root_preopen_and_privilege_reduction",
+    "static_linkage_sanitizes_environment": false,
+    "wrappers": []
+  },
+  "deployment_integrity": {
+    "caller_overrides": false,
+    "dropins": {
+      "applicable_scopes": [
+        "type_wide",
+        "template",
+        "instance_specific",
+        "dash_prefix",
+        "alias_related"
+      ],
+      "classes": {
+        "reconductor_owned": "required_exact_reviewed_artifacts",
+        "reviewed_external_vendor": "reviewed_deployment_context_and_provenance",
+        "unknown_unapproved": "reject_admission"
+      },
+      "owned_artifacts": [
+        {
+          "artifact": "systemd/reconductor-exact-run@.service.d/90-reconductor-exact-stop-timeout.conf",
+          "dormant_without_service_template": true,
+          "installed_path": "/usr/lib/systemd/system/reconductor-exact-run@.service.d/90-reconductor-exact-stop-timeout.conf",
+          "required_properties": {
+            "TimeoutStopFailureMode": "kill"
+          },
+          "requirements": [
+            "expected_path",
+            "root_owned_protected_ancestors",
+            "root_owned_regular_non_symlink_file",
+            "no_group_or_world_write",
+            "reviewed_content_hash_and_provenance"
+          ]
+        }
+      ],
+      "path_allowlist_alone_is_authority": false,
+      "reject_instance_specific_replacement": true,
+      "reject_unexpected_same_name_override": true,
+      "search_roots": [
+        "/etc/systemd/system",
+        "/run/systemd/system",
+        "/usr/lib/systemd/system"
+      ],
+      "stock_fedora_context": {
+        "observed_TimeoutStopFailureMode": "abort",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "proof_payload_digest_pinned": false,
+        "type_wide_dropins_affect_exact_services": true,
+        "vendor_file_modification": false
+      },
+      "unknown_or_later_effective_mismatch": "reject_admission"
+    },
+    "final_effective_properties": {
+      "comparison_authority": "loaded_PID1_configuration_after_all_unit_and_dropin_processing",
+      "main_unit_values_alone_sufficient": false,
+      "mismatch": "reject_admission",
+      "other_frozen_mechanics_still_required": true,
+      "owned_dropin_presence_alone_sufficient": false,
+      "required_before_admission": true,
+      "requirements": {
+        "TimeoutStartFailureMode": "kill",
+        "TimeoutStopFailureMode": "kill"
+      }
+    },
+    "reject_pending_reload_or_mismatch": true,
+    "root_owned_reviewed_artifacts": true,
+    "trusted_configuration_stable_until_cleanup": true,
+    "verify_digest_and_provenance": true,
+    "verify_loaded_configuration": true
+  },
+  "descriptors": {
+    "authority_bearing_standard_streams": false,
+    "forbidden_mechanisms": [
+      "execution_leaf_socket_activation",
+      "OpenFile",
+      "named_io",
+      "credential_fds",
+      "fd_store_inputs",
+      "watchdog_fd",
+      "notification_fd"
+    ],
+    "journal_stream_required": false,
+    "standard": {
+      "stderr": "null",
+      "stdin": "null",
+      "stdout": "null"
+    },
+    "tty": false
+  },
+  "environment": {
+    "checker_implemented": false,
+    "denied_sources": [
+      "EnvironmentFile",
+      "PassEnvironment",
+      "PAMName",
+      "credentials",
+      "activation",
+      "watchdog",
+      "notification",
+      "LogNamespace",
+      "directory_environment_features",
+      "execution_caller_manager_environment_mutation"
+    ],
+    "future_fixed_settings": {
+      "ExecSearchPath": "",
+      "MemoryPressureWatch": "skip",
+      "SetLoginEnvironment": "no"
+    },
+    "generated_names_to_remove": [
+      "USER",
+      "INVOCATION_ID",
+      "SYSTEMD_EXEC_PID",
+      "MAINPID",
+      "MAINPIDFDID",
+      "SERVICE_RESULT",
+      "EXIT_CODE",
+      "EXIT_STATUS"
+    ],
+    "global_service_environment": "fresh_closed_allowlist_check_before_admission",
+    "known_name_denylist_is_security_boundary": false,
+    "peer_assignments": {
+      "LANG": "C",
+      "LC_ALL": "C",
+      "TZ": "UTC"
+    },
+    "remove_global_default_path": true,
+    "reset_unit_assignments_before_fixed_values": true,
+    "sanitization_in_main_is_sufficient": false,
+    "security_boundary": "complete_trusted_source_closure_before_exec",
+    "shared_helper_environment": "same_fixed_three_trusted_assignments",
+    "unknown_global_entry": "reject_admission"
+  },
+  "failure": {
+    "automatic_recovery": false,
+    "helper_failure_or_incomplete_observation": "cleanup_unconfirmed_no_capacity_reuse",
+    "helper_retry": false,
+    "quarantine_on": [
+      "unexpected_reactivation",
+      "changed_InvocationID",
+      "lost_observer_identity",
+      "post_final_command"
+    ],
+    "replay": false,
+    "resend": false,
+    "reuse_original_instance": false
+  },
+  "future_service": {
+    "action_input_channels_forbidden": [
+      "argv",
+      "environment",
+      "unit_properties",
+      "instance_name",
+      "temporary_file_path"
+    ],
+    "exec_start": {
+      "command": null,
+      "status": "unresolved_no_reviewed_production_peer"
+    },
+    "handoff": {
+      "admitted_material_owner": "trusted_worker_broker",
+      "attempt": "one_designated_connection",
+      "direction": "outbound_empty_handed_peer",
+      "reconnect_replay": false,
+      "sandbox_control_socket_access": false
+    },
+    "installable_artifact_present": false,
+    "properties": {
+      "Delegate": "no",
+      "ExecStopPost": "-+/usr/libexec/reconductor/exact-cleanup",
+      "ExitType": "main",
+      "FinalKillSignal": "SIGKILL",
+      "Group": "reconductor-exact",
+      "KillMode": "control-group",
+      "KillSignal": "SIGTERM",
+      "NotifyAccess": "none",
+      "OOMPolicy": "kill",
+      "RemainAfterExit": "no",
+      "Restart": "no",
+      "RestartForceExitStatus": "",
+      "SendSIGKILL": "yes",
+      "Slice": "reconductor-exact-slot.slice",
+      "StandardError": "null",
+      "StandardInput": "null",
+      "StandardOutput": "null",
+      "SupplementaryGroups": "",
+      "TimeoutStartFailureMode": "kill",
+      "TimeoutStopFailureMode": "kill",
+      "Type": "exec",
+      "User": "reconductor-exact"
+    },
+    "template": "reconductor-exact-run@.service",
+    "withheld": true
+  },
+  "hardening": {
+    "api_vfs": {
+      "helper_actual_views_required": [
+        "/proc",
+        "/sys/fs/cgroup",
+        "/run"
+      ],
+      "helper_mount_namespace_may_be_cloned": true,
+      "ordinary_cgroup_view": "full_host_hierarchy_read_only_no_private_cgroup_namespace",
+      "ordinary_setup_implied_by": "ProtectControlGroups=yes",
+      "privileged_stop_post_protection_parameters": "bypassed",
+      "prohibited_view_replacements": [
+        "RootDirectory",
+        "RootImage",
+        "BindPaths",
+        "BindReadOnlyPaths",
+        "TemporaryFileSystem",
+        "namespace_joins"
+      ],
+      "require_helper_mount_namespace_equal_pid1": false,
+      "source_baseline": "https://github.com/systemd/systemd/tree/v259.9",
+      "standalone_mount_apivfs_assignment": "omitted"
+    },
+    "deferred": [
+      "PrivateDevices",
+      "ProtectKernelTunables",
+      "ProtectKernelLogs",
+      "MemoryDenyWriteExecute",
+      "SystemCallFilter"
+    ],
+    "properties": {
+      "AmbientCapabilities": "",
+      "CapabilityBoundingSet": "",
+      "LockPersonality": "yes",
+      "MemoryDenyWriteExecute": "no",
+      "NoNewPrivileges": "yes",
+      "PrivateDevices": "no",
+      "PrivateMounts": "yes",
+      "PrivateTmp": "yes",
+      "PrivateUsers": "no",
+      "ProcSubset": "all",
+      "ProtectControlGroups": "yes",
+      "ProtectHome": "yes",
+      "ProtectKernelLogs": "no",
+      "ProtectKernelModules": "yes",
+      "ProtectKernelTunables": "no",
+      "ProtectProc": "default",
+      "ProtectSystem": "strict",
+      "RestrictNamespaces": "no",
+      "RestrictSUIDSGID": "yes",
+      "SystemCallFilter": ""
+    }
+  },
+  "installation": {
+    "boot_enabled_unit": "reconductor-exact-slot.slice",
+    "boot_target": "multi-user.target",
+    "default_execution_instance": null,
+    "install_only_not_applied_here": true,
+    "proof_status": "disposable_Fedora_proof_pending",
+    "service_template_installation": "withheld",
+    "slice_directory": "/usr/lib/systemd/system",
+    "tmpfiles_directory": "/usr/lib/tmpfiles.d"
+  },
+  "instance": {
+    "all_zero_syntactically_valid": true,
+    "arbitrary_escaped_names": false,
+    "encoding": "lowercase_ascii_hex",
+    "grammar": "^[0-9a-f]{32}$",
+    "lifecycle_identity_only": true,
+    "reuse_for_recovery": false,
+    "validate_before": "StartUnit",
+    "validator": "exactsupervision.ParseInstanceID"
+  },
+  "kind": "policy_only_unpromoted_deployment_contract",
+  "observation": {
+    "child_gc_is_cleanup_proof": false,
+    "cleanup_requires": [
+      "original_invocation_final_milestone",
+      "fresh_later_pinned_slot_populated_zero"
+    ],
+    "final_milestone": {
+      "control_pid_zero": true,
+      "no_later_invocation_command": true,
+      "stop_post_observed_and_completed": true,
+      "terminal_states": [
+        {
+          "active": "inactive",
+          "sub": "dead"
+        },
+        {
+          "active": "failed",
+          "sub": "failed"
+        }
+      ]
+    },
+    "implemented": false,
+    "insufficient": [
+      "helper_SIGKILL",
+      "helper_write_return",
+      "ExecStopPost_result",
+      "unit_Result",
+      "UnitRemoved",
+      "child_cgroup_disappearance",
+      "early_populated_zero",
+      "cgroup_events_failure"
+    ],
+    "observer_outside_slot": true,
+    "ordinary_systemd_group_kill_is_atomic_proof": false,
+    "original_identity": [
+      "boot",
+      "pinned_slot_generation",
+      "owner_generation",
+      "InvocationID"
+    ],
+    "read_error": "cleanup_unconfirmed",
+    "reference_before_start_until_final_evidence": true,
+    "trusted_evidence_issuer_public": false
+  },
+  "resources": {
+    "admission_disabled_until_reviewed_numbers": true,
+    "caller_or_transient_overrides": false,
+    "finite_time_mechanisms": [
+      "RuntimeMaxSec",
+      "TimeoutStartSec",
+      "TimeoutStopSec"
+    ],
+    "layer": "future_fixed_reviewed_resource_dropin",
+    "numerical_policy_owner": "4B4B4",
+    "numerical_values": null,
+    "required_mechanisms": [
+      "MemoryMax",
+      "MemorySwapMax",
+      "TasksMax",
+      "CPUQuota",
+      "RuntimeMaxSec",
+      "TimeoutStartSec",
+      "TimeoutStopSec",
+      "OOMPolicy"
+    ]
+  },
+  "schema_version": "1",
+  "scope": {
+    "directory": "internal/exactsupervision/deployment",
+    "documentation": "internal/exactsupervision/deployment/README.md",
+    "forbidden_modified_paths": [
+      "README.md",
+      ".agents/",
+      "agents/",
+      "internal/hypothesis/eval/",
+      "internal/exactsupervision/native/"
+    ],
+    "production_admission_enabled": false,
+    "runtime_authority": false,
+    "unimplemented": [
+      "production_peer",
+      "worker_integration",
+      "start_backend",
+      "observer_backend",
+      "dbus",
+      "polkit",
+      "runner_promotion"
+    ]
+  },
+  "selinux": {
+    "custom_policy": false,
+    "enforcement_disable": false,
+    "future_proof_requires": [
+      "inspect_AVCs",
+      "verify_actual_labels",
+      "verify_supported_views_and_operations"
+    ],
+    "observer_confinement": "later_deployment_work",
+    "target": "Fedora_SELinux_Enforcing_stock_policy",
+    "unconfined_observer_is_production_proof": false
+  },
+  "start_authority": {
+    "boundary": "future_trusted_worker_side_admission",
+    "caller_supplied_properties": false,
+    "forbidden_operations": [
+      "generic_systemctl_control",
+      "generic_StartUnit",
+      "generic_KillUnit",
+      "transient_unit_creation",
+      "unit_property_mutation",
+      "arbitrary_manager_dbus"
+    ],
+    "generic_execution_identity_manager_authority": false,
+    "implemented": false,
+    "operation": "narrow_fixed_start_only",
+    "required_before_start": [
+      "validate_instance",
+      "verify_deployment_integrity",
+      "verify_account_anchor_binding",
+      "verify_observer_ownership_and_generation",
+      "reserve_serial_capacity",
+      "reference_fixed_instance"
+    ]
+  },
+  "systemd_baseline": "v259.9",
+  "topology": {
+    "activate_execution_at_boot": false,
+    "default_dependencies": true,
+    "execution_cgroup_pattern": "/reconductor.slice/reconductor-exact.slice/reconductor-exact-slot.slice/reconductor-exact-run@<32hex>.service",
+    "explicit_slices_required": true,
+    "maintenance": "verify_identity_and_ownership_continuity_after_reload_or_reexec",
+    "persistent_while_empty": true,
+    "refuse_manual_stop": true,
+    "sentinel_process": false,
+    "shutdown": "disarm_admission_and_end_observation_generation",
+    "slices": [
+      {
+        "activation": "parent_dependency",
+        "cgroup": "/reconductor.slice",
+        "parent": "-.slice",
+        "unit": "reconductor.slice"
+      },
+      {
+        "activation": "parent_dependency",
+        "cgroup": "/reconductor.slice/reconductor-exact.slice",
+        "parent": "reconductor.slice",
+        "unit": "reconductor-exact.slice"
+      },
+      {
+        "activation": "multi-user.target",
+        "cgroup": "/reconductor.slice/reconductor-exact.slice/reconductor-exact-slot.slice",
+        "parent": "reconductor-exact.slice",
+        "unit": "reconductor-exact-slot.slice"
+      }
+    ],
+    "slot_cgroup": "/reconductor.slice/reconductor-exact.slice/reconductor-exact-slot.slice",
+    "slot_identity": "pinned_boot_device_inode_mount_and_available_kernel_cgroup_id",
+    "slot_unit": "reconductor-exact-slot.slice",
+    "stop_when_unneeded": false
+  }
+}

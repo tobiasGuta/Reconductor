@@ -27,7 +27,7 @@ const (
 		a.decision,a.decided_by,a.decided_at,a.expires_at,count(*) OVER(),bool_or(a.task_id<>$2) OVER()
 		FROM approvals a
 		JOIN step_runs sr ON sr.id=a.request_id
-		WHERE sr.workflow_run_id=$1
+		WHERE sr.workflow_run_id=$1 AND COALESCE(to_jsonb(a)->>'approval_kind','workflow_step')='workflow_step'
 		ORDER BY a.requested_at ASC,a.id ASC
 		LIMIT $3`
 	executionProjectionArtifactsQuery = `SELECT a.id,a.task_id,a.workflow_run_id,a.step_run_id,a.tool_run_id,a.type,a.content_type,

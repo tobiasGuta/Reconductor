@@ -9,39 +9,45 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tobiasGuta/Reconductor/internal/artifact"
+	"github.com/tobiasGuta/Reconductor/internal/canonicaljson"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/normalize"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
+	"github.com/tobiasGuta/Reconductor/internal/strictjsonschema"
 )
 
 type Manifest struct {
-	Name                  string              `json:"name"`
-	Description           string              `json:"description"`
-	Version               string              `json:"version"`
-	Risk                  policy.Risk         `json:"risk"`
-	InputSchema           json.RawMessage     `json:"input_schema"`
-	OutputSchema          json.RawMessage     `json:"output_schema"`
-	RequiredScopeType     string              `json:"required_scope_type"`
-	ApprovalRequired      bool                `json:"approval_required"`
-	RetrySafe             bool                `json:"retry_safe"`
-	Idempotent            bool                `json:"idempotent"`
-	SupportedProviders    []string            `json:"supported_providers"`
-	ProducedArtifactTypes []string            `json:"produced_artifact_types"`
-	RequiredSecrets       []string            `json:"required_secrets"`
-	PolicyRequirements    policy.Requirements `json:"policy_requirements"`
-	DefaultTimeout        time.Duration       `json:"default_timeout"`
+	Name                              string              `json:"name"`
+	Description                       string              `json:"description"`
+	Version                           string              `json:"version"`
+	Risk                              policy.Risk         `json:"risk"`
+	InputSchema                       json.RawMessage     `json:"input_schema"`
+	OutputSchema                      json.RawMessage     `json:"output_schema"`
+	RequiredScopeType                 string              `json:"required_scope_type"`
+	ApprovalRequired                  bool                `json:"approval_required"`
+	RetrySafe                         bool                `json:"retry_safe"`
+	Idempotent                        bool                `json:"idempotent"`
+	SupportedProviders                []string            `json:"supported_providers"`
+	ProducedArtifactTypes             []string            `json:"produced_artifact_types"`
+	RequiredSecrets                   []string            `json:"required_secrets"`
+	PolicyRequirements                policy.Requirements `json:"policy_requirements"`
+	DefaultTimeout                    time.Duration       `json:"default_timeout"`
+	SupportsSemanticBindingReferences bool                `json:"supports_semantic_binding_references"`
 }
 type Request struct {
-	Action             domain.ActionRequest       `json:"action"`
-	ProgramID          domain.ID                  `json:"program_id"`
-	Provider           string                     `json:"provider"`
-	Approved           bool                       `json:"approved"`
-	Policy             policy.Policy              `json:"policy"`
-	Scope              Scope                      `json:"scope"`
-	PolicyPhase        string                     `json:"-"`
-	DecisionRecorder   PolicyDecisionRecorder     `json:"-"`
-	InvocationRecorder ProviderInvocationRecorder `json:"-"`
-	QueueJobID         *domain.ID                 `json:"-"`
+	Action                  domain.ActionRequest       `json:"action"`
+	ProgramID               domain.ID                  `json:"program_id"`
+	Provider                string                     `json:"provider"`
+	Approved                bool                       `json:"approved"`
+	Policy                  policy.Policy              `json:"policy"`
+	Scope                   Scope                      `json:"scope"`
+	PolicyPhase             string                     `json:"-"`
+	DecisionRecorder        PolicyDecisionRecorder     `json:"-"`
+	InvocationRecorder      ProviderInvocationRecorder `json:"-"`
+	QueueJobID              *domain.ID                 `json:"-"`
+	PreparedStoreIdentity   *artifact.StoreIdentity    `json:"-"`
+	RequirePreparedEvidence bool                       `json:"-"`
 }
 
 type PolicyDecisionRecord struct {
@@ -107,8 +113,21 @@ type ProviderInvocationRecorder interface {
 	RecordProviderInvocationStarted(context.Context, ProviderInvocationStartRecord) (domain.ID, error)
 	RecordProviderInvocationTerminal(context.Context, ProviderInvocationTerminalRecord) error
 }
+type ProviderInvocationAdmission struct {
+	ProviderAttemptID     domain.ID
+	PreparedSetID         domain.ID
+	ManifestID            domain.ID
+	ReservedCapacityBytes int64
+}
+type PreparedProviderInvocationAllocator interface {
+	AllocateProviderInvocation(context.Context, ProviderInvocationStartRecord, artifact.StoreIdentity) (ProviderInvocationAdmission, error)
+}
 type ResultAdmissionProvenance struct {
 	ProviderAttemptID             domain.ID
+	PreparedSetID                 domain.ID
+	ManifestID                    domain.ID
+	ProviderTerminalEventID       domain.ID
+	ReservedCapacityBytes         int64
 	ActionRequestID               domain.ID
 	StepAttempt                   int
 	QueueJobID                    *domain.ID
@@ -116,14 +135,18 @@ type ResultAdmissionProvenance struct {
 	Provider                      string
 }
 type Result struct {
-	Action              domain.ActionResult        `json:"action"`
-	EffectiveInput      json.RawMessage            `json:"effective_input,omitempty"`
-	ToolRun             *domain.ToolRun            `json:"tool_run,omitempty"`
-	RawStdout           []byte                     `json:"-"`
-	RawStderr           []byte                     `json:"-"`
-	ProviderAttemptID   *domain.ID                 `json:"-"`
-	AdmissionProvenance *ResultAdmissionProvenance `json:"-"`
-	TerminalAuditError  error                      `json:"-"`
+	OutputLimit         *domain.ResultContractLimitV1  `json:"-"`
+	Action              domain.ActionResult            `json:"action"`
+	EffectiveInput      json.RawMessage                `json:"effective_input,omitempty"`
+	ToolRun             *domain.ToolRun                `json:"tool_run,omitempty"`
+	RawStdout           []byte                         `json:"-"`
+	RawStderr           []byte                         `json:"-"`
+	RawDiagnostic       []byte                         `json:"-"`
+	Envelope            *domain.ResultEnvelopeV1       `json:"-"`
+	ProviderOutcome     domain.ResultProviderOutcomeV1 `json:"-"`
+	ProviderAttemptID   *domain.ID                     `json:"-"`
+	AdmissionProvenance *ResultAdmissionProvenance     `json:"-"`
+	TerminalAuditError  error                          `json:"-"`
 }
 type Scope interface{ Allows(string) bool }
 type Capability interface {
@@ -245,7 +268,7 @@ func (r *Registry) Execute(ctx context.Context, req Request) (Result, error) {
 	if req.InvocationRecorder == nil {
 		return Result{}, fmt.Errorf("provider invocation recorder is required")
 	}
-	attemptID, err := req.InvocationRecorder.RecordProviderInvocationStarted(ctx, ProviderInvocationStartRecord{
+	startRecord := ProviderInvocationStartRecord{
 		ProgramID:                     req.ProgramID,
 		TaskID:                        req.Action.TaskID,
 		WorkflowRunID:                 req.Action.WorkflowRunID,
@@ -257,7 +280,19 @@ func (r *Registry) Execute(ctx context.Context, req Request) (Result, error) {
 		Capability:                    req.Action.Capability,
 		Provider:                      req.Provider,
 		Actor:                         req.Action.RequestedBy,
-	})
+	}
+	var preparedAdmission ProviderInvocationAdmission
+	var attemptID domain.ID
+	if req.RequirePreparedEvidence {
+		allocator, ok := req.InvocationRecorder.(PreparedProviderInvocationAllocator)
+		if !ok || req.PreparedStoreIdentity == nil {
+			return Result{}, fmt.Errorf("durable prepared-evidence allocator is required")
+		}
+		preparedAdmission, err = allocator.AllocateProviderInvocation(ctx, startRecord, *req.PreparedStoreIdentity)
+		attemptID = preparedAdmission.ProviderAttemptID
+	} else {
+		attemptID, err = req.InvocationRecorder.RecordProviderInvocationStarted(ctx, startRecord)
+	}
 	if err != nil {
 		return Result{}, fmt.Errorf("persist provider invocation start: %w", err)
 	}
@@ -266,35 +301,99 @@ func (r *Registry) Execute(ctx context.Context, req Request) (Result, error) {
 	}
 	executionReq := req
 	executionReq.QueueJobID = copyIDPointer(trustedQueueJobID)
-	result, providerErr := c.Execute(ctx, executionReq)
-	sourceContractFailure := false
+	budget := int64(domain.ResultEnvelopeMaxBytes)
+	if req.RequirePreparedEvidence {
+		budget = preparedAdmission.ReservedCapacityBytes
+		if budget < 1 || budget > domain.PreparedSetOutputAuthorityMaxBytes {
+			return Result{}, &domain.UnresolvedPersistenceError{Err: fmt.Errorf("invalid allocated output byte authority")}
+		}
+	}
+	providerCtx := ctx
+	if req.RequirePreparedEvidence {
+		providerCtx = WithOutputBudget(ctx, budget)
+	}
+	result, providerErr := c.Execute(providerCtx, executionReq)
+	if limitErr := EnforceOutputBudget(&result, budget); limitErr != nil {
+		providerErr = limitErr
+	}
+	if providerErr != nil && len(result.RawDiagnostic) == 0 {
+		message := providerErr.Error()
+		if int64(len(message)) > budget {
+			providerErr = RejectOutput(&result, budget)
+		} else {
+			result.RawDiagnostic = []byte(message)
+		}
+	}
 	if providerErr == nil && result.Action.Status == "succeeded" && req.Action.Capability == "probe.http" {
-		decorated, decorateErr := normalize.AttachProbeHTTPSourceRecords(result.Action.Output, string(req.ProgramID), string(attemptID), req.Action.Input)
+		// Check numeric/escape expansion before source-record canonicalization.
+		_, _, _, _, preflightErr := canonicaljson.ParseStrictBounded(result.Action.Output, int(budget))
+		var decorated json.RawMessage
+		decorateErr := preflightErr
+		if decorateErr == nil {
+			decorated, decorateErr = normalize.AttachProbeHTTPSourceRecordsBounded(result.Action.Output, string(req.ProgramID), string(attemptID), req.Action.Input, int(budget))
+		}
 		if decorateErr != nil {
-			result.Action.Status = "failed"
-			result.Action.Error = &domain.StructuredError{Classification: "source_contract", Message: "probe HTTP source lineage could not be derived", Retryable: false}
-			providerErr = fmt.Errorf("decorate probe.http source lineage: %w", decorateErr)
-			sourceContractFailure = true
+			var encodingLimit *canonicaljson.EncodingLimitError
+			if errors.As(decorateErr, &encodingLimit) {
+				providerErr = RejectOutput(&result, budget)
+			} else {
+				if len(result.RawDiagnostic) == 0 {
+					result.RawDiagnostic = append([]byte(nil), decorateErr.Error()...)
+				}
+				result.Action.Status = "failed"
+				result.Action.Error = &domain.StructuredError{Classification: "source_contract", Message: "probe HTTP source lineage could not be derived", Retryable: false}
+				providerErr = fmt.Errorf("decorate probe.http source lineage: %w", decorateErr)
+			}
 		} else {
 			result.Action.Output = decorated
+		}
+	}
+	if limitErr := EnforceOutputBudget(&result, budget); limitErr != nil {
+		providerErr = limitErr
+	}
+	if providerErr == nil && len(result.Action.Output) > 0 {
+		semanticValue, _, _, _, semanticErr := canonicaljson.ParseStrictBounded(result.Action.Output, int(budget))
+		if semanticErr == nil && len(c.Manifest().OutputSchema) > 0 {
+			var schemaValue any
+			schemaValue, _, _, _, semanticErr = canonicaljson.ParseStrict(c.Manifest().OutputSchema)
+			if semanticErr == nil {
+				semanticErr = strictjsonschema.Validate(schemaValue, semanticValue)
+			}
+		}
+		if semanticErr != nil {
+			var limitErr *canonicaljson.EncodingLimitError
+			if errors.As(semanticErr, &limitErr) {
+				providerErr = RejectOutput(&result, budget)
+			} else {
+				result.Action.Status = "failed"
+				result.Action.Error = &domain.StructuredError{Classification: "provider_contract_invalid", Message: "provider returned invalid semantic output", Retryable: false}
+				providerErr = fmt.Errorf("provider returned invalid semantic output: %w", semanticErr)
+			}
 		}
 	}
 	result.Action.RequestID = req.Action.ID
 	if result.ToolRun != nil {
 		result.ToolRun.Provider = req.Provider
 	}
-	if !sourceContractFailure {
-		result.ProviderAttemptID = &attemptID
-		result.AdmissionProvenance = &ResultAdmissionProvenance{
-			ProviderAttemptID:             attemptID,
-			ActionRequestID:               req.Action.ID,
-			StepAttempt:                   req.Action.StepAttempt,
-			QueueJobID:                    copyIDPointer(trustedQueueJobID),
-			ExecutionAuthorizationEventID: authorizationEventID,
-			Provider:                      req.Provider,
-		}
+	result.ProviderAttemptID = &attemptID
+	result.AdmissionProvenance = &ResultAdmissionProvenance{
+		ProviderAttemptID:             attemptID,
+		PreparedSetID:                 preparedAdmission.PreparedSetID,
+		ManifestID:                    preparedAdmission.ManifestID,
+		ReservedCapacityBytes:         preparedAdmission.ReservedCapacityBytes,
+		ActionRequestID:               req.Action.ID,
+		StepAttempt:                   req.Action.StepAttempt,
+		QueueJobID:                    copyIDPointer(trustedQueueJobID),
+		ExecutionAuthorizationEventID: authorizationEventID,
+		Provider:                      req.Provider,
 	}
 	result.TerminalAuditError = nil
+	terminalOutcome := classifyProviderInvocation(ctx, result, providerErr)
+	result.ProviderOutcome = domain.ResultProviderOutcomeV1(terminalOutcome)
+	if req.RequirePreparedEvidence {
+		result.AdmissionProvenance.ProviderTerminalEventID = domain.NewID()
+		return result, providerErr
+	}
 	terminalErr := req.InvocationRecorder.RecordProviderInvocationTerminal(ctx, ProviderInvocationTerminalRecord{
 		ProviderAttemptID: attemptID,
 		ProgramID:         req.ProgramID,
@@ -304,7 +403,7 @@ func (r *Registry) Execute(ctx context.Context, req Request) (Result, error) {
 		Capability:        req.Action.Capability,
 		Provider:          req.Provider,
 		Actor:             req.Action.RequestedBy,
-		Outcome:           classifyProviderInvocation(ctx, result, providerErr),
+		Outcome:           terminalOutcome,
 	})
 	if terminalErr != nil {
 		result.TerminalAuditError = fmt.Errorf("persist provider invocation terminal: %w", terminalErr)
@@ -323,7 +422,16 @@ func (r *Registry) providerName(capabilityName, requested string) string {
 	if multi, ok := implementation.(*Multi); ok && multi.defaultProvider != "" {
 		return multi.defaultProvider
 	}
+	if supported := implementation.Manifest().SupportedProviders; len(supported) > 0 {
+		return supported[0]
+	}
 	return capabilityName
+}
+
+// ProviderName resolves an omitted provider through the registry's configured
+// default while preserving an explicit provider selection.
+func (r *Registry) ProviderName(capabilityName, requested string) string {
+	return r.providerName(capabilityName, requested)
 }
 
 // Validate authorizes and validates an action without executing its provider.
@@ -383,19 +491,43 @@ func (r *Registry) authorize(ctx context.Context, req Request, requireDecisionRe
 	return c, eventID, nil
 }
 
-func classifyProviderInvocation(_ context.Context, result Result, err error) ProviderInvocationOutcome {
-	if providerResultCancelled(result) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+func classifyProviderInvocation(ctx context.Context, result Result, err error) ProviderInvocationOutcome {
+	status := strings.ToLower(strings.TrimSpace(result.Action.Status))
+	if status == "succeeded" && result.Action.Error == nil && err == nil {
+		return ProviderInvocationSucceeded
+	}
+	if providerResultTimedOut(result) || (status == "" && errors.Is(err, context.DeadlineExceeded)) {
+		return ProviderInvocationTimedOut
+	}
+	if status == "cancelled" || status == "canceled" || providerResultCancelled(result) || (status == "" && errors.Is(err, context.Canceled)) {
 		return ProviderInvocationCancelled
 	}
-	if err != nil || result.Action.Error != nil || result.Action.Status == "failed" {
+	if err != nil || result.Action.Error != nil || status == "failed" {
 		return ProviderInvocationFailed
+	}
+	if errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+		return ProviderInvocationTimedOut
+	}
+	if errors.Is(context.Cause(ctx), context.Canceled) {
+		return ProviderInvocationCancelled
 	}
 	return ProviderInvocationSucceeded
 }
 
 func providerResultCancelled(result Result) bool {
+	if result.Action.Error == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(result.Action.Error.Classification)) {
+	case "cancelled", "canceled", "context_canceled":
+		return true
+	}
+	return false
+}
+
+func providerResultTimedOut(result Result) bool {
 	switch strings.ToLower(strings.TrimSpace(result.Action.Status)) {
-	case "cancelled", "canceled", "timeout", "timed_out":
+	case "timeout", "timed_out":
 		return true
 	}
 	if result.ToolRun != nil && result.ToolRun.TimedOut {
@@ -405,7 +537,7 @@ func providerResultCancelled(result Result) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(result.Action.Error.Classification)) {
-	case "timeout", "timed_out", "cancelled", "canceled", "context_canceled", "deadline_exceeded":
+	case "timeout", "timed_out", "deadline_exceeded":
 		return true
 	default:
 		return false

@@ -8,11 +8,11 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
@@ -53,6 +53,7 @@ type Server struct {
 	queue     Queue
 	validator *schedulecron.ScheduleValidator
 	mux       *http.ServeMux
+	operator  *operatorBoundary
 }
 
 type Snapshot struct {
@@ -77,11 +78,30 @@ type DeadLetter struct {
 }
 
 func New(store Store, workQueue Queue, validators ...*schedulecron.ScheduleValidator) http.Handler {
+	return newServer(store, workQueue, nil, validators...)
+}
+
+// NewOperator enables mutations only for a configured local operator.
+func NewOperator(store Store, workQueue Queue, address string, operator config.Console, validators ...*schedulecron.ScheduleValidator) (http.Handler, error) {
+	boundary, err := newOperatorBoundary(address, operator)
+	if err != nil {
+		return nil, err
+	}
+	return newServer(store, workQueue, boundary, validators...), nil
+}
+
+func newServer(store Store, workQueue Queue, operator *operatorBoundary, validators ...*schedulecron.ScheduleValidator) http.Handler {
 	var validator *schedulecron.ScheduleValidator
 	if len(validators) > 0 {
 		validator = validators[0]
 	}
-	s := &Server{store: store, queue: workQueue, validator: validator, mux: http.NewServeMux()}
+	s := &Server{store: store, queue: workQueue, validator: validator, mux: http.NewServeMux(), operator: operator}
+	s.mux.HandleFunc("GET /api/v1/operator/check", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	s.mux.HandleFunc("GET /api/v1/exact-approvals", s.exactApprovals)
+	s.mux.HandleFunc("GET /api/v1/exact-approvals/{id}", s.exactApprovalDetail)
+	s.mux.HandleFunc("POST /api/v1/exact-approvals/{id}/decision", s.decideExactApproval)
 	s.mux.HandleFunc("GET /api/v1/snapshot", s.snapshot)
 	s.mux.HandleFunc("GET /api/v1/scheduled-executions/{id}", s.executionDetail)
 	s.mux.HandleFunc("POST /api/v1/approvals/{id}/decision", s.decideApproval)
@@ -112,11 +132,11 @@ func New(store Store, workQueue Queue, validators ...*schedulecron.ScheduleValid
 		}
 		assets.ServeHTTP(w, r)
 	}))
-	return s.securityHeaders(s.mux)
+	return s.securityHeaders(s.operatorGate(s.mux))
 }
 
 func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request) {
-	if !validOperatorRequest(r) {
+	if !s.validOperatorRequest(r) {
 		writeError(w, http.StatusForbidden, "operator request validation failed")
 		return
 	}
@@ -133,14 +153,10 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request) {
 		CronExpression string    `json:"cron_expression"`
 		Timezone       string    `json:"timezone"`
 		Headless       bool      `json:"headless"`
-		Actor          string    `json:"actor"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
-	}
-	if body.Actor == "" {
-		body.Actor = "console-operator"
 	}
 	if body.WorkflowName == "" {
 		body.WorkflowName = "continuous-web-recon"
@@ -150,7 +166,7 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	item := domain.Schedule{ID: domain.NewID(), ProgramID: body.ProgramID, Name: body.Name, WorkflowName: body.WorkflowName, Objective: body.Objective, CronExpression: body.CronExpression, Timezone: body.Timezone, Enabled: true, Headless: body.Headless, CreatedBy: body.Actor, CreatedAt: now, UpdatedAt: now}
+	item := domain.Schedule{ID: domain.NewID(), ProgramID: body.ProgramID, Name: body.Name, WorkflowName: body.WorkflowName, Objective: body.Objective, CronExpression: body.CronExpression, Timezone: body.Timezone, Enabled: true, Headless: body.Headless, CreatedBy: s.operator.actor, CreatedAt: now, UpdatedAt: now}
 	item, err := s.validator.Validate(r.Context(), item, now)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -164,7 +180,7 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
-	if !validOperatorRequest(r) {
+	if !s.validOperatorRequest(r) {
 		writeError(w, http.StatusForbidden, "operator request validation failed")
 		return
 	}
@@ -186,7 +202,6 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
 		Timezone       *string `json:"timezone"`
 		Enabled        *bool   `json:"enabled"`
 		Headless       *bool   `json:"headless"`
-		Actor          string  `json:"actor"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -222,10 +237,7 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.Actor == "" {
-		body.Actor = "console-operator"
-	}
-	if err := store.UpdateSchedule(r.Context(), current, body.Actor); err != nil {
+	if err := store.UpdateSchedule(r.Context(), current, s.operator.actor); err != nil {
 		writeError(w, http.StatusConflict, "schedule could not be updated")
 		return
 	}
@@ -241,7 +253,7 @@ func (s *Server) disableSchedule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setScheduleEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
-	if !validOperatorRequest(r) {
+	if !s.validOperatorRequest(r) {
 		writeError(w, http.StatusForbidden, "operator request validation failed")
 		return
 	}
@@ -254,7 +266,7 @@ func (s *Server) setScheduleEnabled(w http.ResponseWriter, r *http.Request, enab
 		writeError(w, http.StatusServiceUnavailable, "schedule mutations unavailable")
 		return
 	}
-	if err := store.SetScheduleEnabled(r.Context(), domain.ID(r.PathValue("id")), enabled, "console-operator"); err != nil {
+	if err := store.SetScheduleEnabled(r.Context(), domain.ID(r.PathValue("id")), enabled, s.operator.actor); err != nil {
 		writeError(w, http.StatusConflict, "schedule state could not be changed")
 		return
 	}
@@ -262,7 +274,7 @@ func (s *Server) setScheduleEnabled(w http.ResponseWriter, r *http.Request, enab
 }
 
 func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
-	if !validOperatorRequest(r) {
+	if !s.validOperatorRequest(r) {
 		writeError(w, http.StatusForbidden, "operator request validation failed")
 		return
 	}
@@ -275,7 +287,7 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "schedule mutations unavailable")
 		return
 	}
-	item, err := store.EnqueueRunNow(r.Context(), domain.ID(r.PathValue("id")), "console-operator")
+	item, err := store.EnqueueRunNow(r.Context(), domain.ID(r.PathValue("id")), s.operator.actor)
 	if err != nil {
 		if errors.Is(err, database.ErrScheduleOverlap) {
 			writeError(w, http.StatusConflict, "schedule already has a queued or active execution")
@@ -288,7 +300,7 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) resumeScheduledExecution(w http.ResponseWriter, r *http.Request) {
-	if !validOperatorRequest(r) {
+	if !s.validOperatorRequest(r) {
 		writeError(w, http.StatusForbidden, "operator request validation failed")
 		return
 	}
@@ -301,7 +313,7 @@ func (s *Server) resumeScheduledExecution(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusServiceUnavailable, "schedule mutations unavailable")
 		return
 	}
-	if err := store.RequestScheduledExecutionResume(r.Context(), domain.ID(r.PathValue("id")), "console-operator"); err != nil {
+	if err := store.RequestScheduledExecutionResume(r.Context(), domain.ID(r.PathValue("id")), s.operator.actor); err != nil {
 		if errors.Is(err, database.ErrApprovalRejected) {
 			writeError(w, http.StatusConflict, "scheduled execution was closed because approval was rejected")
 			return
@@ -313,7 +325,7 @@ func (s *Server) resumeScheduledExecution(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) reviewChangeItem(w http.ResponseWriter, r *http.Request) {
-	if !validOperatorRequest(r) {
+	if !s.validOperatorRequest(r) {
 		writeError(w, http.StatusForbidden, "operator request validation failed")
 		return
 	}
@@ -325,16 +337,12 @@ func (s *Server) reviewChangeItem(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Disposition string `json:"disposition"`
 		Note        string `json:"note"`
-		Actor       string `json:"actor"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.Actor == "" {
-		body.Actor = "console-operator"
-	}
-	if err := store.ReviewChangeItem(r.Context(), domain.ID(r.PathValue("id")), domain.ChangeReviewDisposition(body.Disposition), body.Note, body.Actor); err != nil {
+	if err := store.ReviewChangeItem(r.Context(), domain.ID(r.PathValue("id")), domain.ChangeReviewDisposition(body.Disposition), body.Note, s.operator.actor); err != nil {
 		writeError(w, http.StatusBadRequest, "change review was not accepted")
 		return
 	}
@@ -342,7 +350,7 @@ func (s *Server) reviewChangeItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) acknowledgeScopeVersion(w http.ResponseWriter, r *http.Request) {
-	if !validOperatorRequest(r) {
+	if !s.validOperatorRequest(r) {
 		writeError(w, http.StatusForbidden, "operator request validation failed")
 		return
 	}
@@ -355,7 +363,7 @@ func (s *Server) acknowledgeScopeVersion(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusServiceUnavailable, "review mutations unavailable")
 		return
 	}
-	if err := store.AcknowledgeScopeVersion(r.Context(), domain.ID(r.PathValue("id")), "console-operator"); err != nil {
+	if err := store.AcknowledgeScopeVersion(r.Context(), domain.ID(r.PathValue("id")), s.operator.actor); err != nil {
 		writeError(w, http.StatusConflict, "scope version could not be acknowledged")
 		return
 	}
@@ -406,13 +414,12 @@ func (s *Server) executionDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request) {
-	if !validOperatorRequest(r) {
+	if !s.validOperatorRequest(r) {
 		writeError(w, http.StatusForbidden, "operator request validation failed")
 		return
 	}
 	var body struct {
 		Decision string `json:"decision"`
-		Actor    string `json:"actor"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -423,15 +430,7 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "decision must be approved or rejected")
 		return
 	}
-	body.Actor = strings.TrimSpace(body.Actor)
-	if body.Actor == "" {
-		body.Actor = "console-operator"
-	}
-	if len(body.Actor) > 80 {
-		writeError(w, http.StatusBadRequest, "actor is too long")
-		return
-	}
-	if err := s.store.DecideApproval(r.Context(), domain.ID(r.PathValue("id")), body.Decision, body.Actor); err != nil {
+	if err := s.store.DecideApproval(r.Context(), domain.ID(r.PathValue("id")), body.Decision, s.operator.actor); err != nil {
 		slog.Warn("operator console approval failed", "approval_id", r.PathValue("id"), "error", err)
 		writeError(w, http.StatusConflict, "approval is no longer pending")
 		return
@@ -440,7 +439,7 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) retryDeadLetter(w http.ResponseWriter, r *http.Request) {
-	if !validOperatorRequest(r) {
+	if !s.validOperatorRequest(r) {
 		writeError(w, http.StatusForbidden, "operator request validation failed")
 		return
 	}
@@ -482,24 +481,6 @@ func stringValue(value any) string {
 	default:
 		return ""
 	}
-}
-
-func validOperatorRequest(r *http.Request) bool {
-	if r.Header.Get("X-Reconductor-Request") != "operator-console" {
-		return false
-	}
-	if site := strings.ToLower(r.Header.Get("Sec-Fetch-Site")); site != "" && site != "same-origin" {
-		return false
-	}
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return true
-	}
-	parsed, err := url.Parse(origin)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return false
-	}
-	return strings.EqualFold(parsed.Host, r.Host)
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {

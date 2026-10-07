@@ -18,7 +18,7 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) != 19 {
+	if len(versions) != 23 {
 		t.Fatalf("migrations=%v", versions)
 	}
 	wantVersions := []string{
@@ -41,6 +41,10 @@ func TestEmbeddedMigrationsAreOrderedAndNonDestructive(t *testing.T) {
 		"0017_artifact_store_tombstone_cleanup.sql",
 		"0018_large_result_publication_journal.sql",
 		"0019_large_result_recovery_foundation.sql",
+		"0020_prepared_evidence_ownership.sql",
+		"0021_provider_output_authority_ceiling.sql",
+		"0022_exact_launch_authority_foundation.sql",
+		"0023_exact_action_contract.sql",
 	}
 	for index := range wantVersions {
 		if versions[index] != wantVersions[index] {
@@ -228,6 +232,9 @@ func TestProviderAttemptProvenanceMigrationConstraints(t *testing.T) {
 		if _, err := pool.Exec(ctx, statement); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE step_runs SET status='succeeded',completed_at=clock_timestamp() WHERE id=$1`, stepID); err != nil {
+		t.Fatal(err)
 	}
 	if err := Up(ctx, pool); err != nil {
 		t.Fatal(err)

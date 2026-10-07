@@ -43,6 +43,7 @@ type WorkflowRequest struct {
 	AcknowledgeScopeExpansion bool
 	ManualDiscoveryRoots      []targeting.ManualDiscoveryRoot
 	ApproveModerate           bool
+	OperatorAttemptCeiling    int
 	Lifecycle                 Lifecycle
 }
 
@@ -191,16 +192,16 @@ func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, 
 		lifecycleScopeVersionID = *state.Run.OriginalScopeVersionID
 	}
 	runtimeScope := targeting.WithDiscoveryRoots(sc, pinnedPlan.DiscoveryRoots, plan.DiscoveryRoots)
-	engine, err := s.engine(ctx, task, runtimeScope, req.Headless, fileStore, req.Lifecycle, lifecycleScopeVersionID)
+	engine, err := s.engine(ctx, task, runtimeScope, req.Headless, req.OperatorAttemptCeiling, fileStore, req.Lifecycle, lifecycleScopeVersionID)
 	if err != nil {
 		return WorkflowResult{Task: task, ScopeChange: change}, err
 	}
-	approvedByRecord, err := s.resumeApproval(ctx, state)
+	approval, err := approvalForResume(ctx, s.Store, state, req.ApproveModerate)
 	if err != nil {
 		return WorkflowResult{Task: task, State: state, ScopeChange: change}, err
 	}
-	if req.ApproveModerate || approvedByRecord {
-		engine.Approval = func(context.Context, workflow.Step, policy.Risk) (bool, error) { return true, nil }
+	if approval != nil {
+		engine.Approval = approval
 	}
 	if state != nil && task.Status == domain.TaskPaused {
 		if err := s.Store.SetTaskStatus(ctx, task.ID, domain.TaskRunning, ""); err != nil {
@@ -218,7 +219,7 @@ func (s Service) Run(ctx context.Context, req WorkflowRequest) (WorkflowResult, 
 	defer stopWatching()
 	go WatchTaskControls(watchCtx, s.Store, task.ID, controls)
 	state, runErr := engine.Run(ctx, def, state, task, controls)
-	if state != nil && !database.IsScheduledExecutionFenceError(runErr) {
+	if state != nil && !database.IsScheduledExecutionFenceError(runErr) && !domain.PersistenceUnresolved(runErr) {
 		status := map[domain.RunStatus]domain.TaskStatus{domain.RunCompleted: domain.TaskCompleted, domain.RunPaused: domain.TaskPaused, domain.RunFailed: domain.TaskFailed, domain.RunCancelled: domain.TaskCancelled}[state.Run.Status]
 		if status != "" {
 			_ = s.Store.SetTaskStatusFromWorkflow(context.WithoutCancel(ctx), task.ID, status)
@@ -343,7 +344,7 @@ func (s Service) resolveTask(ctx context.Context, req WorkflowRequest, def workf
 	return task, nil
 }
 
-func (s Service) engine(ctx context.Context, task domain.Task, sc capability.Scope, headless bool, fileStore workflow.FileStore, lifecycle Lifecycle, scopeVersionID domain.ID) (workflow.Engine, error) {
+func (s Service) engine(ctx context.Context, task domain.Task, sc capability.Scope, headless bool, operatorAttemptCeiling int, fileStore workflow.FileStore, lifecycle Lifecycle, scopeVersionID domain.ID) (workflow.Engine, error) {
 	if s.Artifacts == nil {
 		return workflow.Engine{}, fmt.Errorf("artifact storage is required")
 	}
@@ -356,28 +357,47 @@ func (s Service) engine(ctx context.Context, task domain.Task, sc capability.Sco
 			return lifecycle.WorkflowCreated(ctx, task, state.Run, scopeVersionID)
 		}
 	}
-	return workflow.Engine{Registry: s.Registry, Executor: execution.Service{Registry: s.Registry, Store: s.Store, Artifacts: s.Artifacts, ProgramID: task.ProgramID}, Persister: persister, Policy: pol, Scope: sc, Budget: limiter, MaxParallel: maxParallel, OriginalScopeVersionID: scopeVersionID}, nil
+	executor := execution.Service{Registry: s.Registry, Store: s.Store, Artifacts: s.Artifacts, ProgramID: task.ProgramID}
+	return workflow.Engine{Registry: s.Registry, Executor: executor, BindingResolver: executor, Persister: persister, Policy: pol, Scope: sc, Budget: limiter, MaxParallel: maxParallel, OriginalScopeVersionID: scopeVersionID, OperatorAttemptCeiling: operatorAttemptCeiling}, nil
 }
 
-func (s Service) resumeApproval(ctx context.Context, state *workflow.State) (bool, error) {
-	if state == nil {
-		return false, nil
+type approvalDecisionReader interface {
+	StepApprovalDecision(context.Context, domain.ID) (string, error)
+}
+
+func approvalForResume(ctx context.Context, store approvalDecisionReader, state *workflow.State, approveModerate bool) (workflow.ApprovalFunc, error) {
+	approvedSteps := map[string]domain.ID{}
+	if state != nil {
+		for stepID, ss := range state.Steps {
+			if ss.Run.Status != domain.StepAwaitingApproval {
+				continue
+			}
+			decision, err := store.StepApprovalDecision(ctx, ss.Run.ID)
+			if err != nil {
+				return nil, err
+			}
+			if decision == "rejected" {
+				return nil, fmt.Errorf("approval for step %s was rejected", ss.Run.StepDefinitionID)
+			}
+			if decision == "approved" {
+				approvedSteps[stepID] = ss.Run.ID
+			}
+		}
 	}
-	approved := false
-	for _, ss := range state.Steps {
-		if ss.Run.Status != domain.StepAwaitingApproval {
-			continue
-		}
-		decision, err := s.Store.StepApprovalDecision(ctx, ss.Run.ID)
-		if err != nil {
-			return false, err
-		}
-		if decision == "rejected" {
-			return false, fmt.Errorf("approval for step %s was rejected", ss.Run.StepDefinitionID)
-		}
-		approved = approved || decision == "approved"
+	if len(approvedSteps) == 0 && !approveModerate {
+		return nil, nil
 	}
-	return approved, nil
+	inlineAvailable := approveModerate
+	return func(_ context.Context, step workflow.Step, risk policy.Risk) (bool, error) {
+		if _, ok := approvedSteps[step.ID]; ok {
+			return true, nil
+		}
+		if inlineAvailable && risk == policy.Moderate {
+			inlineAvailable = false
+			return true, nil
+		}
+		return false, workflow.ErrApprovalRequired
+	}, nil
 }
 
 type TaskReader interface {
@@ -397,15 +417,24 @@ func WatchTaskControls(ctx context.Context, store TaskReader, taskID domain.ID, 
 				slog.Warn("workflow task control refresh failed", "task_id", taskID, "error", err)
 				continue
 			}
-			switch task.Status {
-			case domain.TaskCancelled:
-				controls.Cancel()
+			if applyTaskStatus(task.Status, controls) {
 				return
-			case domain.TaskPaused:
-				controls.Pause()
 			}
 		}
 	}
+}
+
+func applyTaskStatus(status domain.TaskStatus, controls *workflow.Controls) bool {
+	switch status {
+	case domain.TaskCancelled:
+		controls.Cancel()
+		return true
+	case domain.TaskPaused:
+		controls.Pause()
+	case domain.TaskRunning:
+		controls.Resume()
+	}
+	return false
 }
 
 func scopeSnapshot(programID domain.ID, reference string, sc platformscope.Scope, plan targeting.TargetPlan) domain.ScopeSnapshot {

@@ -1,0 +1,38 @@
+{
+  "fixture_id": "clean_normal_redirect",
+  "category": "clean",
+  "description": "Standard HTTP to HTTPS root redirect with no navigation parameters",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "http://target.com/",
+        "route_signature": "/",
+        "method": "GET",
+        "status_codes": [301],
+        "query_parameters": [],
+        "labels": ["redirect"],
+        "technologies": ["Cloudflare"],
+        "interest_score": 0,
+        "evidence_artifact_ids": ["art-clean-003"]
+      }
+    ],
+    "changes": [],
+    "evidence": [
+      {
+        "artifact_id": "art-clean-003",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "http://target.com/"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http"]
+  },
+  "expected": {
+    "candidate_count": 0,
+    "candidate_types": [],
+    "should_admit_all": true
+  }
+}

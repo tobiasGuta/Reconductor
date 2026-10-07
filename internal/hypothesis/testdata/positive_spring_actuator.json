@@ -1,0 +1,38 @@
+{
+  "fixture_id": "positive_spring_actuator",
+  "category": "positive",
+  "description": "Exposed Spring Boot Actuator environment endpoint returning 200 OK",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "https://api.target.com/actuator/env",
+        "route_signature": "/actuator/env",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": [],
+        "labels": ["admin", "actuator"],
+        "technologies": ["Spring Boot", "Java"],
+        "interest_score": 8,
+        "evidence_artifact_ids": ["art-actuator-001"]
+      }
+    ],
+    "changes": [],
+    "evidence": [
+      {
+        "artifact_id": "art-actuator-001",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://api.target.com/actuator/env"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http", "crawl.web", "scan.nuclei"]
+  },
+  "expected": {
+    "candidate_count": 1,
+    "candidate_types": ["exposed_actuator_management_interface"],
+    "should_admit_all": true
+  }
+}

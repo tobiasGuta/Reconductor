@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { readFile } from "node:fs/promises";
+import { createContext, runInContext } from "node:vm";
 import test from "node:test";
 
 class FakeClassList {
@@ -599,6 +600,316 @@ function tabEvent(target, shiftKey = false) {
     preventDefault() { this.prevented = true; },
   };
 }
+
+test("operator credential verification keeps bearer in page memory only", async () => {
+  const document = installDocument();
+  document.register("operator-credential-status");
+  const originalFetch = globalThis.fetch;
+  const originalSetItem = globalThis.localStorage.setItem;
+  const calls = [];
+  globalThis.localStorage.setItem = (...args) => { calls.push(["storage", ...args]); };
+  globalThis.fetch = async (...args) => {
+    calls.push(["fetch", ...args]);
+    return response(200, { status: "ok" });
+  };
+  try {
+    const credential = "0123456789abcdef0123456789abcdef";
+    assert.equal(await app.verifyOperatorCredential(credential), true);
+    assert.equal(calls[0][1], "/api/v1/operator/check");
+    assert.equal(calls[0][2].headers.Authorization, `Bearer ${credential}`);
+    assert.equal(calls[0][2].cache, "no-store");
+    assert.equal(app.operatorMutationHeaders().Authorization, `Bearer ${credential}`);
+    assert.equal(app.state.operatorCredential, credential);
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions unlocked for this page");
+    assert.equal(calls.some((call) => call[0] === "storage"), false);
+
+    globalThis.fetch = async () => response(401, {});
+    assert.equal(await app.verifyOperatorCredential("wrong-credential"), false);
+    assert.equal(app.state.operatorCredential, "");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions locked");
+  } finally {
+    app.state.operatorCredential = "";
+    globalThis.fetch = originalFetch;
+    globalThis.localStorage.setItem = originalSetItem;
+  }
+});
+
+function operatorCredentialDocument() {
+  const document = installDocument();
+  document.register("operator-credential");
+  document.register("operator-credential-status");
+  app.state.operatorCredential = "";
+  return document;
+}
+
+function submitCredential(document, credential) {
+  const input = document.querySelector("#operator-credential");
+  input.value = credential;
+  const pending = app.submitOperatorCredential({ preventDefault() {} });
+  assert.equal(input.value, "", "password field clears before the response");
+  return pending;
+}
+
+async function boundOperatorCredentialPage() {
+  const [source, markup] = await Promise.all([
+    readFile(new URL("./static/app.js", import.meta.url), "utf8"),
+    readFile(new URL("./static/index.html", import.meta.url), "utf8"),
+  ]);
+  const document = new FakeDocument();
+  for (const match of markup.matchAll(/\bid="([^"]+)"/g)) document.register(match[1]);
+  const requests = [];
+  const pending = [];
+  const context = createContext({
+    document, requests, pending, module: { exports: {} },
+    localStorage: { getItem() { return ""; }, setItem() { assert.fail("credential must not persist"); } },
+    window: { addEventListener() {} }, setTimeout() {},
+  });
+  // Fetch promises must share the handler's realm to exercise its exact microtask ordering.
+  runInContext(`fetch = (url, options) => new Promise((resolve, reject) => {
+    requests.push({ url, options });
+    pending.push({ resolve, reject });
+  });`, context);
+  runInContext(source, context);
+  runInContext("bindEvents();", context);
+  const [handler] = document.querySelector("#operator-credential-form").listeners.get("submit");
+  return {
+    document, requests, pending, state: runInContext("state", context),
+    submit(credential) {
+      const input = document.querySelector("#operator-credential");
+      input.value = credential;
+      const result = handler({ preventDefault() {} });
+      assert.equal(input.value, "", "bound form clears the password synchronously");
+      return result;
+    },
+    status() { return document.querySelector("#operator-credential-status").textContent; },
+    feedback() { return document.querySelector("#toast-region").textContent; },
+  };
+}
+
+for (const outcome of ["401", "network", "success"]) {
+  test(`bound credential form ignores stale ${outcome} feedback across its own await`, async () => {
+    const page = await boundOperatorCredentialPage();
+    const pendingA = page.submit("token-A");
+    if (outcome === "network") page.pending[0].reject(new Error("offline A"));
+    else page.pending[0].resolve(response(outcome === "401" ? 401 : 200, {}));
+    let pendingB;
+    queueMicrotask(() => { pendingB = page.submit("token-B"); });
+    await pendingA;
+    assert.ok(pendingB, "B starts before A's form continuation finishes");
+    assert.equal(page.state.operatorVerificationGeneration, 2);
+    assert.equal(page.state.operatorCredential, "");
+    assert.equal(page.status(), "Actions locked");
+    const staleFeedback = page.feedback();
+    page.pending[1].resolve(response(200, { status: "ok" }));
+    await pendingB;
+    assert.equal(staleFeedback, "", "A must not present feedback after B starts");
+    assert.equal(page.feedback(), "");
+    assert.equal(page.state.operatorCredential, "token-B");
+    assert.equal(page.status(), "Actions unlocked for this page");
+    assert.equal(page.requests[1].options.headers.Authorization, "Bearer token-B");
+  });
+}
+
+for (const outcome of ["401", "network"]) {
+  test(`bound credential form still displays current ${outcome} feedback`, async () => {
+    const page = await boundOperatorCredentialPage();
+    const current = page.submit("invalid-current");
+    if (outcome === "network") page.pending[0].reject(new Error("offline"));
+    else page.pending[0].resolve(response(401, {}));
+    await current;
+    assert.equal(page.state.operatorCredential, "");
+    assert.equal(page.status(), "Actions locked");
+    assert.equal(page.feedback(), outcome === "network"
+      ? "Could not check the operator credential." : "Operator credential was not accepted.");
+  });
+}
+
+test("bound credential form gives only C ownership for every A/B/C completion order", async () => {
+  const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+  for (const outcome of ["success", "401", "network"]) {
+    for (const order of orders) {
+      const page = await boundOperatorCredentialPage();
+      const jobs = ["token-A", "token-B", "token-C"].map((token) => page.submit(token));
+      let currentFinished = false;
+      for (const index of order) {
+        if (index === 1 || (index === 2 && outcome === "network")) page.pending[index].reject(new Error("offline"));
+        else page.pending[index].resolve(response(index === 2 && outcome === "success" ? 200 : 401, {}));
+        await jobs[index];
+        if (index === 2) currentFinished = true;
+        const unlocked = currentFinished && outcome === "success";
+        assert.equal(page.state.operatorCredential, unlocked ? "token-C" : "");
+        assert.equal(page.status(), unlocked ? "Actions unlocked for this page" : "Actions locked");
+        assert.equal(page.feedback(), !currentFinished || outcome === "success" ? ""
+          : outcome === "network" ? "Could not check the operator credential." : "Operator credential was not accepted.");
+      }
+    }
+  }
+});
+
+test("newer rejected credential stays locked after an older success", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const first = deferred();
+  const second = deferred();
+  const requests = [];
+  globalThis.fetch = (url, options) => {
+    requests.push({ url, options });
+    return requests.length === 1 ? first.promise : second.promise;
+  };
+  try {
+    const pendingA = submitCredential(document, "valid-A");
+    const pendingB = submitCredential(document, "invalid-B");
+    assert.equal(app.state.operatorCredential, "");
+    second.resolve(response(401, {}));
+    await pendingB;
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions locked");
+    assert.equal(document.querySelector("#toast-region").textContent, "Operator credential was not accepted.");
+    first.resolve(response(200, { status: "ok" }));
+    await pendingA;
+    assert.equal(app.state.operatorCredential, "");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions locked");
+    assert.equal(document.querySelector("#toast-region").children.length, 1);
+    assert.deepEqual(requests.map(({ options }) => options.headers.Authorization), ["Bearer valid-A", "Bearer invalid-B"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
+
+test("newer accepted credential survives an older rejection", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const first = deferred();
+  const second = deferred();
+  let count = 0;
+  globalThis.fetch = () => (++count === 1 ? first.promise : second.promise);
+  try {
+    const pendingA = submitCredential(document, "invalid-A");
+    const pendingB = submitCredential(document, "valid-B");
+    second.resolve(response(200, { status: "ok" }));
+    await pendingB;
+    first.resolve(response(401, {}));
+    await pendingA;
+    assert.equal(app.state.operatorCredential, "valid-B");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions unlocked for this page");
+    assert.equal(document.querySelector("#toast-region").children.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
+
+test("older verification network failure is silent after newer success", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const first = deferred();
+  const second = deferred();
+  let count = 0;
+  globalThis.fetch = () => (++count === 1 ? first.promise : second.promise);
+  try {
+    const pendingA = submitCredential(document, "valid-A");
+    const pendingB = submitCredential(document, "valid-B");
+    second.resolve(response(200, { status: "ok" }));
+    await pendingB;
+    first.resolve(Promise.reject(new Error("offline")));
+    await pendingA;
+    assert.equal(app.state.operatorCredential, "valid-B");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions unlocked for this page");
+    assert.equal(document.querySelector("#toast-region").children.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
+
+test("failed replacement clears an earlier accepted credential immediately", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const replacement = deferred();
+  let count = 0;
+  globalThis.fetch = () => (++count === 1 ? Promise.resolve(response(200, { status: "ok" })) : replacement.promise);
+  try {
+    await submitCredential(document, "valid-A");
+    assert.equal(app.state.operatorCredential, "valid-A");
+    const pendingB = submitCredential(document, "invalid-B");
+    assert.equal(app.state.operatorCredential, "");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions locked");
+    replacement.resolve(response(401, {}));
+    await pendingB;
+    assert.equal(app.state.operatorCredential, "");
+    assert.equal(document.querySelector("#toast-region").textContent, "Operator credential was not accepted.");
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
+
+test("repeated accepted replacements retain only the latest token for mutations", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const first = deferred();
+  const second = deferred();
+  const third = deferred();
+  const verifications = [first, second, third];
+  const mutationCalls = [];
+  globalThis.fetch = (url, options) => {
+    if (url === "/api/v1/operator/check") return verifications.shift().promise;
+    mutationCalls.push({ url, options });
+    return Promise.resolve(response(409, { error: "expected test rejection" }));
+  };
+  try {
+    const pendingA = submitCredential(document, "valid-A");
+    const pendingB = submitCredential(document, "valid-B");
+    second.resolve(response(200, { status: "ok" }));
+    await pendingB;
+    first.resolve(response(200, { status: "ok" }));
+    await pendingA;
+    assert.equal(app.state.operatorCredential, "valid-B");
+    const pendingC = submitCredential(document, "valid-C");
+    assert.equal(app.state.operatorCredential, "");
+    third.resolve(response(200, { status: "ok" }));
+    await pendingC;
+    assert.equal(app.state.operatorCredential, "valid-C");
+    assert.equal(app.operatorMutationHeaders().Authorization, "Bearer valid-C");
+    app.state.data.scheduled_executions = [execution("paused-1", "paused_operator")];
+    app.renderSchedules();
+    const [resume] = findButtons(document.querySelector("#scheduled-execution-list"), "Resume");
+    await resume.click();
+    assert.equal(mutationCalls.length, 1);
+    assert.equal(mutationCalls[0].options.headers.Authorization, "Bearer valid-C");
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
+
+test("older mutation rejection cannot clear a newer verified credential", async () => {
+  const document = operatorCredentialDocument();
+  const originalFetch = globalThis.fetch;
+  const oldMutation = deferred();
+  const mutationCalls = [];
+  globalThis.fetch = (url, options) => {
+    if (url === "/api/v1/operator/check") return Promise.resolve(response(200, { status: "ok" }));
+    mutationCalls.push({ url, options });
+    return oldMutation.promise;
+  };
+  try {
+    await submitCredential(document, "valid-A");
+    app.state.data.scheduled_executions = [execution("paused-1", "paused_operator")];
+    app.renderSchedules();
+    const [resume] = findButtons(document.querySelector("#scheduled-execution-list"), "Resume");
+    const pendingMutation = resume.click();
+    assert.equal(mutationCalls[0].options.headers.Authorization, "Bearer valid-A");
+    await submitCredential(document, "valid-B");
+    oldMutation.resolve(response(401, { error: "expired" }));
+    await pendingMutation;
+    assert.equal(app.state.operatorCredential, "valid-B");
+    assert.equal(document.querySelector("#operator-credential-status").textContent, "Actions unlocked for this page");
+  } finally {
+    globalThis.fetch = originalFetch;
+    app.state.operatorCredential = "";
+  }
+});
 
 test("drawer focus containment keeps one control for Tab and Shift+Tab", () => {
   const document = installDocument();
@@ -1858,10 +2169,15 @@ test("resume remains independent and workflow-run detail still uses the drawer",
   assert.ok(details);
 
   await resume.click();
+  assert.equal(calls.length, 0, "locked actions do not send mutation requests");
+  app.state.operatorCredential = "test-operator-token";
+  await resume.click();
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "/api/v1/scheduled-executions/paused-1/resume");
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.headers["X-Reconductor-Request"], "operator-console");
+  assert.equal(calls[0].options.headers.Authorization, "Bearer test-operator-token");
+  app.state.operatorCredential = "";
 
   app.state.data.steps = [{ workflow_run_id: "run-1", step_definition_id: "probe", capability: "http.probe", status: "succeeded", attempt_count: 1 }];
   app.openRunDrawer({ id: "run-1", objective: "Existing workflow detail", workflow_name: "baseline", workflow_version: "1", status: "succeeded", trigger_source: "operator" });
@@ -1882,3 +2198,240 @@ test("server-controlled strings remain text-only", async () => {
     assert.equal(source.includes(forbidden), false, `app.js must not contain ${forbidden}`);
   }
 });
+
+function exactReviewFixture(status = "pending") {
+  return {
+    approval_id: "exact-1", status, decision: status, decisionable: status === "pending", created_at: "2026-10-01T12:00:00Z", expires_at: "2026-10-02T12:00:00Z",
+    action_id: "action-1", program_id: "program-1", task_id: "task-1", workflow_run_id: "run-1", step_run_id: "step-1", step_attempt: 1, provider_attempt_id: "X-1", capability: "http.request", capability_revision: "v1", contract_version: "exact-action-contract/v1",
+    action_hash: "a".repeat(64), review_hash: "b".repeat(64), evidence_available: true,
+    request: { method: "GET", scheme: "https", host: "example.test", port: 443, request_target: "/item/%2f?id=2&id=1?", identity: "anonymous", headers: [], body: "none", max_requests: 1, redirects: false, retries: false },
+    review: { purpose: "compare <img src=x>", expected_positive_outcome: "positive", expected_negative_outcome: "negative", assumptions: ["frozen assumption"], missing_evidence: ["frozen unknown"], source_kind: "test", source_provider: "model", source_model: "revision",
+      citations: [{ role: "supporting", artifact_id: "support-1", frozen_sha256: "c".repeat(64), locator: "line 1", current_availability: "available" }, { role: "contradictory", artifact_id: "against-1", frozen_sha256: "d".repeat(64), locator: "line 2", current_availability: "available" }] },
+  };
+}
+function exactReviewDocument() {
+  const document = installDocument();
+  for (const id of ["exact-approval-list", "exact-approval-detail", "modal-eyebrow", "modal-title", "modal-description", "modal-details", "modal-cancel", "operator-credential-status"]) document.register(id);
+  app.state.view = "exact-approvals";
+  app.state.operatorCredential = "current-operator-token";
+  app.state.operatorVerificationGeneration++;
+  app.state.selectedProgram = "program-1";
+  app.state.exactApprovals = { items: [], nextCursor: "", id: "", detail: null, status: "ready", error: "", listGeneration: 0, detailGeneration: 0, decisionGeneration: 0, busy: false, modalOwner: false, returnFocus: null };
+  return document;
+}
+
+test("exact approval navigation uses a protected list and reads detail separately", async () => {
+  const document = exactReviewDocument();
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return response(200, url.includes("/exact-1") ? exactReviewFixture() : { items: [exactReviewFixture()], next_cursor: "" });
+  };
+  const markup = await readFile(new URL("./static/index.html", import.meta.url), "utf8");
+  assert.match(markup, /data-view="exact-approvals"/);
+  assert.match(markup, /data-view-panel="exact-approvals"/);
+  const nav = document.register("exact-test-nav", "nav-item");
+  nav.dataset.view = "exact-approvals";
+  const view = document.register("exact-test-view", "view");
+  view.dataset.viewPanel = "exact-approvals";
+  await app.showView("exact-approvals");
+  assert.equal(app.state.view, "exact-approvals");
+  assert.equal(nav.classList.contains("active"), true);
+  assert.equal(view.classList.contains("active"), true);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /exact-approvals\?program_id=program-1/);
+  assert.equal(calls[0].options.headers.Authorization, "Bearer current-operator-token");
+  assert.equal(calls[0].options.cache, "no-store");
+  const [review] = document.querySelector("#exact-approval-list").querySelectorAll("button:not([disabled])");
+  assert.match(review.textContent, /exact-1.*pending/);
+  await review.click();
+  assert.equal(calls[1].url, "/api/v1/exact-approvals/exact-1");
+  assert.equal(app.state.exactApprovals.detail.approval_id, "exact-1");
+});
+
+test("exact detail preserves raw target, full H/RH, roles and separate availability as text", () => {
+  const document = exactReviewDocument();
+  const detail = exactReviewFixture();
+  app.state.exactApprovals.detail = detail;
+  app.renderExactApprovals();
+  const text = document.querySelector("#exact-approval-detail").textContent;
+  for (const value of ["GET", "https://example.test:443", "/item/%2f?id=2&id=1?", detail.action_hash, detail.review_hash, "supporting evidence", "contradictory evidence", "Frozen SHA-256", "Current availability", "anonymous", "disabled", "none", detail.review.purpose]) assert.ok(text.includes(value), value);
+  assert.equal(document.createdElements.some((item) => item.tagName === "IMG" || item.tagName === "A" || item.tagName === "INPUT"), false);
+  assert.deepEqual(findButtons(document.querySelector("#exact-approval-detail"), "ALLOW ONCE").length, 1);
+  const hash = detail.review_hash;
+  detail.review.citations[0].current_availability = "restricted";
+  detail.evidence_available = false;
+  app.renderExactApprovals();
+  assert.equal(findButtons(document.querySelector("#exact-approval-detail"), "ALLOW ONCE")[0].disabled, true);
+  assert.equal(findButtons(document.querySelector("#exact-approval-detail"), "DENY")[0].disabled, false);
+  assert.equal(detail.review_hash, hash);
+  assert.match(document.querySelector("#exact-approval-detail").textContent, /restricted/);
+});
+
+for (const status of ["approved", "rejected", "expired", "revoked"]) {
+  test(`exact ${status} state is read-only`, () => {
+    const document = exactReviewDocument();
+    app.state.exactApprovals.detail = exactReviewFixture(status);
+    app.renderExactApprovals();
+    assert.equal(findButtons(document.querySelector("#exact-approval-detail"), "ALLOW ONCE").length, 0);
+    assert.equal(findButtons(document.querySelector("#exact-approval-detail"), "DENY").length, 0);
+    assert.match(document.querySelector("#exact-approval-detail").textContent, /read-only/);
+  });
+}
+
+for (const decision of ["approved", "rejected"]) {
+  test(`exact ${decision} requires confirmation and sends only intent plus H/RH before refetch`, async () => {
+    const document = exactReviewDocument();
+    const original = exactReviewFixture();
+    app.state.exactApprovals.id = "exact-1";
+    app.state.exactApprovals.detail = original;
+    app.renderExactApprovals();
+    const calls = [];
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url, options });
+      if (options?.method === "POST") return response(200, { message: "Authorization decision recorded. No request was executed." });
+      return response(200, url.includes("/exact-1") ? exactReviewFixture(decision) : { items: [exactReviewFixture(decision)], next_cursor: "" });
+    };
+    const label = decision === "approved" ? "ALLOW ONCE" : "DENY";
+    const [button] = findButtons(document.querySelector("#exact-approval-detail"), label);
+    await button.click();
+    assert.equal(calls.length, 0, "opening confirmation never sends a decision");
+    assert.equal(document.querySelector("#action-modal").classList.contains("hidden"), false);
+    assert.equal(document.activeElement, document.querySelector("#modal-cancel"), "Enter initially targets Cancel");
+    assert.match(document.querySelector("#modal-description").textContent, /does not execute/);
+    for (const [name, value] of app.exactRequestFacts(original)) assert.ok(document.querySelector("#modal-details").textContent.includes(String(value)), name);
+    await app.state.modalAction();
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0].url, "/api/v1/exact-approvals/exact-1/decision");
+    assert.equal(calls[0].options.headers.Authorization, "Bearer current-operator-token");
+    assert.deepEqual(JSON.parse(calls[0].options.body), { decision, action_hash: original.action_hash, review_hash: original.review_hash });
+    assert.match(calls[1].url, /^\/api\/v1\/exact-approvals\?/);
+    assert.equal(calls[2].url, "/api/v1/exact-approvals/exact-1");
+    assert.equal(app.state.exactApprovals.detail.status, decision);
+    assert.equal(app.state.exactApprovals.detail.decisionable, false);
+    assert.equal(calls.some(({ url }) => /dispatch|permit|https:\/\/example/.test(url)), false);
+  });
+}
+
+for (const reason of ["stale decision", "evidence unavailable", "network failure"]) {
+  test(`exact ${reason} refetches authoritative state and displays rejection`, async () => {
+    const document = exactReviewDocument();
+    app.state.exactApprovals.id = "exact-1";
+    app.state.exactApprovals.detail = exactReviewFixture();
+    const calls = [];
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url, options });
+      if (options?.method === "POST") {
+        if (reason === "network failure") throw new Error("offline");
+        return response(409, { message: reason });
+      }
+      const current = exactReviewFixture(reason === "stale decision" ? "rejected" : "pending");
+      if (reason === "evidence unavailable") { current.evidence_available = false; current.review.citations[0].current_availability = "unavailable"; }
+      return response(200, url.includes("/exact-1") ? current : { items: [current], next_cursor: "" });
+    };
+    await app.submitExactDecision("exact-1", "approved", "a".repeat(64), "b".repeat(64));
+    assert.equal(calls.length, 3);
+    assert.notEqual(app.state.exactApprovals.detail.status, "approved");
+    assert.ok(document.querySelector("#toast-region").textContent.includes(reason === "network failure" ? "could not" : reason));
+    if (reason === "evidence unavailable") assert.equal(findButtons(document.querySelector("#exact-approval-detail"), "ALLOW ONCE")[0].disabled, true);
+  });
+}
+
+test("exact sensitive response cannot restore detail after credential replacement", async () => {
+  const document = exactReviewDocument();
+  const late = deferred();
+  globalThis.fetch = () => late.promise;
+  const read = app.openExactApproval("exact-1");
+  globalThis.fetch = async () => response(200, { status: "ok" });
+  await app.verifyOperatorCredential("replacement-B");
+  late.resolve(response(200, exactReviewFixture()));
+  await read;
+  assert.equal(app.state.exactApprovals.detail, null);
+  assert.equal(app.state.operatorCredential, "replacement-B");
+  assert.equal(document.querySelector("#exact-approval-detail").textContent.includes("/item/"), false);
+});
+
+test("late exact mutation 401 cannot clear newer credential or display stale feedback", async () => {
+  const document = exactReviewDocument();
+  const late = deferred();
+  globalThis.fetch = () => late.promise;
+  const decision = app.submitExactDecision("exact-1", "approved", "a".repeat(64), "b".repeat(64));
+  globalThis.fetch = async () => response(200, { status: "ok" });
+  await app.verifyOperatorCredential("replacement-B");
+  late.resolve(response(401, { error: "old credential" }));
+  await decision;
+  assert.equal(app.state.operatorCredential, "replacement-B");
+  assert.equal(document.querySelector("#toast-region").textContent, "");
+});
+
+test("exact pagination fetches the server cursor and retains distinct items", async () => {
+  exactReviewDocument();
+  let call = 0;
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(url);
+    const item = exactReviewFixture();
+    if (++call === 2) item.approval_id = "exact-2";
+    return response(200, { items: [item], next_cursor: call === 1 ? "exact-1" : "" });
+  };
+  await app.refreshExactApprovals();
+  await app.refreshExactApprovals({ more: true });
+  assert.match(urls[1], /after=exact-1/);
+  assert.deepEqual(app.state.exactApprovals.items.map((item) => item.approval_id), ["exact-1", "exact-2"]);
+});
+
+test("late exact decision cannot close or enable a newer unrelated confirmation", async () => {
+  const document = exactReviewDocument();
+  const detail = exactReviewFixture();
+  app.state.exactApprovals.id = detail.approval_id;
+  app.state.exactApprovals.detail = detail;
+  const late = deferred();
+  globalThis.fetch = async (url, options) => options?.method === "POST" ? late.promise
+    : response(200, url.includes("/exact-1") ? exactReviewFixture("approved") : { items: [], next_cursor: "" });
+  app.confirmExactDecision(detail, "approved");
+  const pending = app.state.modalAction();
+  app.closeModal();
+  const newerAction = () => {};
+  app.openModal({ action: newerAction, eyebrow: "Other review", title: "Other confirmation", description: "Other action", confirmLabel: "Confirm", details: [] });
+  document.querySelector("#modal-confirm").disabled = true;
+  late.resolve(response(200, { message: "Recorded" }));
+  await pending;
+  assert.equal(document.querySelector("#action-modal").classList.contains("hidden"), false);
+  assert.equal(app.state.modalAction, newerAction);
+  assert.equal(document.querySelector("#modal-confirm").disabled, true);
+});
+
+test("program switch clears exact detail and makes the old decision continuation inert", async () => {
+  const document = exactReviewDocument();
+  const detail = exactReviewFixture();
+  app.state.exactApprovals.id = detail.approval_id;
+  app.state.exactApprovals.detail = detail;
+  const late = deferred();
+  let calls = 0;
+  globalThis.fetch = () => { calls++; return late.promise; };
+  app.confirmExactDecision(detail, "approved");
+  const pending = app.state.modalAction();
+  app.state.selectedProgram = "program-2";
+  app.state.exactApprovals.id = "";
+  app.clearExactReviews();
+  late.resolve(response(200, { message: "Old program decision" }));
+  await pending;
+  assert.equal(calls, 1, "obsolete continuation must not refetch over the new view");
+  assert.equal(app.state.exactApprovals.detail, null);
+  assert.equal(app.state.exactApprovals.busy, false);
+  assert.equal(document.querySelector("#toast-region").textContent, "");
+  assert.equal(document.querySelector("#exact-approval-detail").textContent.includes(detail.request.request_target), false);
+});
+
+for (const target of ["/item?id=1&id=2", "/item?id=2&id=1", "/item/%2F?id=1&id=1", "/item/%2f?", "/item?"]) {
+  test(`exact request target displays literally: ${target}`, () => {
+    const document = exactReviewDocument();
+    const detail = exactReviewFixture();
+    detail.request.request_target = target;
+    app.state.exactApprovals.detail = detail;
+    app.renderExactApprovals();
+    assert.ok(document.querySelector("#exact-approval-detail").textContent.includes(target));
+    app.confirmExactDecision(detail, "approved");
+    assert.ok(document.querySelector("#modal-details").textContent.includes(target));
+  });
+}

@@ -162,6 +162,9 @@ func (s *Service) execute(ctx context.Context, exec domain.ScheduledExecution, s
 		request.ResumeRunID = *exec.WorkflowRunID
 	}
 	result, err := s.Orchestrator.Run(runCtx, request)
+	if domain.PersistenceUnresolved(err) {
+		return err
+	}
 	if database.IsScheduledExecutionFenceError(err) {
 		return err
 	}

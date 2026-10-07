@@ -1,0 +1,50 @@
+{
+  "fixture_id": "clean_spa_soft404",
+  "category": "clean",
+  "description": "Single-page application returning status 200 for arbitrary paths without management signals",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "https://app.target.com/view/home",
+        "route_signature": "/view/home",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": [],
+        "labels": ["spa"],
+        "technologies": ["Vue.js"],
+        "interest_score": 0,
+        "evidence_artifact_ids": ["art-clean-004"]
+      },
+      {
+        "raw_url": "https://app.target.com/view/nonexistent",
+        "route_signature": "/view/nonexistent",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": [],
+        "labels": ["spa"],
+        "technologies": ["Vue.js"],
+        "interest_score": 0,
+        "evidence_artifact_ids": ["art-clean-004"]
+      }
+    ],
+    "changes": [],
+    "evidence": [
+      {
+        "artifact_id": "art-clean-004",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://app.target.com/view/home",
+          "https://app.target.com/view/nonexistent"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http", "crawl.web"]
+  },
+  "expected": {
+    "candidate_count": 0,
+    "candidate_types": [],
+    "should_admit_all": true
+  }
+}

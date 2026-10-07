@@ -1,0 +1,38 @@
+{
+  "fixture_id": "positive_redirect_param_signal",
+  "category": "positive",
+  "description": "Endpoint accepting redirect navigation parameter with HTTP 302 status requiring validation",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "https://auth.target.com/oauth/authorize?redirect=https://app.target.com/callback",
+        "route_signature": "/oauth/authorize",
+        "method": "GET",
+        "status_codes": [302],
+        "query_parameters": ["redirect=https://app.target.com/callback", "client_id=123"],
+        "labels": ["auth", "redirect"],
+        "technologies": ["OAuth2"],
+        "interest_score": 5,
+        "evidence_artifact_ids": ["art-redirect-001"]
+      }
+    ],
+    "changes": [],
+    "evidence": [
+      {
+        "artifact_id": "art-redirect-001",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://auth.target.com/oauth/authorize"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http"]
+  },
+  "expected": {
+    "candidate_count": 1,
+    "candidate_types": ["parameter_reflection_anomaly"],
+    "should_admit_all": true
+  }
+}

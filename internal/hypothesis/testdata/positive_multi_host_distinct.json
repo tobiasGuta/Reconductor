@@ -1,0 +1,58 @@
+{
+  "fixture_id": "positive_multi_host_distinct",
+  "category": "positive",
+  "description": "Multi-host run with identical route signatures on different hosts preserving distinct origin identities",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "https://api.target.com/api/v1/users/42",
+        "route_signature": "/api/v1/users/{param}",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": [],
+        "labels": ["api"],
+        "technologies": ["FastAPI"],
+        "interest_score": 1,
+        "evidence_artifact_ids": ["art-multi-001"]
+      },
+      {
+        "raw_url": "https://admin.target.com/api/v1/users/42",
+        "route_signature": "/api/v1/users/{param}",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": [],
+        "labels": ["admin", "api"],
+        "technologies": ["Django"],
+        "interest_score": 7,
+        "evidence_artifact_ids": ["art-multi-002"]
+      }
+    ],
+    "changes": [],
+    "evidence": [
+      {
+        "artifact_id": "art-multi-001",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://api.target.com/api/v1/users/{param}"
+        ]
+      },
+      {
+        "artifact_id": "art-multi-002",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://admin.target.com/api/v1/users/{param}"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http"]
+  },
+  "expected": {
+    "candidate_count": 1,
+    "candidate_types": ["exposed_administrative_interface"],
+    "should_admit_all": true
+  }
+}

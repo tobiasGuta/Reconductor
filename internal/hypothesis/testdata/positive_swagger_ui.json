@@ -1,0 +1,38 @@
+{
+  "fixture_id": "positive_swagger_ui",
+  "category": "positive",
+  "description": "Exposed Swagger UI API documentation endpoint returning 200 OK",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "https://api.target.com/swagger-ui/index.html",
+        "route_signature": "/swagger-ui/index.html",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": [],
+        "labels": ["swagger", "api"],
+        "technologies": ["Swagger UI"],
+        "interest_score": 6,
+        "evidence_artifact_ids": ["art-swagger-001"]
+      }
+    ],
+    "changes": [],
+    "evidence": [
+      {
+        "artifact_id": "art-swagger-001",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://api.target.com/swagger-ui/index.html"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http", "crawl.web"]
+  },
+  "expected": {
+    "candidate_count": 1,
+    "candidate_types": ["exposed_api_documentation"],
+    "should_admit_all": true
+  }
+}

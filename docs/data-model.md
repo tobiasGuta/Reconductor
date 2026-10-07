@@ -12,7 +12,13 @@ Programs hold engagement identity, scope/policy references, current scope and ta
 
 Audit events preserve program scope decisions and task/run/step/tool lineage for scope loads, plan derivation, manual roots, accepted/filtered targets, exclusions, protocol/port rejection, scope changes, and moderate approvals.
 
-Artifacts carry nullable `expires_at` metadata. A null value means explicitly indefinite retention; expired content is removed from local storage before its database row is deleted, and both retention assignment and expiration are audited.
+Artifacts carry nullable `expires_at` metadata. A null value means explicitly indefinite retention. Explicit cleanup removes only expired physical content and permanently tombstones the retained database row with `content_deleted_at`; quarantine and retry metadata preserve the cleanup outcome. Retention assignment, claims, deletion, retries, and quarantine are audited.
+
+Large provider results use `result-envelope/v1`. The StepRun output retains the action request, provider attempt, result occurrence, capability/schema identity, and either bounded inline semantic JSON or an exact semantic-result artifact reference. `artifact_publications` journal the fenced `reserved -> publishing -> sealed -> adopted` path; known non-adoption can become `abandoned`, while an unverifiable filesystem outcome becomes `quarantined`. Publication identity and terminal outcomes are immutable.
+
+`prepared_evidence_sets` owns durable staged evidence before publication and database adoption. Each set belongs to exactly one provider attempt or failure finalization and records the Program, Task, WorkflowRun, StepRun, action request, attempt, physical artifact-store incarnation, manifest, capacity reservation, and lifecycle. Per-store `artifact_store_prepared_limits` bound one set, total unresolved bytes, and open-set count. `SEALED` or otherwise unresolved evidence is never inferred from Redis delivery state and never authorizes provider replay; resolved staged content remains charged until bounded recovery removes it and records `CLEANED`.
+
+Artifact-backed semantic bindings are provenance references rather than copied payloads. Authorization rechecks the same Program and WorkflowRun, exact adopted publication, source envelope, provider attempt, artifact identity/digest/size, live cleanup state, store incarnation, and dependency path in the immutable materialized workflow. The selected JSON value is streamed under fixed byte, node, and depth limits before it is supplied to a consumer.
 
 Assets are stable logical identities. Asset observations describe what a capability saw during a particular successful workflow run.
 

@@ -1,0 +1,58 @@
+{
+  "fixture_id": "semantic_related_endpoints",
+  "category": "semantic_control",
+  "description": "Disparate endpoints sharing entity parameters across distinct service origins without deterministic triggers",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "https://accounts.target.com/profile/settings",
+        "route_signature": "/profile/settings",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": ["org_id=123"],
+        "labels": ["accounts"],
+        "technologies": ["Ruby on Rails"],
+        "interest_score": 1,
+        "evidence_artifact_ids": ["art-rel-001"]
+      },
+      {
+        "raw_url": "https://billing.target.com/invoices/summary",
+        "route_signature": "/invoices/summary",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": ["org_id=123"],
+        "labels": ["billing"],
+        "technologies": ["Ruby on Rails"],
+        "interest_score": 1,
+        "evidence_artifact_ids": ["art-rel-002"]
+      }
+    ],
+    "changes": [],
+    "evidence": [
+      {
+        "artifact_id": "art-rel-001",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://accounts.target.com/profile/settings"
+        ]
+      },
+      {
+        "artifact_id": "art-rel-002",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://billing.target.com/invoices/summary"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http"]
+  },
+  "expected": {
+    "candidate_count": 0,
+    "candidate_types": [],
+    "should_admit_all": true
+  }
+}

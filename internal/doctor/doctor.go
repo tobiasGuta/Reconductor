@@ -18,6 +18,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/redis/go-redis/v9/maintnotifications"
+	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/providercheck"
@@ -38,7 +39,7 @@ func Run(ctx context.Context, cfg config.Config, configErr error) Report {
 		report.Results = append(report.Results, providercheck.Result{Component: "Configuration", Kind: "configuration", Required: true, Status: providercheck.Incompatible, Details: configErr.Error()})
 	}
 	report.Results = append(report.Results, CheckProviderEnvironment(ctx, cfg, nil)...)
-	report.Results = append(report.Results, checkPostgreSQL(ctx, cfg), checkRedis(ctx, cfg))
+	report.Results = append(report.Results, checkPostgreSQL(ctx, cfg), checkPreparedEvidence(ctx, cfg), checkRedis(ctx, cfg))
 	report.Healthy = len(Failures(report.Results, false)) == 0
 	return report
 }
@@ -305,6 +306,68 @@ func checkPostgreSQL(ctx context.Context, cfg config.Config) providercheck.Resul
 	}
 	result.Status = providercheck.Status("reachable")
 	result.Details = "connection and version query succeeded"
+	return result
+}
+
+func checkPreparedEvidence(ctx context.Context, cfg config.Config) providercheck.Result {
+	result := providercheck.Result{Component: "Prepared evidence", Kind: "artifact_store", Required: true, ExpectedVersion: "configured with admission capacity"}
+	if strings.TrimSpace(cfg.Database.URL) == "" {
+		result.Status = providercheck.Status("not_configured")
+		result.Details = "DATABASE_URL is required to validate prepared evidence"
+		return result
+	}
+	storeID, err := cfg.ArtifactStorage.RequiredStoreID()
+	if err != nil {
+		result.Status = providercheck.Status("not_configured")
+		result.Details = safeError(err)
+		return result
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	store, err := database.Open(checkCtx, cfg.Database.URL)
+	if err != nil {
+		result.Status = providercheck.Status("unreachable")
+		result.Details = safeError(err)
+		return result
+	}
+	defer store.Close()
+	if err := store.RequireCurrentSchema(checkCtx); err != nil {
+		result.Status = providercheck.Incompatible
+		result.Details = safeError(err)
+		return result
+	}
+	local, err := artifact.OpenLocal(checkCtx, cfg.ArtifactStorage.Root, storeID, store, nil)
+	if err != nil {
+		result.Status = providercheck.Incompatible
+		result.Details = safeError(err)
+		return result
+	}
+	guard, err := local.AcquirePublisher(checkCtx, local.Identity())
+	if err != nil {
+		result.Status = providercheck.Incompatible
+		result.Details = safeError(err)
+		return result
+	}
+	if _, ok := guard.(artifact.PreparedPublisherGuard); !ok {
+		_ = guard.Close()
+		result.Status = providercheck.Incompatible
+		result.Details = "artifact publisher lacks prepared-evidence capability"
+		return result
+	}
+	if err := guard.Close(); err != nil {
+		result.Status = providercheck.Incompatible
+		result.Details = safeError(err)
+		return result
+	}
+	status, err := store.RequirePreparedEvidenceReady(checkCtx, storeID)
+	if err != nil {
+		result.Status = providercheck.Incompatible
+		result.Details = safeError(err)
+		return result
+	}
+	result.Status = providercheck.Status("reachable")
+	result.Path = cfg.ArtifactStorage.Root
+	result.Details = fmt.Sprintf("durable publisher ready; open sets %d/%d; unresolved bytes %d/%d; per-set reservation %d", status.OpenSets, status.MaxOpenSets, status.UnresolvedBytes, status.MaxUnresolvedBytes, status.MaxSetBytes)
 	return result
 }
 

@@ -30,6 +30,7 @@ type fakeStore struct {
 	projectionCalls int
 	snapshotCalls   int
 	decided         string
+	decidedActor    string
 }
 
 func (f *fakeStore) ConsoleSnapshot(context.Context, domain.ID) (database.ConsoleSnapshot, error) {
@@ -46,8 +47,9 @@ func (f *fakeStore) GetExecutionProjection(_ context.Context, id domain.ID) (dat
 	return f.projection, nil
 }
 
-func (f *fakeStore) DecideApproval(_ context.Context, _ domain.ID, decision, _ string) error {
+func (f *fakeStore) DecideApproval(_ context.Context, _ domain.ID, decision, actor string) error {
 	f.decided = decision
+	f.decidedActor = actor
 	return nil
 }
 
@@ -318,10 +320,10 @@ func TestExecutionDetailSerializesProjectionWithoutWrapperOrRawFields(t *testing
 
 func TestExecutionDetailRouteCoexistsWithResume(t *testing.T) {
 	store := &mutationStore{fakeStore: fakeStore{projection: representativeExecutionProjection()}}
-	handler := New(store, nil)
+	handler := newTestOperator(t, store, nil)
 
 	detailRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(detailRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/scheduled-executions/execution-123", nil))
+	handler.ServeHTTP(detailRecorder, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8088/api/v1/scheduled-executions/execution-123", nil))
 	if detailRecorder.Code != http.StatusOK {
 		t.Fatalf("detail status = %d, body = %s", detailRecorder.Code, detailRecorder.Body.String())
 	}
@@ -390,10 +392,11 @@ func TestSnapshotSanitizesPendingScopeExpansionTargetPlan(t *testing.T) {
 
 func TestApprovalRequiresOperatorHeader(t *testing.T) {
 	store := &fakeStore{}
-	handler := New(store, nil)
+	handler := newTestOperator(t, store, nil)
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/approval-1/decision", strings.NewReader(`{"decision":"approved"}`))
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+testOperatorToken)
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusForbidden)
@@ -405,19 +408,20 @@ func TestApprovalRequiresOperatorHeader(t *testing.T) {
 
 func TestApprovalAcceptsSameOriginOperatorRequest(t *testing.T) {
 	store := &fakeStore{}
-	handler := New(store, nil)
+	handler := newTestOperator(t, store, nil)
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8088/api/v1/approvals/approval-1/decision", strings.NewReader(`{"decision":"approved","actor":"alice"}`))
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8088/api/v1/approvals/approval-1/decision", strings.NewReader(`{"decision":"approved"}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Reconductor-Request", "operator-console")
+	request.Header.Set("Authorization", "Bearer "+testOperatorToken)
 	request.Header.Set("Origin", "http://127.0.0.1:8088")
 	request.Header.Set("Sec-Fetch-Site", "same-origin")
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	if store.decided != "approved" {
-		t.Fatalf("decision = %q", store.decided)
+	if store.decided != "approved" || store.decidedActor != "configured-operator" {
+		t.Fatalf("decision = %q actor = %q", store.decided, store.decidedActor)
 	}
 }
 
@@ -433,7 +437,7 @@ func TestConsoleScheduleAndScopeMutationsUseSharedValidation(t *testing.T) {
 		schedules: map[domain.ID]domain.Schedule{},
 	}
 	validator := &schedulecron.ScheduleValidator{Programs: store, Registry: providers.Registry(config.Config{})}
-	handler := New(store, nil, validator)
+	handler := newTestOperator(t, store, nil, validator)
 
 	create := operatorRequest(http.MethodPost, "/api/v1/schedules", `{"program_id":"`+string(programID)+`","name":"Daily","workflow_name":"continuous-web-recon","objective":"Authorized scan","cron_expression":"0 9 * * *","timezone":"UTC","headless":true}`)
 	recorder := httptest.NewRecorder()
@@ -477,6 +481,7 @@ func operatorRequest(method, target, body string) *http.Request {
 	request := httptest.NewRequest(method, "http://127.0.0.1:8088"+target, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Reconductor-Request", "operator-console")
+	request.Header.Set("Authorization", "Bearer "+testOperatorToken)
 	request.Header.Set("Origin", "http://127.0.0.1:8088")
 	request.Header.Set("Sec-Fetch-Site", "same-origin")
 	return request

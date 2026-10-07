@@ -1,0 +1,62 @@
+{
+  "fixture_id": "canary_sensitive_leakage",
+  "category": "canary",
+  "description": "Sensitive canaries in query values, titles, summaries, and unredacted evidence; assembler must exclude all canaries",
+  "input": {
+    "endpoints": [
+      {
+        "raw_url": "https://target.com/api?token=SECRET_BEARER_CANARY&api_key=SECRET_API_KEY_CANARY&password=SECRET_PASSWORD_CANARY",
+        "route_signature": "/api",
+        "method": "GET",
+        "status_codes": [200],
+        "query_parameters": [
+          "token=SECRET_BEARER_CANARY",
+          "api_key=SECRET_API_KEY_CANARY",
+          "password=SECRET_PASSWORD_CANARY"
+        ],
+        "labels": ["api"],
+        "technologies": ["Express"],
+        "interest_score": 1,
+        "evidence_artifact_ids": ["art-canary-001", "art-unredacted-999"]
+      }
+    ],
+    "changes": [
+      {
+        "kind": "asset_changed",
+        "entity_type": "asset",
+        "entity_key": "https://target.com/user?token=SECRET_CHANGE_QUERY_CANARY",
+        "priority": "low",
+        "reasons": ["normal_update"],
+        "evidence_artifact_ids": ["art-canary-001"],
+        "title": "User password reset with secret: SECRET_TITLE_PASSWORD_CANARY",
+        "summary": "Cookie header session=SECRET_SESSION_CANARY was logged"
+      }
+    ],
+    "evidence": [
+      {
+        "artifact_id": "art-canary-001",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://target.com/api?token=SECRET_LOCATOR_CANARY"
+        ]
+      },
+      {
+        "artifact_id": "art-unredacted-999",
+        "step_definition_id": "probe-http",
+        "source_category": "http_probe",
+        "redaction_state": "unredacted",
+        "locators": [
+          "https://target.com/unredacted-SECRET_UNREDACTED_CANARY"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http"]
+  },
+  "expected": {
+    "candidate_count": 0,
+    "candidate_types": [],
+    "should_admit_all": true
+  }
+}

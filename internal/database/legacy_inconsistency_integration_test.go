@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -36,9 +37,7 @@ func TestLegacyInconsistenciesRemainDetectableAfterMaterializationMigration(t *t
 				t.Fatal(err)
 			}
 		}
-		if err := store.Migrate(ctx); err != nil {
-			t.Fatal(err)
-		}
+		assertProviderCeilingMigrationBlockedByActiveState(t, store, ctx)
 		if err := store.reconcileStaleScheduledExecutions(ctx, staleReconciliationBatchLimit); err != nil {
 			t.Fatal(err)
 		}
@@ -90,9 +89,7 @@ func TestLegacyInconsistenciesRemainDetectableAfterMaterializationMigration(t *t
 				t.Fatal(err)
 			}
 		}
-		if err := store.Migrate(ctx); err != nil {
-			t.Fatal(err)
-		}
+		assertProviderCeilingMigrationBlockedByActiveState(t, store, ctx)
 		projection, err := store.GetExecutionProjection(ctx, executionID)
 		if err != nil {
 			t.Fatal(err)
@@ -101,6 +98,22 @@ func TestLegacyInconsistenciesRemainDetectableAfterMaterializationMigration(t *t
 			t.Fatalf("projection workflow=%#v issues=%v", projection.Workflow, projection.Lineage.Issues)
 		}
 	})
+}
+
+func assertProviderCeilingMigrationBlockedByActiveState(t *testing.T, store *Store, ctx context.Context) {
+	t.Helper()
+	err := store.Migrate(ctx)
+	if err == nil || !strings.Contains(err.Error(), "execution or publication state is active") {
+		t.Fatalf("migration 0021 active-state error=%v", err)
+	}
+	var version int64
+	var name string
+	if err := store.Pool.QueryRow(ctx, `SELECT version,name FROM schema_migrations ORDER BY version DESC LIMIT 1`).Scan(&version, &name); err != nil {
+		t.Fatal(err)
+	}
+	if version != 20 || name != "0020_prepared_evidence_ownership.sql" {
+		t.Fatalf("failed migration frontier=%d (%s)", version, name)
+	}
 }
 
 func assertLegacyProbeHTTPSourceHierarchyRejected(t *testing.T, mismatch string) {

@@ -1,10 +1,12 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +24,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/orchestration"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
+	platformproviders "github.com/tobiasGuta/Reconductor/internal/providers"
 	"github.com/tobiasGuta/Reconductor/internal/workflows"
 )
 
@@ -63,13 +66,99 @@ func testDatabaseStore(t *testing.T) (*database.Store, context.Context) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("migrate isolated test schema: %v", err)
 	}
-	if _, err := store.RegisterArtifactStore(ctx, schedulerTestStoreRegistration()); err != nil {
+	registered, err := store.RegisterArtifactStore(ctx, schedulerTestStoreRegistration())
+	if err != nil {
 		t.Fatalf("register isolated test artifact store: %v", err)
+	}
+	if err := store.ConfigurePreparedEvidenceLimits(ctx, registered.ID, 128, 1<<20, 128<<20); err != nil {
+		t.Fatalf("configure isolated prepared-evidence limits: %v", err)
 	}
 	return store, ctx
 }
 
 type schedulerTestArtifacts struct{}
+
+func (schedulerTestArtifacts) Identity() artifact.StoreIdentity {
+	return artifact.StoreIdentityFrom(domain.ArtifactStore{ArtifactStoreRegistration: schedulerTestStoreRegistration()})
+}
+
+func (s schedulerTestArtifacts) AcquirePublisher(_ context.Context, expected artifact.StoreIdentity) (artifact.PublisherGuard, error) {
+	if expected != s.Identity() {
+		return nil, fmt.Errorf("scheduler test publisher identity mismatch")
+	}
+	return &schedulerTestPublisher{identity: expected, prepared: make(map[string][]byte)}, nil
+}
+
+type schedulerTestPublisher struct {
+	identity artifact.StoreIdentity
+	prepared map[string][]byte
+}
+
+func (p *schedulerTestPublisher) Identity() artifact.StoreIdentity { return p.identity }
+
+func (p *schedulerTestPublisher) StagePrepared(_ context.Context, request artifact.PreparedStageRequest) (artifact.PreparedStageReceipt, error) {
+	if err := request.ValidateCapacity(); err != nil {
+		return artifact.PreparedStageReceipt{}, err
+	}
+	manifest, err := domain.DecodePreparedManifestV1(request.ManifestJSON)
+	if err != nil {
+		return artifact.PreparedStageReceipt{}, err
+	}
+	manifestKey, _ := domain.PreparedManifestKey(request.SetID)
+	if manifest.SetID != request.SetID || manifest.ManifestID != request.ManifestID || manifest.ArtifactStoreID != p.identity.ArtifactStoreID || manifest.StoreIncarnationNonce != p.identity.IncarnationNonce || manifest.StoreBackendKind != p.identity.BackendKind || manifest.StoreMarkerFormat != p.identity.MarkerFormat || manifest.StoreMarkerVersion != p.identity.MarkerVersion || request.ManifestKey != manifestKey || request.Control.StorageKey != manifest.Control.StorageKey || request.Control.ExpectedSize != manifest.Control.ContentSizeBytes || artifact.DigestString(request.Control.ExpectedSHA256) != manifest.Control.ContentSHA256 || len(request.Members) != len(manifest.Members) {
+		return artifact.PreparedStageReceipt{}, fmt.Errorf("scheduler test prepared manifest mismatch")
+	}
+	contentBytes := int64(0)
+	objects := append([]artifact.PreparedStageObject{request.Control}, request.Members...)
+	for index, object := range objects {
+		if object.Source == nil {
+			return artifact.PreparedStageReceipt{}, fmt.Errorf("scheduler test prepared source %d is nil", index)
+		}
+		if index > 0 {
+			member := manifest.Members[index-1]
+			if object.StorageKey != member.PreparedKey || object.ExpectedSize != member.ContentSizeBytes || artifact.DigestString(object.ExpectedSHA256) != member.ContentSHA256 {
+				return artifact.PreparedStageReceipt{}, fmt.Errorf("scheduler test prepared member %d mismatch", index-1)
+			}
+		}
+		reader, err := object.Source.Open()
+		if err != nil {
+			return artifact.PreparedStageReceipt{}, err
+		}
+		data, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil || closeErr != nil || int64(len(data)) != object.ExpectedSize || artifact.DigestBytes(data) != object.ExpectedSHA256 {
+			return artifact.PreparedStageReceipt{}, errors.Join(readErr, closeErr, fmt.Errorf("scheduler test prepared source %d mismatch", index))
+		}
+		p.prepared[object.StorageKey] = data
+		contentBytes += int64(len(data))
+	}
+	p.prepared[request.ManifestKey] = append([]byte(nil), request.ManifestJSON...)
+	return artifact.PreparedStageReceipt{ManifestSize: int64(len(request.ManifestJSON)), ManifestSHA256: artifact.DigestBytes(request.ManifestJSON), MemberCount: len(request.Members), ContentBytes: contentBytes, Durable: true}, nil
+}
+
+func (p *schedulerTestPublisher) OpenPrepared(_ context.Context, key string, size int64, digest [32]byte) (io.ReadCloser, error) {
+	data, ok := p.prepared[key]
+	if !ok || int64(len(data)) != size || artifact.DigestBytes(data) != digest {
+		return nil, fmt.Errorf("scheduler test prepared object mismatch")
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (p *schedulerTestPublisher) PublishReserved(_ context.Context, reserved artifact.ReservedArtifactV1, source io.Reader) (artifact.PublishedArtifactV1, error) {
+	if reserved.ArtifactStoreID != p.identity.ArtifactStoreID {
+		return artifact.PublishedArtifactV1{}, fmt.Errorf("scheduler test publication store mismatch")
+	}
+	data, err := io.ReadAll(source)
+	if err != nil {
+		return artifact.PublishedArtifactV1{}, err
+	}
+	if int64(len(data)) != reserved.ExpectedSize || artifact.DigestBytes(data) != reserved.ExpectedSHA256 {
+		return artifact.PublishedArtifactV1{}, fmt.Errorf("scheduler test publication content mismatch")
+	}
+	return artifact.PublishedArtifactV1{SizeBytes: int64(len(data)), SHA256: reserved.ExpectedSHA256, Durable: true}, nil
+}
+
+func (*schedulerTestPublisher) Close() error { return nil }
 
 func (schedulerTestArtifacts) Put(_ context.Context, req artifact.PutRequest) (domain.Artifact, error) {
 	id := domain.NewID()
@@ -92,6 +181,27 @@ type fakeProvider struct {
 	approval  bool
 }
 
+var schedulerProductionRegistry = platformproviders.Registry(config.Config{})
+
+func schedulerFixtureOutput(name string) (json.RawMessage, bool) {
+	switch name {
+	case "targeting.prepare":
+		return json.RawMessage(`{"urls":[],"port_targets":[],"filtered":[],"accepted_count":0,"filtered_count":0,"target_plan_digest":"plan"}`), true
+	case "compare.assets":
+		return json.RawMessage(`{"new_or_changed":[],"crawl_targets":[],"scan_targets":[],"status_routes":{"active":[],"redirects":[],"authentication":[],"ignored":[]},"removed":[],"changes":[]}`), true
+	case "classify.endpoint":
+		return json.RawMessage(`{"endpoints":[],"classifications":[],"interesting_endpoints":[],"relationships":[],"source_derivations":[]}`), true
+	case "report.changes":
+		return json.RawMessage(`{"changes":[],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan","change_items":[]}`), true
+	case "probe.http":
+		return json.RawMessage(`{"lines":[],"authorized":[],"authorized_urls":[],"authorized_records":[],"authorized_source_records":[],"filtered":[],"records":[],"warnings":[],"accepted_count":0,"filtered_count":0}`), true
+	case "discover.subdomains", "discover.archive_urls", "resolve.dns", "scan.ports", "scan.nuclei", "crawl.web":
+		return json.RawMessage(`{"lines":[],"authorized":[],"authorized_urls":[],"authorized_records":[],"filtered":[],"records":[],"warnings":[],"accepted_count":0,"filtered_count":0}`), true
+	default:
+		return nil, false
+	}
+}
+
 func (p *fakeProvider) Validate(ctx context.Context, req capability.Request) error {
 	return nil
 }
@@ -102,21 +212,26 @@ func (p *fakeProvider) Execute(ctx context.Context, req capability.Request) (cap
 	if p.onExecute != nil {
 		result, err = p.onExecute(ctx)
 	}
-	if err == nil && p.name == "probe.http" {
-		var output map[string]json.RawMessage
-		if json.Unmarshal(result.Action.Output, &output) == nil && string(output["authorized_records"]) == "[]" {
-			// The shared scheduler success fixture has no authorized records. probe.http v4
-			// nevertheless requires its explicitly non-null, platform-derived source collection.
-			output["authorized_source_records"] = json.RawMessage(`[]`)
-			result.Action.Output, err = json.Marshal(output)
+	if err == nil {
+		if output, current := schedulerFixtureOutput(p.name); current {
+			result.Action.Output = output
+		} else if p.name == "pinned.old" {
+			result.Action.Output = nil
 		}
-	}
-	if err == nil && p.name == "classify.endpoint" {
-		result.Action.Output = json.RawMessage(`{"endpoints":[],"classifications":[],"interesting_endpoints":[],"relationships":[]}`)
 	}
 	return result, err
 }
 func (p *fakeProvider) Manifest() capability.Manifest {
+	if current, ok := schedulerProductionRegistry.Get(p.name); ok {
+		manifest := current.Manifest()
+		if p.risk != "" {
+			manifest.Risk = p.risk
+		}
+		if p.approval {
+			manifest.ApprovalRequired = true
+		}
+		return manifest
+	}
 	r := p.risk
 	if r == "" {
 		r = policy.Passive
@@ -164,12 +279,7 @@ func allCaps() []string {
 		"resolve.dns",
 		"scan.ports",
 		"scan.nuclei",
-		"scan.ffuf",
-		"crawl.urls",
 		"crawl.web",
-		"scan.wpscan",
-		"take.screenshot",
-		"report.brief",
 		"classify.endpoint",
 		"report.changes",
 		"probe.http",
@@ -275,8 +385,8 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		<-cancelObserved
 
 		dispatchErr := <-errs
-		if !errors.Is(dispatchErr, database.ErrLostScheduledExecutionLease) {
-			t.Fatalf("expected ErrLostScheduledExecutionLease, got: %v", dispatchErr)
+		if !database.IsScheduledExecutionFenceError(dispatchErr) {
+			t.Fatalf("expected scheduled execution fence error, got: %v", dispatchErr)
 		}
 		var seStatus domain.ScheduledExecutionStatus
 
@@ -344,8 +454,8 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 			t.Fatalf("expire lease during provider completion: %v", dbErr)
 		default:
 		}
-		if !errors.Is(err, database.ErrLostScheduledExecutionLease) {
-			t.Fatalf("expected ErrLostScheduledExecutionLease, got: %v", err)
+		if !database.IsScheduledExecutionFenceError(err) {
+			t.Fatalf("expected scheduled execution fence error, got: %v", err)
 		}
 	})
 
@@ -435,8 +545,8 @@ func TestHeartbeatOwnershipLossAll(t *testing.T) {
 		<-providerCancellationObserved
 
 		err = <-errs
-		if !errors.Is(err, database.ErrLostScheduledExecutionLease) {
-			t.Fatalf("expected ErrLostScheduledExecutionLease, got: %v", err)
+		if !database.IsScheduledExecutionFenceError(err) {
+			t.Fatalf("expected scheduled execution fence error, got: %v", err)
 		}
 		var scheduledStatus domain.ScheduledExecutionStatus
 		if err := store.Pool.QueryRow(ctx, `SELECT status FROM scheduled_executions WHERE id=$1`, execution.ID).Scan(&scheduledStatus); err != nil {

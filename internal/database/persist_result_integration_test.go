@@ -1,11 +1,14 @@
 package database
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"strings"
@@ -75,18 +78,6 @@ func (r invalidPostgresStartRecorder) RecordProviderInvocationTerminal(ctx conte
 	return r.store.RecordProviderInvocationTerminal(ctx, record)
 }
 
-type failingPostgresTerminalRecorder struct {
-	store *Store
-	err   error
-}
-
-func (r failingPostgresTerminalRecorder) RecordProviderInvocationStarted(ctx context.Context, record capability.ProviderInvocationStartRecord) (domain.ID, error) {
-	return r.store.RecordProviderInvocationStarted(ctx, record)
-}
-func (r failingPostgresTerminalRecorder) RecordProviderInvocationTerminal(context.Context, capability.ProviderInvocationTerminalRecord) error {
-	return r.err
-}
-
 type integrationAllowScope struct{}
 
 func (integrationAllowScope) Allows(string) bool { return true }
@@ -121,7 +112,7 @@ func (c *postgresWorkflowRetryCapability) Execute(ctx context.Context, req capab
 	exitCode := 0
 	tool := &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: req.Provider, ToolVersion: "1", SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"integration"}`), StartedAt: now, CompletedAt: &now, ExitCode: &exitCode}
 	result := capability.Result{
-		Action:    domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "provider succeeded", Output: json.RawMessage(`{"lines":[]}`)},
+		Action:    domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "provider succeeded"},
 		ToolRun:   tool,
 		RawStdout: []byte("provider attempt output\n"),
 	}
@@ -134,7 +125,111 @@ func (c *postgresWorkflowRetryCapability) Execute(ctx context.Context, req capab
 	return result, nil
 }
 
-type postgresWorkflowRetryArtifacts struct{}
+type postgresWorkflowRetryArtifacts struct {
+	acquireErr error
+	guard      artifact.PublisherGuard
+}
+
+func (postgresWorkflowRetryArtifacts) Identity() artifact.StoreIdentity {
+	return artifact.StoreIdentity{ArtifactStoreID: testArtifactStoreID, IncarnationNonce: testArtifactStoreNonce, BackendKind: artifact.BackendKind, MarkerFormat: artifact.MarkerFormat, MarkerVersion: artifact.MarkerVersion}
+}
+
+func (s postgresWorkflowRetryArtifacts) AcquirePublisher(_ context.Context, expected artifact.StoreIdentity) (artifact.PublisherGuard, error) {
+	if expected != s.Identity() {
+		return nil, fmt.Errorf("test publisher identity mismatch")
+	}
+	if s.acquireErr != nil {
+		return nil, s.acquireErr
+	}
+	if s.guard != nil {
+		return s.guard, nil
+	}
+	return &postgresWorkflowRetryPublisher{identity: expected, prepared: make(map[string][]byte)}, nil
+}
+
+type postgresWorkflowRetryPublisher struct {
+	identity artifact.StoreIdentity
+	prepared map[string][]byte
+}
+
+func (p *postgresWorkflowRetryPublisher) Identity() artifact.StoreIdentity { return p.identity }
+
+func (p *postgresWorkflowRetryPublisher) StagePrepared(_ context.Context, request artifact.PreparedStageRequest) (artifact.PreparedStageReceipt, error) {
+	if err := request.ValidateCapacity(); err != nil {
+		return artifact.PreparedStageReceipt{}, err
+	}
+	manifest, err := domain.DecodePreparedManifestV1(request.ManifestJSON)
+	if err != nil {
+		return artifact.PreparedStageReceipt{}, err
+	}
+	manifestKey, _ := domain.PreparedManifestKey(request.SetID)
+	if manifest.SetID != request.SetID || manifest.ManifestID != request.ManifestID || manifest.ArtifactStoreID != p.identity.ArtifactStoreID || manifest.StoreIncarnationNonce != p.identity.IncarnationNonce || manifest.StoreBackendKind != p.identity.BackendKind || manifest.StoreMarkerFormat != p.identity.MarkerFormat || manifest.StoreMarkerVersion != p.identity.MarkerVersion || request.ManifestKey != manifestKey || request.Control.StorageKey != manifest.Control.StorageKey || request.Control.ExpectedSize != manifest.Control.ContentSizeBytes || artifact.DigestString(request.Control.ExpectedSHA256) != manifest.Control.ContentSHA256 || len(request.Members) != len(manifest.Members) {
+		return artifact.PreparedStageReceipt{}, fmt.Errorf("test prepared manifest mismatch")
+	}
+	contentBytes := int64(0)
+	objects := append([]artifact.PreparedStageObject{request.Control}, request.Members...)
+	for index, object := range objects {
+		if object.Source == nil {
+			return artifact.PreparedStageReceipt{}, fmt.Errorf("test prepared source %d is nil", index)
+		}
+		if index > 0 {
+			member := manifest.Members[index-1]
+			if object.StorageKey != member.PreparedKey || object.ExpectedSize != member.ContentSizeBytes || artifact.DigestString(object.ExpectedSHA256) != member.ContentSHA256 {
+				return artifact.PreparedStageReceipt{}, fmt.Errorf("test prepared member %d mismatch", index-1)
+			}
+		}
+		reader, err := object.Source.Open()
+		if err != nil {
+			return artifact.PreparedStageReceipt{}, err
+		}
+		data, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil || closeErr != nil || int64(len(data)) != object.ExpectedSize || artifact.DigestBytes(data) != object.ExpectedSHA256 {
+			return artifact.PreparedStageReceipt{}, errors.Join(readErr, closeErr, fmt.Errorf("test prepared source %d mismatch", index))
+		}
+		p.prepared[object.StorageKey] = data
+		contentBytes += int64(len(data))
+	}
+	p.prepared[request.ManifestKey] = append([]byte(nil), request.ManifestJSON...)
+	return artifact.PreparedStageReceipt{ManifestSize: int64(len(request.ManifestJSON)), ManifestSHA256: artifact.DigestBytes(request.ManifestJSON), MemberCount: len(request.Members), ContentBytes: contentBytes, Durable: true}, nil
+}
+
+func (p *postgresWorkflowRetryPublisher) OpenPrepared(_ context.Context, key string, size int64, digest [32]byte) (io.ReadCloser, error) {
+	data, ok := p.prepared[key]
+	if !ok || int64(len(data)) != size || artifact.DigestBytes(data) != digest {
+		return nil, fmt.Errorf("test prepared object mismatch")
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (p *postgresWorkflowRetryPublisher) PublishReserved(_ context.Context, reserved artifact.ReservedArtifactV1, source io.Reader) (artifact.PublishedArtifactV1, error) {
+	if reserved.ArtifactStoreID != p.identity.ArtifactStoreID {
+		return artifact.PublishedArtifactV1{}, fmt.Errorf("test publication store mismatch")
+	}
+	data, err := io.ReadAll(source)
+	if err != nil {
+		return artifact.PublishedArtifactV1{}, err
+	}
+	if int64(len(data)) != reserved.ExpectedSize || artifact.DigestBytes(data) != reserved.ExpectedSHA256 {
+		return artifact.PublishedArtifactV1{}, fmt.Errorf("test publication content mismatch")
+	}
+	return artifact.PublishedArtifactV1{SizeBytes: int64(len(data)), SHA256: reserved.ExpectedSHA256, Durable: true}, nil
+}
+
+func (*postgresWorkflowRetryPublisher) Close() error { return nil }
+
+type postgresInvalidPublisherGuard struct{ closeCalls int }
+
+func (postgresInvalidPublisherGuard) Identity() artifact.StoreIdentity {
+	return postgresWorkflowRetryArtifacts{}.Identity()
+}
+func (postgresInvalidPublisherGuard) PublishReserved(context.Context, artifact.ReservedArtifactV1, io.Reader) (artifact.PublishedArtifactV1, error) {
+	return artifact.PublishedArtifactV1{}, errors.New("invalid publisher guard must not publish")
+}
+func (g *postgresInvalidPublisherGuard) Close() error {
+	g.closeCalls++
+	return nil
+}
 
 func (postgresWorkflowRetryArtifacts) Put(_ context.Context, req artifact.PutRequest) (domain.Artifact, error) {
 	item := domain.Artifact{ID: domain.NewID(), TaskID: req.TaskID, WorkflowRunID: req.WorkflowRunID, StepRunID: req.StepRunID, ToolRunID: req.ToolRunID, Type: req.Type, ContentType: req.ContentType, Size: int64(len(req.Data)), SHA256: strings.Repeat("a", 64), CreatedAt: time.Now().UTC(), RedactionState: "redacted"}
@@ -155,7 +250,7 @@ type postgresClassifyResumeCapability struct {
 }
 
 func (*postgresClassifyResumeCapability) Manifest() capability.Manifest {
-	return capability.Manifest{Name: "classify.endpoint", Version: "1", Risk: policy.Low, RetrySafe: true, Idempotent: true, SupportedProviders: []string{"classifier"}}
+	return capability.Manifest{Name: "classify.endpoint", Version: "5", Risk: policy.Low, RetrySafe: true, Idempotent: true, SupportedProviders: []string{"classifier"}}
 }
 func (*postgresClassifyResumeCapability) Validate(context.Context, capability.Request) error {
 	return nil
@@ -171,7 +266,7 @@ func (c *postgresClassifyResumeCapability) Execute(ctx context.Context, req capa
 	c.persistedAttempts = append(c.persistedAttempts, attempt)
 	now := time.Now().UTC()
 	exitCode := 0
-	result := capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "classifier succeeded", Output: json.RawMessage(`{"endpoints":[],"classifications":[],"interesting_endpoints":[],"relationships":[]}`)}, ToolRun: &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: req.Provider, ToolVersion: "1", SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"integration"}`), StartedAt: now, CompletedAt: &now, ExitCode: &exitCode}}
+	result := capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: "classifier succeeded", Output: json.RawMessage(`{"endpoints":[],"classifications":[],"interesting_endpoints":[],"relationships":[],"source_derivations":[]}`)}, ToolRun: &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: req.Provider, ToolVersion: "5", SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"integration"}`), StartedAt: now, CompletedAt: &now, ExitCode: &exitCode}}
 	if c.calls == 1 {
 		result.Action.Status = "failed"
 		result.Action.Summary = "retryable classifier failure"
@@ -352,6 +447,10 @@ func TestWorkflowRetryPersistsEveryProviderAttempt(t *testing.T) {
 	stepID := state.Steps["retry"].Run.ID
 	var status domain.StepStatus
 	var attemptCount, stepCount, toolCount, providerAttemptCount, artifactCount, artifactToolCount, toolExecutionCount, acceptedDecisionCount int
+	var failedStdoutCount, failedDiagnosticCount, failedSemanticCount int
+	var succeededStdoutCount, succeededDiagnosticCount, succeededSemanticCount int
+	var failedPublicationCount, failedMinimumOrdinal, failedMaximumOrdinal int
+	var succeededPublicationCount, succeededMinimumOrdinal, succeededMaximumOrdinal int
 	var completedAt *time.Time
 	if err := env.store.Pool.QueryRow(env.ctx, `SELECT status,attempt_count,completed_at FROM step_runs WHERE id=$1`, stepID).Scan(&status, &attemptCount, &completedAt); err != nil {
 		t.Fatal(err)
@@ -366,8 +465,191 @@ func TestWorkflowRetryPersistsEveryProviderAttempt(t *testing.T) {
 		(SELECT count(*) FROM audit_events WHERE step_run_id=$2 AND event_type='provider_result_accepted')`, state.Run.ID, stepID).Scan(&stepCount, &toolCount, &providerAttemptCount, &artifactCount, &artifactToolCount, &toolExecutionCount, &acceptedDecisionCount); err != nil {
 		t.Fatal(err)
 	}
-	if status != domain.StepSucceeded || attemptCount != 2 || completedAt == nil || stepCount != 1 || toolCount != 2 || providerAttemptCount != 2 || artifactCount != 4 || artifactToolCount != 2 || toolExecutionCount != 2 || acceptedDecisionCount != 2 {
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT
+		count(*) FILTER (WHERE started.step_attempt=1 AND artifacts.type='raw-provider-output' AND artifacts.content_type='application/x-ndjson'),
+		count(*) FILTER (WHERE started.step_attempt=1 AND artifacts.type='provider-diagnostic'),
+		count(*) FILTER (WHERE started.step_attempt=1 AND artifacts.type='normalized-result' AND artifacts.content_type='application/json'),
+		count(*) FILTER (WHERE started.step_attempt=2 AND artifacts.type='raw-provider-output' AND artifacts.content_type='application/x-ndjson'),
+		count(*) FILTER (WHERE started.step_attempt=2 AND artifacts.type='provider-diagnostic'),
+		count(*) FILTER (WHERE started.step_attempt=2 AND artifacts.type='normalized-result' AND artifacts.content_type='application/json'),
+		count(*) FILTER (WHERE started.step_attempt=1),
+		COALESCE(min(publications.publication_ordinal) FILTER (WHERE started.step_attempt=1),-1),
+		COALESCE(max(publications.publication_ordinal) FILTER (WHERE started.step_attempt=1),-1),
+		count(*) FILTER (WHERE started.step_attempt=2),
+		COALESCE(min(publications.publication_ordinal) FILTER (WHERE started.step_attempt=2),-1),
+		COALESCE(max(publications.publication_ordinal) FILTER (WHERE started.step_attempt=2),-1)
+		FROM artifacts
+		JOIN tool_runs tools ON tools.id=artifacts.tool_run_id
+		JOIN audit_events started ON started.id=tools.provider_attempt_id AND started.event_type='provider_invocation_started'
+		JOIN artifact_publications publications ON publications.artifact_id=artifacts.id
+		WHERE artifacts.step_run_id=$1`, stepID).Scan(
+		&failedStdoutCount, &failedDiagnosticCount, &failedSemanticCount,
+		&succeededStdoutCount, &succeededDiagnosticCount, &succeededSemanticCount,
+		&failedPublicationCount, &failedMinimumOrdinal, &failedMaximumOrdinal,
+		&succeededPublicationCount, &succeededMinimumOrdinal, &succeededMaximumOrdinal,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if status != domain.StepSucceeded || attemptCount != 2 || completedAt == nil || stepCount != 1 || toolCount != 2 || providerAttemptCount != 2 || artifactCount != 5 || artifactToolCount != 2 || toolExecutionCount != 2 || acceptedDecisionCount != 2 {
 		t.Fatalf("status=%s attempt=%d completed=%v steps=%d tools=%d provider_attempts=%d artifacts=%d artifact_tools=%d tool_executions=%d accepted_decisions=%d", status, attemptCount, completedAt, stepCount, toolCount, providerAttemptCount, artifactCount, artifactToolCount, toolExecutionCount, acceptedDecisionCount)
+	}
+	if failedStdoutCount != 1 || failedDiagnosticCount != 1 || failedSemanticCount != 1 || failedPublicationCount != 3 || failedMinimumOrdinal != 0 || failedMaximumOrdinal != 2 {
+		t.Fatalf("failed attempt evidence stdout=%d diagnostic=%d semantic=%d publications=%d ordinals=%d..%d", failedStdoutCount, failedDiagnosticCount, failedSemanticCount, failedPublicationCount, failedMinimumOrdinal, failedMaximumOrdinal)
+	}
+	if succeededStdoutCount != 1 || succeededDiagnosticCount != 0 || succeededSemanticCount != 1 || succeededPublicationCount != 2 || succeededMinimumOrdinal != 0 || succeededMaximumOrdinal != 1 {
+		t.Fatalf("successful attempt evidence stdout=%d diagnostic=%d semantic=%d publications=%d ordinals=%d..%d", succeededStdoutCount, succeededDiagnosticCount, succeededSemanticCount, succeededPublicationCount, succeededMinimumOrdinal, succeededMaximumOrdinal)
+	}
+}
+
+type effectiveInputCaptureStore struct {
+	*Store
+	proposed json.RawMessage
+}
+
+func (s *effectiveInputCaptureStore) PersistEffectiveStepInput(ctx context.Context, programID domain.ID, action domain.ActionRequest, proposed json.RawMessage) (json.RawMessage, error) {
+	s.proposed = append(json.RawMessage(nil), proposed...)
+	return s.Store.PersistEffectiveStepInput(ctx, programID, action, proposed)
+}
+
+func TestWorkflowPublisherAcquisitionFailurePersistsAuthoritativeEffectiveInput(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "publisher-acquisition-effective-input")
+	now := time.Now().UTC()
+	task := domain.Task{ID: domain.NewID(), ProgramID: env.programID, Objective: "publisher acquisition failure", WorkflowDefinitionID: env.definitionID, Status: domain.TaskRunning, RequestedBy: "integration-test", CreatedAt: now, UpdatedAt: now}
+	if err := env.store.CreateTask(env.ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	provider := &postgresWorkflowRetryCapability{}
+	registry := capability.NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	callerInput := json.RawMessage(`{"b":2,"a":1}`)
+	definition, scopeVersionID := syntheticWorkflowDefinition(t, env.store, env.ctx, task.ID)
+	definition.Steps = []workflow.Step{{ID: "publisher", Capability: "test.workflow-retry", Input: callerInput, Retry: workflow.RetryPolicy{MaxAttempts: 1}}}
+	publisherErr := errors.New("publisher authority unavailable")
+	capturingStore := &effectiveInputCaptureStore{Store: env.store}
+	engine := workflow.Engine{
+		Registry:               registry,
+		Executor:               execution.Service{Registry: registry, Store: capturingStore, Artifacts: postgresWorkflowRetryArtifacts{acquireErr: publisherErr}, ProgramID: env.programID},
+		Persister:              WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: t.TempDir()}},
+		Policy:                 policy.Policy{AllowedCapabilities: []string{"test.workflow-retry"}},
+		Scope:                  integrationAllowScope{},
+		OriginalScopeVersionID: scopeVersionID,
+	}
+	state, err := engine.Run(env.ctx, definition, nil, task, nil)
+	if !errors.Is(err, publisherErr) || errors.Is(err, workflow.ErrEffectiveStepInputConflict) {
+		t.Fatalf("workflow error=%v", err)
+	}
+	if state == nil || state.Run.Status != domain.RunFailed || state.Steps["publisher"] == nil || state.Steps["publisher"].Run.Status != domain.StepFailed {
+		t.Fatalf("workflow state=%#v", state)
+	}
+
+	stepID := state.Steps["publisher"].Run.ID
+	var runStatus domain.RunStatus
+	var runCompleted, stepCompleted *time.Time
+	var stepStatus domain.StepStatus
+	var attemptCount int
+	var classification, details string
+	var persistedInput json.RawMessage
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT wr.status,wr.completed_at,sr.status,sr.attempt_count,sr.completed_at,sr.error_classification,sr.error_details,sr.input
+		FROM workflow_runs wr JOIN step_runs sr ON sr.workflow_run_id=wr.id WHERE wr.id=$1 AND sr.id=$2`, state.Run.ID, stepID).Scan(&runStatus, &runCompleted, &stepStatus, &attemptCount, &stepCompleted, &classification, &details, &persistedInput); err != nil {
+		t.Fatal(err)
+	}
+	if runStatus != domain.RunFailed || runCompleted == nil || stepStatus != domain.StepFailed || attemptCount != 1 || stepCompleted == nil || classification != "execution" || !strings.Contains(details, publisherErr.Error()) {
+		t.Fatalf("run=%s completed=%v step=%s attempts=%d step_completed=%v classification=%q details=%q", runStatus, runCompleted, stepStatus, attemptCount, stepCompleted, classification, details)
+	}
+	if len(capturingStore.proposed) == 0 || bytes.Equal(capturingStore.proposed, persistedInput) || bytes.Equal(callerInput, persistedInput) {
+		t.Fatalf("effective input was not PostgreSQL-authoritative: caller=%s proposed=%s persisted=%s", callerInput, capturingStore.proposed, persistedInput)
+	}
+	var semanticallyEqual bool
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT $1::jsonb=$2::jsonb`, capturingStore.proposed, persistedInput).Scan(&semanticallyEqual); err != nil || !semanticallyEqual {
+		t.Fatalf("effective inputs are not semantically equal: proposed=%s persisted=%s equal=%v err=%v", capturingStore.proposed, persistedInput, semanticallyEqual, err)
+	}
+
+	var stepRows, providerCalls, toolRuns, artifacts, preparedSets, publications, secondAttempts int
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT
+		(SELECT count(*) FROM step_runs WHERE workflow_run_id=$1),
+		(SELECT count(*) FROM audit_events WHERE workflow_run_id=$1 AND event_type='provider_invocation_started'),
+		(SELECT count(*) FROM tool_runs WHERE step_run_id=$2),
+		(SELECT count(*) FROM artifacts WHERE workflow_run_id=$1),
+		(SELECT count(*) FROM prepared_evidence_sets WHERE workflow_run_id=$1),
+		(SELECT count(*) FROM artifact_publications publications JOIN audit_events attempts ON attempts.id=publications.provider_attempt_id WHERE attempts.workflow_run_id=$1),
+		(SELECT count(*) FROM audit_events WHERE step_run_id=$2 AND event_type='provider_invocation_started' AND step_attempt=2)`, state.Run.ID, stepID).Scan(&stepRows, &providerCalls, &toolRuns, &artifacts, &preparedSets, &publications, &secondAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if provider.calls != 0 || stepRows != 1 || providerCalls != 0 || toolRuns != 0 || artifacts != 0 || preparedSets != 0 || publications != 0 || secondAttempts != 0 {
+		t.Fatalf("provider_calls=%d step_rows=%d provider_audits=%d tool_runs=%d artifacts=%d prepared_sets=%d publications=%d second_attempts=%d", provider.calls, stepRows, providerCalls, toolRuns, artifacts, preparedSets, publications, secondAttempts)
+	}
+}
+
+func TestWorkflowPublisherGuardMismatchPersistsAuthoritativeEffectiveInput(t *testing.T) {
+	env := newRecoveryTestEnvironment(t, "publisher-guard-mismatch-effective-input")
+	now := time.Now().UTC()
+	task := domain.Task{ID: domain.NewID(), ProgramID: env.programID, Objective: "publisher guard mismatch", WorkflowDefinitionID: env.definitionID, Status: domain.TaskRunning, RequestedBy: "integration-test", CreatedAt: now, UpdatedAt: now}
+	if err := env.store.CreateTask(env.ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	provider := &postgresWorkflowRetryCapability{}
+	registry := capability.NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	callerInput := json.RawMessage(`{"b":2,"a":1}`)
+	definition, scopeVersionID := syntheticWorkflowDefinition(t, env.store, env.ctx, task.ID)
+	definition.Steps = []workflow.Step{{ID: "publisher", Capability: "test.workflow-retry", Input: callerInput, Retry: workflow.RetryPolicy{MaxAttempts: 1}}}
+	guard := &postgresInvalidPublisherGuard{}
+	capturingStore := &effectiveInputCaptureStore{Store: env.store}
+	engine := workflow.Engine{
+		Registry:               registry,
+		Executor:               execution.Service{Registry: registry, Store: capturingStore, Artifacts: postgresWorkflowRetryArtifacts{guard: guard}, ProgramID: env.programID},
+		Persister:              WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: t.TempDir()}},
+		Policy:                 policy.Policy{AllowedCapabilities: []string{"test.workflow-retry"}},
+		Scope:                  integrationAllowScope{},
+		OriginalScopeVersionID: scopeVersionID,
+	}
+	state, err := engine.Run(env.ctx, definition, nil, task, nil)
+	if err == nil || errors.Is(err, workflow.ErrEffectiveStepInputConflict) || !strings.Contains(err.Error(), "artifact publisher lacks prepared-evidence capability") {
+		t.Fatalf("workflow error=%v", err)
+	}
+	if guard.closeCalls != 1 || state == nil || state.Run.Status != domain.RunFailed || state.Steps["publisher"] == nil || state.Steps["publisher"].Run.Status != domain.StepFailed {
+		t.Fatalf("guard_closes=%d workflow_state=%#v", guard.closeCalls, state)
+	}
+
+	stepID := state.Steps["publisher"].Run.ID
+	var runStatus domain.RunStatus
+	var runCompleted, stepCompleted *time.Time
+	var stepStatus domain.StepStatus
+	var attemptCount int
+	var classification, details string
+	var persistedInput json.RawMessage
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT wr.status,wr.completed_at,sr.status,sr.attempt_count,sr.completed_at,sr.error_classification,sr.error_details,sr.input
+		FROM workflow_runs wr JOIN step_runs sr ON sr.workflow_run_id=wr.id WHERE wr.id=$1 AND sr.id=$2`, state.Run.ID, stepID).Scan(&runStatus, &runCompleted, &stepStatus, &attemptCount, &stepCompleted, &classification, &details, &persistedInput); err != nil {
+		t.Fatal(err)
+	}
+	if runStatus != domain.RunFailed || runCompleted == nil || stepStatus != domain.StepFailed || attemptCount != 1 || stepCompleted == nil || classification != "execution" || !strings.Contains(details, "artifact publisher lacks prepared-evidence capability") {
+		t.Fatalf("run=%s completed=%v step=%s attempts=%d step_completed=%v classification=%q details=%q", runStatus, runCompleted, stepStatus, attemptCount, stepCompleted, classification, details)
+	}
+	if len(capturingStore.proposed) == 0 || bytes.Equal(capturingStore.proposed, persistedInput) || bytes.Equal(callerInput, persistedInput) {
+		t.Fatalf("effective input was not PostgreSQL-authoritative: caller=%s proposed=%s persisted=%s", callerInput, capturingStore.proposed, persistedInput)
+	}
+	var semanticallyEqual bool
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT $1::jsonb=$2::jsonb`, capturingStore.proposed, persistedInput).Scan(&semanticallyEqual); err != nil || !semanticallyEqual {
+		t.Fatalf("effective inputs are not semantically equal: proposed=%s persisted=%s equal=%v err=%v", capturingStore.proposed, persistedInput, semanticallyEqual, err)
+	}
+
+	var stepRows, providerCalls, toolRuns, artifacts, preparedSets, publications, secondAttempts int
+	if err := env.store.Pool.QueryRow(env.ctx, `SELECT
+		(SELECT count(*) FROM step_runs WHERE workflow_run_id=$1),
+		(SELECT count(*) FROM audit_events WHERE workflow_run_id=$1 AND event_type='provider_invocation_started'),
+		(SELECT count(*) FROM tool_runs WHERE step_run_id=$2),
+		(SELECT count(*) FROM artifacts WHERE workflow_run_id=$1),
+		(SELECT count(*) FROM prepared_evidence_sets WHERE workflow_run_id=$1),
+		(SELECT count(*) FROM artifact_publications publications JOIN audit_events attempts ON attempts.id=publications.provider_attempt_id WHERE attempts.workflow_run_id=$1),
+		(SELECT count(*) FROM audit_events WHERE step_run_id=$2 AND event_type='provider_invocation_started' AND step_attempt=2)`, state.Run.ID, stepID).Scan(&stepRows, &providerCalls, &toolRuns, &artifacts, &preparedSets, &publications, &secondAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if provider.calls != 0 || stepRows != 1 || providerCalls != 0 || toolRuns != 0 || artifacts != 0 || preparedSets != 0 || publications != 0 || secondAttempts != 0 {
+		t.Fatalf("provider_calls=%d step_rows=%d provider_audits=%d tool_runs=%d artifacts=%d prepared_sets=%d publications=%d second_attempts=%d", provider.calls, stepRows, providerCalls, toolRuns, artifacts, preparedSets, publications, secondAttempts)
 	}
 }
 
@@ -442,7 +724,7 @@ func TestConcurrentEffectiveStepAttemptIsOneShotBeforeProviderExecution(t *testi
 		t.Fatal(err)
 	}
 	barrierStore := &concurrentEffectiveInputStore{Store: env.store, bothLoaded: make(chan struct{})}
-	service := execution.Service{Registry: registry, Store: barrierStore, ProgramID: env.programID}
+	service := execution.Service{Registry: registry, Store: barrierStore, Artifacts: postgresWorkflowRetryArtifacts{}, ProgramID: env.programID}
 	type outcome struct{ err error }
 	results := make(chan outcome, 2)
 	for range 2 {
@@ -546,7 +828,7 @@ func TestTwoCompleteEnginesCannotLetLosingAttemptClaimOverwriteWinnerLifecycle(t
 		root := t.TempDir()
 		engine := workflow.Engine{
 			Registry:  registry,
-			Executor:  execution.Service{Registry: registry, Store: barrierStore, ProgramID: env.programID},
+			Executor:  execution.Service{Registry: registry, Store: barrierStore, Artifacts: postgresWorkflowRetryArtifacts{}, ProgramID: env.programID},
 			Persister: WorkflowPersister{Store: env.store, File: workflow.FileStore{Root: root}},
 			Policy:    policy.Policy{ID: "two-engine-attempt", AllowedCapabilities: []string{"test.concurrent-attempt"}},
 			Scope:     integrationAllowScope{}, OriginalScopeVersionID: scopeVersionID,
@@ -989,31 +1271,11 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 		t.Fatalf("detached terminal rows=%d err=%v", detachedTerminals, err)
 	}
 
-	terminalCause := errors.New("synthetic terminal audit outage")
-	successAction := rejectedAction
-	successAction.ID = domain.NewID()
-	result, err := (execution.Service{Registry: registry, Store: store, ProgramID: programID, ProviderAuditor: failingPostgresTerminalRecorder{store: store, err: terminalCause}}).Execute(ctx, capability.Request{Action: successAction, Policy: policy.Policy{AllowedCapabilities: []string{"test.provenance"}}, Scope: integrationAllowScope{}})
-	if err != nil {
-		t.Fatalf("terminal audit degradation changed provider success: %v", err)
-	}
-	if !errors.Is(result.TerminalAuditError, terminalCause) || result.ProviderAttemptID == nil || provider.calls != 1 {
-		t.Fatalf("result=%#v provider_calls=%d", result, provider.calls)
-	}
-	var persistedStatus domain.StepStatus
-	var persistedAttempt domain.ID
-	if err := store.Pool.QueryRow(ctx, `SELECT sr.status,tr.provider_attempt_id FROM step_runs sr JOIN tool_runs tr ON tr.step_run_id=sr.id WHERE sr.id=$1`, provenanceStepID).Scan(&persistedStatus, &persistedAttempt); err != nil {
-		t.Fatal(err)
-	}
-	if persistedStatus != domain.StepSucceeded || persistedAttempt != *result.ProviderAttemptID {
-		t.Fatalf("persisted status=%s attempt=%s result_attempt=%s", persistedStatus, persistedAttempt, *result.ProviderAttemptID)
-	}
-	var missingTerminal int
-	if err := store.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE provider_attempt_id=$1 AND event_type IN ('provider_invocation_succeeded','provider_invocation_failed','provider_invocation_cancelled')`, *result.ProviderAttemptID).Scan(&missingTerminal); err != nil {
-		t.Fatal(err)
-	}
-	if missingTerminal != 0 {
-		t.Fatalf("terminal event was fabricated after audit failure: count=%d", missingTerminal)
-	}
+	// Prepared-result execution no longer calls RecordProviderInvocationTerminal:
+	// SealPreparedEvidence inserts terminal provenance and seals the prepared set
+	// in one PostgreSQL transaction. Service tests cover seal failure and unknown
+	// acknowledgement without adoption or replay, but this integration suite has
+	// no test-only injection point inside that exact PostgreSQL transaction.
 
 	if _, err := store.Pool.Exec(ctx, `DELETE FROM artifacts WHERE id=$1`, artifactID); err == nil || !strings.Contains(err.Error(), "metadata deletion is prohibited") {
 		t.Fatalf("artifact delete error=%v", err)

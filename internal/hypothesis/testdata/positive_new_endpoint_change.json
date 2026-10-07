@@ -1,0 +1,37 @@
+{
+  "fixture_id": "positive_new_endpoint_change",
+  "category": "positive",
+  "description": "High priority newly discovered administrative endpoint in change tracking",
+  "input": {
+    "endpoints": [],
+    "changes": [
+      {
+        "kind": "endpoint_interesting",
+        "entity_type": "endpoint",
+        "entity_key": "https://api.target.com/admin/v2/users",
+        "priority": "high",
+        "reasons": ["new_endpoint_discovered", "contains_admin_keyword"],
+        "evidence_artifact_ids": ["art-change-001"],
+        "title": "Newly discovered admin endpoint",
+        "summary": "Scanner identified a new administration endpoint"
+      }
+    ],
+    "evidence": [
+      {
+        "artifact_id": "art-change-001",
+        "step_definition_id": "compare-assets",
+        "source_category": "diff_report",
+        "redaction_state": "redacted",
+        "locators": [
+          "https://api.target.com/admin/v2/users"
+        ]
+      }
+    ],
+    "allowed_capabilities": ["probe.http"]
+  },
+  "expected": {
+    "candidate_count": 1,
+    "candidate_types": ["new_endpoint_investigation"],
+    "should_admit_all": true
+  }
+}

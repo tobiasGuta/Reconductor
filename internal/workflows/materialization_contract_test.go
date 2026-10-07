@@ -33,11 +33,11 @@ func TestWorkflowMaterializationReleaseContracts(t *testing.T) {
 		materializer string
 		digest       string
 	}{
-		{"continuous-exact", ContinuousWebRecon(exact, false), string(ContinuousTemplateID), ContinuousVersion, "web-recon/v1", "62b8a326f9e1e06230156c459f16ccb79d0eb72526dc1a33c0229d02d96dfa6a"},
-		{"continuous-no-common-ports", ContinuousWebRecon(noCommonPorts, false), string(ContinuousTemplateID), ContinuousVersion, "web-recon/v1", "761df9ad76fe03c12662af5f6bc0d19ffd442ae9e850ef19ac719511aad3b620"},
-		{"continuous-discovery-headless-false", ContinuousWebRecon(discovery, false), string(ContinuousTemplateID), ContinuousVersion, "web-recon/v1", "6dbba39c6e2a59c4c32daa3ab8f064697c65d195c36732ca84af6823f467027d"},
-		{"continuous-discovery-headless-true", ContinuousWebRecon(discovery, true), string(ContinuousTemplateID), ContinuousVersion, "web-recon/v1", "a0179d9574baebca7450a7cb82cc5d7c5b89a078c97ff615ba1e46a5e49afad7"},
-		{"baseline-exact", AuthorizedWebBaseline(exact, false), string(BaselineTemplateID), BaselineVersion, "web-recon/v1", "d98290bb80ee2f84caf515b2dd2fe92e504847cf66e4466475f368370ad42d94"},
+		{"continuous-exact", ContinuousWebRecon(exact, false), string(ContinuousTemplateID), ContinuousVersion, "web-recon/v1", "85a142be2571fff5a4ea72dedaca689df558b2509d801eba7b41977d8bbc3522"},
+		{"continuous-no-common-ports", ContinuousWebRecon(noCommonPorts, false), string(ContinuousTemplateID), ContinuousVersion, "web-recon/v1", "b55547ffd59077271e4c6e3749a5a56d3d47d8f5dfcfff01b3c205952eb203dc"},
+		{"continuous-discovery-headless-false", ContinuousWebRecon(discovery, false), string(ContinuousTemplateID), ContinuousVersion, "web-recon/v1", "09d27977e3e8b51429dd51777efcf45b70e40da5127de90797530513dc1d2da2"},
+		{"continuous-discovery-headless-true", ContinuousWebRecon(discovery, true), string(ContinuousTemplateID), ContinuousVersion, "web-recon/v1", "8d1789fb62576e4218464e9b7cd10b09d636cfe1b0b702eda8c3b919eb3ebfd8"},
+		{"baseline-exact", AuthorizedWebBaseline(exact, false), string(BaselineTemplateID), BaselineVersion, "web-recon/v1", "06e061d74e7b488a60d60c2445fa4e687a3db4d176ec2416878017e510a575fa"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -68,5 +68,8 @@ func TestSupportedReleaseRequiresCompleteFourPartIdentity(t *testing.T) {
 	}
 	if SupportsRelease(BaselineTemplateID, ContinuousName, ContinuousVersion, "web-recon/v1") {
 		t.Fatal("mismatched template UUID was accepted")
+	}
+	if !SupportsRelease(continuousTemplateIDV240, ContinuousName, continuousVersionV240, "web-recon/v1") || !SupportsRelease(baselineTemplateIDV140, BaselineName, baselineVersionV140, "web-recon/v1") {
+		t.Fatal("immediately previous materialized releases are no longer resumable")
 	}
 }

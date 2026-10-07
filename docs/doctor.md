@@ -1,6 +1,6 @@
 # Environment diagnostics
 
-`platform doctor` performs passive local readiness checks. It does not run a workflow, send target traffic, update tools, or download templates.
+`platform doctor` performs passive local readiness checks. It does not run a workflow, send target traffic, update tools, or download templates. It also validates the registered artifact-store marker, durable publisher support for the current operating system and filesystem, configured prepared-evidence limits, and capacity for one additional provider result.
 
 ```powershell
 go run ./cmd/platform doctor
@@ -50,3 +50,5 @@ Template statuses:
 ## Services
 
 PostgreSQL readiness requires a successful connection, version query, and major version 15 or newer. Redis readiness requires `PING`, server information, and major version 7 or newer. Credentials are used for the checks but are not printed in the report.
+
+The `Prepared evidence` row requires the current schema, an initialized artifact store matching `ARTIFACT_STORE_ID`, a supported durable publisher, configured limits, and enough uncharged capacity for one additional maximum-sized set. Its diagnostic reports current set and byte occupancy. Missing limits are configured explicitly with `platform artifact-store prepared-limits`; full capacity is reclaimed with `platform artifact-store prepared-recover` during a drained maintenance window.

@@ -16,11 +16,16 @@ import (
 const (
 	ContinuousName         = "continuous-web-recon"
 	BaselineName           = "authorized-web-baseline"
-	ContinuousVersion      = "2.4.0"
-	BaselineVersion        = "1.4.0"
+	ContinuousVersion      = "2.5.0"
+	BaselineVersion        = "1.5.0"
 	WebReconMaterializerV1 = workflow.SupportedMaterializerRevision
-	ContinuousTemplateID   = domain.ID("3e62ed2c-ab49-421d-a4ce-5fdfead60f4a")
-	BaselineTemplateID     = domain.ID("96b2e895-8c7a-4812-b2dc-fac5eb364547")
+	ContinuousTemplateID   = domain.ID("f07a6fd9-b0db-438a-ac07-fc1c6c7137ff")
+	BaselineTemplateID     = domain.ID("a1afc4c8-f059-4406-8294-610c7ce14070")
+
+	continuousVersionV240    = "2.4.0"
+	baselineVersionV140      = "1.4.0"
+	continuousTemplateIDV240 = domain.ID("3e62ed2c-ab49-421d-a4ce-5fdfead60f4a")
+	baselineTemplateIDV140   = domain.ID("96b2e895-8c7a-4812-b2dc-fac5eb364547")
 )
 
 var defaultPolicyRequirements = json.RawMessage(`{"forbid":["dos","bruteforce","credential-stuffing","state-changing"],"moderate_requires_approval":true}`)
@@ -34,12 +39,30 @@ func Templates() []workflow.Template {
 			Description:               "Scope-driven continuous web reconnaissance with preliminary briefs and optional scanner enrichment",
 			Materializer:              WebReconMaterializerV1,
 			DefaultPolicyRequirements: append(json.RawMessage(nil), defaultPolicyRequirements...),
-			CreatedAt:                 time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC),
+			CreatedAt:                 time.Date(2026, 9, 26, 0, 0, 0, 0, time.UTC),
 		},
 		{
 			ID:                        BaselineTemplateID,
 			Name:                      BaselineName,
 			Version:                   BaselineVersion,
+			Description:               "Scope-derived exact-seed authorized web baseline with preliminary briefs and optional scanner enrichment",
+			Materializer:              WebReconMaterializerV1,
+			DefaultPolicyRequirements: append(json.RawMessage(nil), defaultPolicyRequirements...),
+			CreatedAt:                 time.Date(2026, 9, 26, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			ID:                        continuousTemplateIDV240,
+			Name:                      ContinuousName,
+			Version:                   continuousVersionV240,
+			Description:               "Scope-driven continuous web reconnaissance with preliminary briefs and optional scanner enrichment",
+			Materializer:              WebReconMaterializerV1,
+			DefaultPolicyRequirements: append(json.RawMessage(nil), defaultPolicyRequirements...),
+			CreatedAt:                 time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			ID:                        baselineTemplateIDV140,
+			Name:                      BaselineName,
+			Version:                   baselineVersionV140,
 			Description:               "Scope-derived exact-seed authorized web baseline with preliminary briefs and optional scanner enrichment",
 			Materializer:              WebReconMaterializerV1,
 			DefaultPolicyRequirements: append(json.RawMessage(nil), defaultPolicyRequirements...),
@@ -129,12 +152,12 @@ func webReconDefinition(template workflow.Template, plan targeting.TargetPlan, h
 		classifyBindings["passive_observations"] = "discover-archive-urls.output.authorized_records"
 	}
 	steps = append(steps,
-		workflow.Step{ID: "classify-interesting-endpoints", Capability: "classify.endpoint", DependsOn: classifyDeps, Input: raw(map[string]any{"active": []string{}, "passive": []string{}, "http_observations": []any{}, "http_source_records": []any{}, "crawl_observations": []any{}, "passive_observations": []any{}, "historical_observations": []any{}, "api_schema_endpoints": []string{}, "target_plan_digest": plan.Digest}), Bindings: classifyBindings, Retry: retry(), Timeout: time.Minute},
+		workflow.Step{ID: "classify-interesting-endpoints", Capability: "classify.endpoint", DependsOn: classifyDeps, Input: raw(map[string]any{"active": []string{}, "passive": []string{}, "http_observations": []any{}, "http_source_records": []any{}, "crawl_observations": []any{}, "passive_observations": []any{}, "historical_observations": []any{}, "api_schema_endpoints": []string{}, "target_plan_digest": plan.Digest}), Bindings: classifyBindings, OptionalBindings: map[string]bool{"crawl_observations": true}, Retry: retry(), Timeout: time.Minute},
 		workflow.Step{ID: "generate-recon-brief", Capability: "report.changes", DependsOn: []string{"classify-interesting-endpoints"}, Input: raw(map[string]any{"changes": []any{}, "endpoints": []any{}, "candidate_matches": []any{}, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"changes": "compare-assets.output.changes", "endpoints": "classify-interesting-endpoints.output.interesting_endpoints"}, Retry: retry(), Timeout: time.Minute},
 		workflow.Step{ID: "run-safe-nuclei-profile", Capability: "scan.nuclei", Provider: "nuclei", DependsOn: []string{"classify-interesting-endpoints"}, Condition: "nonempty:compare-assets.output.scan_targets", Input: raw(map[string]any{"targets": []string{}, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"targets": "compare-assets.output.scan_targets"}, Retry: workflow.RetryPolicy{MaxAttempts: 2, BaseDelay: 5 * time.Second}, Timeout: 45 * time.Minute, ApprovalRequired: true},
-		workflow.Step{ID: "enrich-recon-brief", Capability: "report.changes", DependsOn: []string{"generate-recon-brief", "run-safe-nuclei-profile"}, Input: raw(map[string]any{"changes": []any{}, "endpoints": []any{}, "candidate_matches": []any{}, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"changes": "compare-assets.output.changes", "endpoints": "classify-interesting-endpoints.output.interesting_endpoints", "candidate_matches": "run-safe-nuclei-profile.output.lines"}, Retry: retry(), Timeout: time.Minute},
+		workflow.Step{ID: "enrich-recon-brief", Capability: "report.changes", DependsOn: []string{"generate-recon-brief", "run-safe-nuclei-profile"}, Input: raw(map[string]any{"changes": []any{}, "endpoints": []any{}, "candidate_matches": []any{}, "target_plan_digest": plan.Digest}), Bindings: map[string]string{"changes": "compare-assets.output.changes", "endpoints": "classify-interesting-endpoints.output.interesting_endpoints", "candidate_matches": "run-safe-nuclei-profile.output.lines"}, OptionalBindings: map[string]bool{"candidate_matches": true}, Retry: retry(), Timeout: time.Minute},
 	)
-	return workflow.Definition{ID: template.ID, Name: template.Name, Version: template.Version, Materializer: template.Materializer, Description: template.Description, DefaultPolicyRequirements: append(json.RawMessage(nil), template.DefaultPolicyRequirements...), CreatedAt: template.CreatedAt, Steps: steps}
+	return workflow.Definition{ID: template.ID, Name: template.Name, Version: template.Version, Materializer: template.Materializer, BindingSemantics: workflow.BindingSemanticsRequiredV1, Description: template.Description, DefaultPolicyRequirements: append(json.RawMessage(nil), template.DefaultPolicyRequirements...), CreatedAt: template.CreatedAt, Steps: steps}
 }
 
 func commonPorts(plan targeting.TargetPlan) []int {

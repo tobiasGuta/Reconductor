@@ -7,6 +7,10 @@ const state = {
   loading: false,
   timer: null,
   modalAction: null,
+  modalGeneration: 0,
+  exactApprovals: { items: [], nextCursor: "", id: "", detail: null, status: "locked", error: "", listGeneration: 0, detailGeneration: 0, decisionGeneration: 0, busy: false, modalOwner: false, returnFocus: null },
+	operatorCredential: "",
+	operatorVerificationGeneration: 0,
   drawer: {
     returnFocus: null,
     returnTarget: null,
@@ -124,6 +128,7 @@ function showView(name, { focusWorkspace = false } = {}) {
   $(".sidebar").classList.remove("open");
   const reduceMotion = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   window.scrollTo({ top: 0, behavior: reduceMotion ? "auto" : "smooth" });
+  if (name === "exact-approvals") return refreshExactApprovals();
   if (name === "runs") return activateRunWorkspace({ focus: focusWorkspace });
 }
 
@@ -1315,7 +1320,7 @@ function renderChangeInbox() {
     const actions = element("div", "card-actions");
     for (const disposition of ["interesting", "investigating", "expected_change", "not_relevant", "resolved"]) {
       const button = element("button", disposition === "interesting" ? "primary-button" : "secondary-button", disposition.replaceAll("_", " "));
-      button.addEventListener("click", () => postAction(`/api/v1/change-items/${encodeURIComponent(item.id)}/review`, { disposition, note: note.value.trim(), actor: "console-operator" }, "Change review saved."));
+      button.addEventListener("click", () => postAction(`/api/v1/change-items/${encodeURIComponent(item.id)}/review`, { disposition, note: note.value.trim() }, "Change review saved."));
       actions.append(button);
     }
     card.append(copy, meta, statusBadge(item.disposition || "unreviewed"), actions);
@@ -1519,7 +1524,7 @@ function confirmApproval(item, decision) {
     details: [["Risk", item.risk], ["Reason", item.reason], ["Objective", item.objective], ["Request", shortID(item.request_id)]],
     confirmLabel: decision === "approved" ? "Approve step" : "Reject step",
     danger: decision === "rejected",
-    action: () => postAction(`/api/v1/approvals/${encodeURIComponent(item.id)}/decision`, { decision, actor: "console-operator" }, `Approval ${decision}.`),
+    action: () => postAction(`/api/v1/approvals/${encodeURIComponent(item.id)}/decision`, { decision }, `Approval ${decision}.`),
   });
 }
 
@@ -1943,7 +1948,11 @@ async function openExecutionDetail(id, opener = null, returnTarget = null) {
 }
 
 function openModal(config) {
+  state.modalGeneration++;
+  state.exactApprovals.modalOwner = false;
+  state.exactApprovals.returnFocus = null;
   state.modalAction = config.action;
+  $("#modal-confirm").disabled = false;
   $("#modal-eyebrow").textContent = config.eyebrow;
   $("#modal-title").textContent = config.title;
   $("#modal-description").textContent = config.description;
@@ -1957,19 +1966,30 @@ function openModal(config) {
 }
 
 function closeModal() {
+  state.modalGeneration++;
   state.modalAction = null;
   $("#action-modal").classList.add("hidden");
+  if (state.exactApprovals.modalOwner) {
+    state.exactApprovals.modalOwner = false;
+    const opener = state.exactApprovals.returnFocus;
+    if (opener && opener.isConnected !== false) opener.focus();
+    else $("#exact-approval-detail")?.focus();
+    state.exactApprovals.returnFocus = null;
+  }
 }
 
 async function postAction(path, body, successMessage) {
   const button = $("#modal-confirm");
   button.disabled = true;
   try {
+	if (!state.operatorCredential) throw new Error("Unlock operator actions first.");
+	const verificationGeneration = state.operatorVerificationGeneration;
     const response = await fetch(path, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Reconductor-Request": "operator-console", Accept: "application/json" },
+      headers: operatorMutationHeaders(),
       body: JSON.stringify(body),
     });
+	if (response.status === 401 && verificationGeneration === state.operatorVerificationGeneration) lockOperatorActions();
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(result.error || "The operator action was not accepted.");
     closeModal();
@@ -1982,21 +2002,69 @@ async function postAction(path, body, successMessage) {
   }
 }
 
+function operatorMutationHeaders() {
+	return { "Content-Type": "application/json", "X-Reconductor-Request": "operator-console", Accept: "application/json", Authorization: `Bearer ${state.operatorCredential}` };
+}
+
+function lockOperatorActions() {
+	state.operatorCredential = "";
+	clearExactReviews();
+	const status = $("#operator-credential-status");
+	if (status) status.textContent = "Actions locked";
+}
+
+async function verifyOperatorCredential(credential) {
+	const generation = ++state.operatorVerificationGeneration;
+	lockOperatorActions();
+	try {
+		const response = await fetch("/api/v1/operator/check", {
+			headers: { Authorization: `Bearer ${credential}`, Accept: "application/json" }, cache: "no-store",
+		});
+		if (generation !== state.operatorVerificationGeneration) return null;
+		if (!response.ok) return false;
+		state.operatorCredential = credential;
+		const status = $("#operator-credential-status");
+		if (status) status.textContent = "Actions unlocked for this page";
+		return true;
+	} catch {
+		return generation === state.operatorVerificationGeneration ? "unavailable" : null;
+	}
+}
+
 function toast(message, isError = false) {
   const item = element("div", `toast ${isError ? "error" : ""}`.trim(), message);
   $("#toast-region").append(item);
   setTimeout(() => item.remove(), 4500);
 }
 
+async function submitOperatorCredential(event) {
+	event.preventDefault();
+	const input = $("#operator-credential");
+	const credential = input.value;
+	input.value = "";
+	const verification = verifyOperatorCredential(credential);
+	const generation = state.operatorVerificationGeneration;
+	const result = await verification;
+	if (generation !== state.operatorVerificationGeneration) return;
+	if (result === true && state.view === "exact-approvals") await refreshExactApprovals();
+	if (generation !== state.operatorVerificationGeneration) return;
+	if (result === false) toast("Operator credential was not accepted.", true);
+	if (result === "unavailable") toast("Could not check the operator credential.", true);
+}
+
 function bindEvents() {
+	$("#operator-credential-form").addEventListener("submit", submitOperatorCredential);
   $$(".nav-item").forEach((item) => item.addEventListener("click", () => showView(item.dataset.view)));
   $$('[data-go-view]').forEach((item) => item.addEventListener("click", () => showView(item.dataset.goView)));
   $("#program-select").addEventListener("change", (event) => {
     state.selectedProgram = event.target.value;
+    state.exactApprovals.id = "";
+    clearExactReviews();
+    if (state.view === "exact-approvals") void refreshExactApprovals();
     localStorage.setItem("reconductor.program", state.selectedProgram);
     loadData();
   });
-  $("#refresh-button").addEventListener("click", () => loadData());
+  $("#refresh-button").addEventListener("click", () => state.view === "exact-approvals" ? refreshExactApprovals() : loadData());
   $("#retry-load").addEventListener("click", () => loadData());
   $("#asset-search").addEventListener("input", renderAssetTable);
   $("#asset-type-filter").addEventListener("change", renderAssetTable);
@@ -2022,12 +2090,14 @@ function bindEvents() {
       cron_expression: String(form.get("cron") || ""),
       timezone: String(form.get("timezone") || ""),
       headless: form.get("headless") === "on",
-      actor: "console-operator",
     };
     if (!scheduleID) body.program_id = state.data?.selected_program_id || state.selectedProgram;
     try {
+	  if (!state.operatorCredential) throw new Error("Unlock operator actions first.");
+	  const verificationGeneration = state.operatorVerificationGeneration;
       const path = scheduleID ? `/api/v1/schedules/${encodeURIComponent(scheduleID)}/update` : "/api/v1/schedules";
-      const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Reconductor-Request": "operator-console", Accept: "application/json" }, body: JSON.stringify(body) });
+      const response = await fetch(path, { method: "POST", headers: operatorMutationHeaders(), body: JSON.stringify(body) });
+	  if (response.status === 401 && verificationGeneration === state.operatorVerificationGeneration) lockOperatorActions();
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.error || "Schedule was not accepted.");
       resetScheduleForm();
@@ -2051,8 +2121,226 @@ function handleDocumentKeydown(event) {
   containDrawerTab(event, drawerTabbableElements(drawer), document.activeElement, drawer);
 }
 
+// Exact review values are display-only server DTOs. Decisions send IDs and hash
+// guards, never reconstructed requests, evidence, actor, or execution commands.
+function clearExactReviews() {
+  const exact = state.exactApprovals;
+  const wasBusy = exact.busy;
+  exact.listGeneration++;
+  exact.detailGeneration++;
+  exact.decisionGeneration++;
+  exact.items = [];
+  exact.nextCursor = "";
+  exact.detail = null;
+  exact.error = "";
+  exact.status = "locked";
+  exact.busy = false;
+  if (exact.modalOwner) closeModal();
+  if (wasBusy && !state.modalAction) {
+    const confirm = $("#modal-confirm");
+    if (confirm) confirm.disabled = false;
+  }
+  renderExactApprovals();
+}
+
+async function exactRead(path, generation) {
+  const response = await fetch(path, { headers: { Authorization: `Bearer ${state.operatorCredential}`, Accept: "application/json" }, cache: "no-store" });
+  if (generation !== state.operatorVerificationGeneration || !state.operatorCredential) return null;
+  if (response.status === 401) { lockOperatorActions(); return null; }
+  const body = await response.json();
+  if (generation !== state.operatorVerificationGeneration || !state.operatorCredential) return null;
+  if (!response.ok) throw new Error(body.error || "Exact review is unavailable.");
+  return body;
+}
+
+async function refreshExactApprovals({ more = false } = {}) {
+  if (!state.operatorCredential) { clearExactReviews(); return; }
+  const exact = state.exactApprovals;
+  const generation = state.operatorVerificationGeneration;
+  const request = ++exact.listGeneration;
+  const program = state.selectedProgram;
+  const cursor = more ? exact.nextCursor : "";
+  if (more && !cursor) return;
+  try {
+    const query = new URLSearchParams();
+    if (program) query.set("program_id", program);
+    if (cursor) query.set("after", cursor);
+    const body = await exactRead(`/api/v1/exact-approvals?${query}`, generation);
+    if (!body || generation !== state.operatorVerificationGeneration || request !== exact.listGeneration || program !== state.selectedProgram) return;
+    const items = more ? [...exact.items, ...body.items] : body.items;
+    exact.items = [...new Map(items.map((item) => [item.approval_id, item])).values()];
+    exact.nextCursor = body.next_cursor || "";
+    exact.error = "";
+    if (!exact.detail) exact.status = "ready";
+    renderExactApprovals();
+    if (!more && exact.id) await openExactApproval(exact.id, { focus: false });
+  } catch (error) {
+    if (generation !== state.operatorVerificationGeneration || request !== exact.listGeneration) return;
+    exact.items = [];
+    exact.nextCursor = "";
+    exact.detail = null;
+    exact.status = "error";
+    exact.error = error.message;
+    renderExactApprovals();
+  }
+}
+
+async function openExactApproval(id, { focus = true } = {}) {
+  const exact = state.exactApprovals;
+  const generation = state.operatorVerificationGeneration;
+  const request = ++exact.detailGeneration;
+  exact.id = String(id);
+  exact.detail = null;
+  exact.status = "loading";
+  renderExactApprovals();
+  if (!state.operatorCredential) { clearExactReviews(); return; }
+  try {
+    const body = await exactRead(`/api/v1/exact-approvals/${encodeURIComponent(id)}`, generation);
+    if (!body || generation !== state.operatorVerificationGeneration || request !== exact.detailGeneration) return;
+    exact.detail = body;
+    exact.status = "ready";
+    exact.error = "";
+    renderExactApprovals();
+    if (focus) $("#exact-review-heading")?.focus();
+  } catch (error) {
+    if (generation !== state.operatorVerificationGeneration || request !== exact.detailGeneration) return;
+    exact.status = "error";
+    exact.error = error.message;
+    renderExactApprovals();
+  }
+}
+
+function exactRequestFacts(detail) {
+  const r = detail.request;
+  return [["Approval ID", detail.approval_id], ["Frozen program ID", detail.program_id], ["Frozen action ID", detail.action_id], ["Method", r.method], ["Origin", `${r.scheme}://${r.host}:${r.port}`], ["Exact request target", r.request_target],
+    ["Identity", r.identity], ["Maximum requests", r.max_requests], ["Redirects", r.redirects ? "enabled" : "disabled"],
+    ["Retries", r.retries ? "enabled" : "disabled"], ["Headers", r.headers.length ? r.headers.join("\n") : "none"],
+    ["Body", r.body], ["Action hash H", detail.action_hash], ["Review hash RH", detail.review_hash]];
+}
+
+function renderExactApprovals() {
+  const list = $("#exact-approval-list");
+  const panel = $("#exact-approval-detail");
+  if (!list || !panel) return;
+  const exact = state.exactApprovals;
+  list.replaceChildren();
+  panel.replaceChildren();
+  if (!state.operatorCredential) {
+    list.append(empty("Unlock operator actions to read exact approvals."));
+    panel.append(empty("Frozen exact reviews require an operator credential."));
+    return;
+  }
+  for (const item of exact.items) {
+    const button = element("button", "secondary-button exact-review-item", `${item.approval_id} · ${item.status} · prepared ${formatTime(item.created_at, true)} · expires ${formatTime(item.expires_at, true)}`);
+    button.type = "button";
+    button.dataset.exactApprovalId = item.approval_id;
+    button.disabled = exact.busy;
+    button.setAttribute("aria-pressed", String(exact.id === item.approval_id));
+    button.addEventListener("click", () => openExactApproval(item.approval_id));
+    list.append(button);
+  }
+  if (!exact.items.length) list.append(empty(exact.error || "No exact approvals in this program."));
+  if (exact.nextCursor) {
+    const more = element("button", "secondary-button", "Load more exact approvals");
+    more.type = "button";
+    more.disabled = exact.busy;
+    more.addEventListener("click", () => refreshExactApprovals({ more: true }));
+    list.append(more);
+  }
+  if (!exact.detail) { panel.append(empty(exact.status === "loading" ? "Loading frozen review…" : exact.error || "Select an exact approval.")); return; }
+  const detail = exact.detail;
+  const heading = element("h2", "", "Exact action review");
+  heading.id = "exact-review-heading";
+  heading.tabIndex = -1;
+  panel.append(heading, statusBadge(detail.status), element("p", "", `Recorded decision: ${detail.decision}. Expires ${formatTime(detail.expires_at, true)}.`));
+  const facts = element("dl", "modal-details exact-request-facts");
+  appendDetails(facts, exactRequestFacts(detail));
+  const identity = element("dl", "modal-details");
+  appendDetails(identity, [["Contract version", detail.contract_version], ["Capability revision", `${detail.capability} / ${detail.capability_revision}`], ["Task ID", detail.task_id], ["Workflow run ID", detail.workflow_run_id], ["Step run ID / attempt", `${detail.step_run_id} / ${detail.step_attempt}`], ["Bound execution identity X", detail.provider_attempt_id]]);
+  panel.append(facts, element("h3", "", "Frozen proposal identity"), identity, element("h3", "", "Frozen review context"));
+  const review = detail.review;
+  for (const [label, value] of [["Purpose", review.purpose], ["Expected positive outcome", review.expected_positive_outcome], ["Expected negative outcome", review.expected_negative_outcome],
+    ["Assumptions", review.assumptions.join("\n") || "none"], ["Missing evidence", review.missing_evidence.join("\n") || "none"],
+    ["Proposal source", `${review.source_kind} · ${review.source_provider} · ${review.source_model}`]]) {
+    panel.append(element("h4", "", label), element("p", "exact-prose", value));
+  }
+  panel.append(element("h3", "", "Evidence: frozen citations and current availability"));
+  if (!review.citations.length) panel.append(empty("No frozen evidence citations."));
+  for (const citation of review.citations) {
+    const card = element("article", "exact-citation");
+    card.append(element("h4", "", `${citation.role} evidence`));
+    const facts = element("dl", "modal-details");
+    appendDetails(facts, [["Frozen artifact ID", citation.artifact_id], ["Frozen SHA-256", citation.frozen_sha256], ["Frozen locator", citation.locator], ["Current availability", citation.current_availability]]);
+    card.append(facts);
+    panel.append(card);
+  }
+  panel.append(element("p", "", "Changes require a new action proposal. This surface records authorization only; it does not execute the request."));
+  if (detail.decisionable) {
+    const actions = element("div", "card-actions");
+    for (const [decision, label] of [["rejected", "DENY"], ["approved", "ALLOW ONCE"]]) {
+      const button = element("button", decision === "approved" ? "primary-button" : "danger-button", label);
+      button.type = "button";
+      button.disabled = exact.busy || (decision === "approved" && !detail.evidence_available);
+      button.addEventListener("click", () => confirmExactDecision(detail, decision, button));
+      actions.append(button);
+    }
+    panel.append(actions);
+    if (!detail.evidence_available) panel.append(element("p", "", "Allow once is blocked while cited evidence is unavailable or restricted. The server verifies evidence again at decision time."));
+  } else panel.append(element("p", "", "This approval is read-only; no further decision is available."));
+}
+
+function confirmExactDecision(detail, decision, opener = null) {
+  if (!state.operatorCredential || !detail.decisionable || state.exactApprovals.busy || (decision === "approved" && !detail.evidence_available)) return;
+  openModal({ eyebrow: "Exact authorization", title: decision === "approved" ? "Allow this exact action once?" : "Deny this exact action?",
+    description: "This records authorization only. It does not execute the request. Changes require a new action proposal.",
+    confirmLabel: decision === "approved" ? "ALLOW ONCE" : "DENY", danger: decision === "rejected", details: exactRequestFacts(detail),
+    action: () => submitExactDecision(detail.approval_id, decision, detail.action_hash, detail.review_hash) });
+  state.exactApprovals.modalOwner = true;
+  state.exactApprovals.returnFocus = opener;
+  $("#modal-confirm").disabled = false;
+}
+
+async function submitExactDecision(id, decision, actionHash, reviewHash) {
+  const exact = state.exactApprovals;
+  if (exact.busy || !state.operatorCredential) return;
+  const generation = state.operatorVerificationGeneration;
+  const request = ++exact.decisionGeneration;
+  const modalGeneration = state.modalGeneration;
+  exact.busy = true;
+  $("#modal-confirm").disabled = true;
+  renderExactApprovals();
+  let message = "Exact decision could not be recorded. Review the current state.";
+  let failed = true;
+  try {
+    const response = await fetch(`/api/v1/exact-approvals/${encodeURIComponent(id)}/decision`, {
+      method: "POST", headers: operatorMutationHeaders(), body: JSON.stringify({ decision, action_hash: actionHash, review_hash: reviewHash }),
+    });
+    if (generation !== state.operatorVerificationGeneration || request !== exact.decisionGeneration) return;
+    if (response.status === 401) { lockOperatorActions(); return; }
+    const body = await response.json().catch(() => ({}));
+    if (generation !== state.operatorVerificationGeneration || request !== exact.decisionGeneration) return;
+    failed = !response.ok;
+    message = body.message || body.error || message;
+  } catch {
+    if (generation !== state.operatorVerificationGeneration || request !== exact.decisionGeneration) return;
+  } finally {
+    if (generation === state.operatorVerificationGeneration && request === exact.decisionGeneration && state.operatorCredential) {
+      const ownedModal = exact.modalOwner && modalGeneration === state.modalGeneration;
+      if (ownedModal) closeModal();
+      exact.busy = false;
+      if (ownedModal || !state.modalAction) $("#modal-confirm").disabled = false;
+      await refreshExactApprovals();
+      if (generation === state.operatorVerificationGeneration && request === exact.decisionGeneration && state.operatorCredential) {
+        if (state.view === "exact-approvals" && $("#action-modal").classList.contains("hidden")) $("#exact-approval-detail")?.focus();
+        toast(message, failed);
+      }
+    }
+  }
+}
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    refreshExactApprovals, openExactApproval, renderExactApprovals, confirmExactDecision, submitExactDecision, exactRequestFacts, clearExactReviews, openModal, closeModal, showView,
     artifactCountText,
     buildRunSelectorEntries,
     containDrawerTab,
@@ -2060,6 +2348,9 @@ if (typeof module !== "undefined" && module.exports) {
 	latestRunSteps,
     partitionRunRelationships,
     state,
+	verifyOperatorCredential,
+	submitOperatorCredential,
+	operatorMutationHeaders,
     closeDrawer,
     openExecutionWorkspace,
     openExecutionDetail,

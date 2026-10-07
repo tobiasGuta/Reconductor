@@ -116,7 +116,7 @@ func TestOwnedContainerLabelsRequireExactRunIdentity(t *testing.T) {
 
 func TestSchedulerGenerationReadinessIsLogIsolated(t *testing.T) {
 	var log lockedBuffer
-	readyLine := "2026/08/01 12:00:00 INFO Reconductor scheduler ready poll_interval=100ms max_concurrent_runs=1"
+	readyLine := "2026/08/01 12:00:00 INFO Reconductor scheduler ready poll_interval=100ms max_concurrent_runs=1 prepared_open_sets=0 prepared_max_open_sets=32"
 	_, _ = log.Write([]byte(readyLine + "\n"))
 	offset := log.Len()
 	if schedulerReadyFrom(&log, offset) {
@@ -438,7 +438,7 @@ func TestStepStoreDiffDetectsPostgreSQLFileDivergence(t *testing.T) {
 func TestScheduledExecutionAuditCountsUseExecutionDetails(t *testing.T) {
 	executionID := domain.ID("execution")
 	otherExecutionID := domain.ID("other-execution")
-	events := []database.ConsoleAuditEvent{
+	events := []scheduledExecutionAuditEvidence{
 		{ID: "claim", EventType: "scheduled_execution_claimed", Details: json.RawMessage(`{"scheduled_execution_id":"execution"}`)},
 		{ID: "other-claim", EventType: "scheduled_execution_claimed", Details: json.RawMessage(`{"scheduled_execution_id":"other-execution"}`)},
 		{ID: "resume", EventType: "scheduled_execution_resume_requested", Details: json.RawMessage(`{"scheduled_execution_id":"execution"}`)},
@@ -458,8 +458,94 @@ func TestScheduledExecutionAuditCountsUseExecutionDetails(t *testing.T) {
 	if claims != 1 || resumes != 0 {
 		t.Fatalf("other claim audits=%d resume audits=%d want=1/0", claims, resumes)
 	}
-	if _, _, err := scheduledExecutionAuditCounts(executionID, []database.ConsoleAuditEvent{{ID: "bad", EventType: "scheduled_execution_claimed", Details: json.RawMessage(`{}`)}}); err == nil {
+	if _, _, err := scheduledExecutionAuditCounts(executionID, []scheduledExecutionAuditEvidence{{ID: "bad", EventType: "scheduled_execution_claimed", Details: json.RawMessage(`{}`)}}); err == nil {
 		t.Fatal("claim audit without scheduled-execution identity was accepted")
+	}
+}
+
+func TestConsoleProjectionOmitsPersistencePayloadFields(t *testing.T) {
+	snapshot := database.ConsoleSnapshot{
+		Tools:       []database.ConsoleToolRun{{ID: "tool", WorkflowRunID: "run", StepDefinitionID: "step", Provider: "provider"}},
+		AuditEvents: []database.ConsoleAuditEvent{{ID: "audit", EventType: "workflow_started", SafeMessage: "workflow started"}},
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prohibited, err := prohibitedConsoleProjectionFields(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prohibited) != 0 {
+		t.Fatalf("safe console projection reported prohibited fields: %v", prohibited)
+	}
+	for _, field := range []string{`"sanitized_arguments":`, `"details":`} {
+		if strings.Contains(string(encoded), field) {
+			t.Fatalf("console JSON exposed %s: %s", field, encoded)
+		}
+	}
+
+	injected := []byte(`{"tool_runs":[{"sanitized_arguments":{"target":"secret"}}],"audit_events":[{"details":{"reason":"secret"}}]}`)
+	prohibited, err = prohibitedConsoleProjectionFields(injected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(prohibited, ",")
+	for _, path := range []string{"tool_runs[0].sanitized_arguments", "audit_events[0].details"} {
+		if !strings.Contains(got, path) {
+			t.Fatalf("prohibited field detector=%q, missing %q", got, path)
+		}
+	}
+}
+
+func TestRequireSemanticOutputDecodesPersistedResultEnvelope(t *testing.T) {
+	semantic := json.RawMessage(`{"z":2,"accepted_count":1}`)
+	wantSemantic := json.RawMessage(`{"accepted_count":1,"z":2}`)
+	artifactID := domain.NewID()
+	storeID := domain.NewID()
+	digest := strings.Repeat("0", 64)
+	envelope := domain.ResultEnvelopeV1{
+		Version:             domain.ResultEnvelopeVersionV1,
+		ActionRequestID:     domain.NewID(),
+		ResultOccurrenceID:  domain.NewID(),
+		ProviderAttemptID:   domain.NewID(),
+		CapabilityName:      "probe.http",
+		CapabilityVersion:   "1",
+		Status:              domain.ResultStatusSucceeded,
+		ProviderOutcome:     domain.ResultProviderSucceeded,
+		Summary:             "httpx accepted 1 normalized records",
+		PublicationComplete: true,
+		SemanticOutput: domain.SemanticOutputV1{
+			Version:            domain.SemanticOutputVersionV1,
+			Mode:               domain.SemanticModeInlineJSON,
+			Completeness:       domain.SemanticComplete,
+			Canonicalization:   domain.CanonicalJSONVersionV1,
+			ArtifactID:         artifactID,
+			ContentSHA256:      digest,
+			ContentSizeBytes:   int64(len(semantic)),
+			OutputSchemaSHA256: digest,
+			NodeCount:          3,
+			MaximumDepth:       2,
+			ProjectionState:    domain.ProjectionComplete,
+			InlineJSON:         semantic,
+		},
+		Artifacts: []domain.ResultArtifactRefV1{{
+			ArtifactID:       artifactID,
+			ArtifactStoreID:  storeID,
+			StorageKey:       "v1/" + strings.ReplaceAll(string(artifactID), "-", "")[:2] + "/" + string(artifactID),
+			Role:             domain.ArtifactRoleSemanticResult,
+			ContentType:      "application/json",
+			ContentSizeBytes: int64(len(semantic)),
+			ContentSHA256:    digest,
+		}},
+	}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := (&harness{t: t}).requireSemanticOutput(raw, "HTTPX fixture")
+	if string(got) != string(wantSemantic) {
+		t.Fatalf("semantic output=%s want=%s", got, wantSemantic)
 	}
 }
 
